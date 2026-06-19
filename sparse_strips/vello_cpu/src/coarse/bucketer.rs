@@ -632,7 +632,6 @@ impl CommandBucketer {
         }
 
         let clip_bbox = *self.clip_bboxes.last().unwrap();
-
         // TODO: Don't emit layers with empty clip bboxes (and non-destructive blend modes)
         // in the first place during recordings.
         if clip_bbox.is_empty() {
