@@ -7,6 +7,8 @@ mod allocate;
 mod cursor;
 pub(crate) mod execute;
 pub(crate) mod round;
+#[cfg(test)]
+mod test_support;
 
 use self::allocate::{Atlases, LayerAllocationRequest};
 use self::cursor::Cursor;
@@ -805,5 +807,233 @@ impl ScheduleTarget for LayerTextureRegion {
 
     fn texture_binding(&self) -> LayerTexturePairConstraint {
         LayerTexturePairConstraint::new(self.texture.target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::SceneCase;
+    use crate::target::{RootRenderTarget, TextureParity};
+    use vello_common::filter_effects::{Filter, FilterPrimitive};
+    use vello_common::geometry::SizeU16;
+    use vello_common::kurbo::Rect;
+    use vello_common::peniko::{BlendMode, Compose, Mix};
+
+    #[test]
+    fn empty_scene() {
+        let scheduled = SceneCase::new(32, 32).schedule_root();
+
+        assert!(scheduled.views().is_empty());
+        assert_eq!(scheduled.page_counts(), [0, 0]);
+        assert!(!scheduled.scratch_texture());
+    }
+
+    #[test]
+    fn root_draws() {
+        let mut case = SceneCase::new(32, 8);
+        for x in [0.0, 8.0, 16.0] {
+            case.draw_at(x, 0.5);
+        }
+
+        let scheduled = case.schedule_root();
+        let views = scheduled.views();
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].root.x, [0, 8, 16]);
+        assert!(!views[0].root.has_child_layer);
+        assert_eq!(scheduled.page_counts(), [0, 0]);
+    }
+
+    #[test]
+    fn draw_order() {
+        let mut case = SceneCase::new(32, 8);
+        case.draw_at(0.0, 0.5);
+        case.layer(|case| case.draw_at(8.0, 0.5));
+        case.draw_at(16.0, 0.5);
+
+        let scheduled = case.schedule_root();
+        let views = scheduled.views();
+
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].root.x, [0, 8, 16]);
+        assert!(views[0].root.has_child_layer);
+    }
+
+    #[test]
+    fn opaque_root() {
+        let mut case = SceneCase::new(32, 8);
+        for x in [0.0, 8.0, 16.0] {
+            case.draw_at(x, 1.0);
+        }
+        case.draw_at(24.0, 0.5);
+
+        let user = case.schedule_root();
+        assert_eq!(user.opaque_x(), [16, 8, 0]);
+        assert_eq!(user.views()[0].root.x, [24]);
+
+        let atlas = case.schedule(RootRenderTarget::AtlasLayer, SizeU16::new(64), 8);
+        assert!(atlas.opaque_x().is_empty());
+        assert_eq!(atlas.views()[0].root.x, [0, 8, 16, 24]);
+    }
+
+    #[test]
+    fn simple_layer() {
+        let mut case = SceneCase::new(32, 8);
+        case.layer(|case| case.draw_at(8.0, 0.5));
+
+        let scheduled = case.schedule_root();
+        let views = scheduled.views();
+        let round = &views[0];
+
+        assert_eq!(scheduled.page_counts(), [0, 1]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(round.odd.x.len(), 1);
+        assert_eq!(round.root.x, [8]);
+        assert!(round.root.has_child_layer);
+        assert_eq!(round.clears[TextureParity::Odd.get_parity()].len(), 1);
+    }
+
+    #[test]
+    fn nested_parity() {
+        let mut case = SceneCase::new(16, 8);
+        case.layer(|case| {
+            case.layer(|case| case.draw_at(4.0, 0.5));
+        });
+
+        let scheduled = case.schedule_root();
+        let views = scheduled.views();
+        let round = &views[0];
+
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(round.even.x.len(), 1);
+        assert_eq!(round.odd.x.len(), 1);
+        assert!(round.odd.has_child_layer);
+        assert_eq!(round.root.x.len(), 1);
+        assert!(round.root.has_child_layer);
+        assert_eq!(round.clears[TextureParity::Even.get_parity()].len(), 1);
+        assert_eq!(round.clears[TextureParity::Odd.get_parity()].len(), 1);
+    }
+
+    #[test]
+    fn sibling_batch() {
+        let mut case = SceneCase::new(32, 8);
+        for x in [0.0, 8.0, 16.0] {
+            case.layer(|case| case.draw_at(x, 0.5));
+        }
+
+        let scheduled = case.schedule(RootRenderTarget::UserSurface, SizeU16::from_wh(16, 8), 1);
+        let views = scheduled.views();
+        let round = &views[0];
+
+        assert_eq!(scheduled.page_counts(), [0, 1]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(round.odd.x.len(), 3);
+        assert_eq!(round.root.x, [0, 8, 16]);
+        assert_eq!(round.clears[TextureParity::Odd.get_parity()].len(), 3);
+    }
+
+    #[test]
+    fn deep_reuse() {
+        fn chain(case: &mut SceneCase, depth: usize) {
+            case.layer(|case| {
+                if depth == 1 {
+                    case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5);
+                } else {
+                    chain(case, depth - 1);
+                }
+            });
+        }
+
+        const DEPTH: usize = 12;
+        let mut case = SceneCase::new(8, 8);
+        chain(&mut case, DEPTH);
+
+        let scheduled = case.schedule(RootRenderTarget::UserSurface, SizeU16::new(8), 2);
+        let views = scheduled.views();
+        let layer_draws = views
+            .iter()
+            .map(|round| round.even.x.len() + round.odd.x.len())
+            .sum::<usize>();
+
+        assert!(views.len() > 1);
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert_eq!(layer_draws, DEPTH);
+        assert_eq!(scheduled.total_clears(), DEPTH);
+    }
+
+    #[test]
+    fn empty_layer() {
+        let mut case = SceneCase::new(16, 8);
+        case.layer(|_| {});
+
+        let scheduled = case.schedule_root();
+
+        assert!(scheduled.views().is_empty());
+        assert_eq!(scheduled.page_counts(), [0, 0]);
+    }
+
+    #[test]
+    fn destructive_empty() {
+        let mut case = SceneCase::new(32, 8);
+        case.layer(|case| {
+            case.draw(Rect::new(0.0, 0.0, 16.0, 8.0), 0.5);
+            case.layer_with(
+                None,
+                Some(BlendMode::new(Mix::Normal, Compose::Clear)),
+                None,
+                |_| {},
+            );
+        });
+
+        let scheduled = case.schedule_root();
+
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert!(scheduled.scratch_texture());
+        assert_eq!(scheduled.storage.buffers.blend_ops.len(), 1);
+    }
+
+    #[test]
+    fn layer_clip() {
+        let clip = Rect::new(8.0, 0.0, 16.0, 8.0);
+        let mut clipped = SceneCase::new(32, 8);
+        clipped.layer_with(Some(clip), None, None, |case| {
+            case.draw(Rect::new(0.0, 0.0, 24.0, 8.0), 0.5);
+        });
+        let scheduled = clipped.schedule_root();
+        let views = scheduled.views();
+        assert_eq!(scheduled.page_counts(), [0, 1]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].odd.x.len(), 1);
+        assert!(views[0].root.has_child_layer);
+        assert_eq!(views[0].clears[TextureParity::Odd.get_parity()].len(), 1);
+
+        let mut disjoint = SceneCase::new(32, 8);
+        disjoint.layer_with(Some(Rect::new(24.0, 0.0, 32.0, 8.0)), None, None, |case| {
+            case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5)
+        });
+        let scheduled = disjoint.schedule_root();
+        assert!(scheduled.views().is_empty());
+        assert_eq!(scheduled.page_counts(), [0, 0]);
+    }
+
+    #[test]
+    fn filter_layer() {
+        let mut case = SceneCase::new(64, 16);
+        let clip = Rect::new(16.0, 0.0, 24.0, 8.0);
+        let filter = Filter::from_primitive(FilterPrimitive::Offset { dx: 8.0, dy: 0.0 });
+        case.layer_with(Some(clip), None, Some(filter), |case| {
+            case.draw(Rect::new(8.0, 0.0, 16.0, 8.0), 0.5);
+        });
+
+        let scheduled = case.schedule(RootRenderTarget::UserSurface, SizeU16::new(128), 2);
+        let views = scheduled.views();
+
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert_eq!(views.len(), 1);
+        assert_eq!(views[0].odd.x.len(), 1);
+        assert_eq!(views[0].filter_passes, [0, 1]);
+        assert!(views[0].root.has_child_layer);
+        assert_eq!(scheduled.total_clears(), 2);
     }
 }
