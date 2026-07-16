@@ -233,3 +233,207 @@ impl AtlasExt for Atlas {
         );
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        AtlasExt, Atlases, FILTER_ATLAS_PADDING, LayerAllocationRequest, RegionAllocationRequest,
+    };
+    use crate::scene::LayersConfig;
+    use crate::schedule::{LayerSamplePlacement, OpenLayer};
+    use crate::target::{LayerTextureId, TextureParity};
+    use vello_common::filter::{FilterData, FilterLayerPlacement};
+    use vello_common::filter_effects::{Filter, FilterPrimitive};
+    use vello_common::geometry::{RectU16, SizeU16};
+    use vello_common::kurbo::Affine;
+    use vello_common::multi_atlas::{Atlas, AtlasError, AtlasId};
+    use vello_common::record::RecordedLayerKind;
+
+    fn config(max_textures: usize) -> LayersConfig {
+        LayersConfig {
+            max_textures: Some(max_textures),
+            ..Default::default()
+        }
+    }
+
+    fn request(
+        texture_parity: TextureParity,
+        size: SizeU16,
+        padding: u16,
+    ) -> LayerAllocationRequest {
+        LayerAllocationRequest {
+            texture_parity,
+            region: RegionAllocationRequest { size, padding },
+        }
+    }
+
+    fn open_layer(kind: &RecordedLayerKind) -> OpenLayer<'_> {
+        let bbox = RectU16::new(4, 8, 20, 32);
+        OpenLayer {
+            cmds: &[],
+            kind,
+            texture_parity: TextureParity::Odd,
+            bbox,
+            sample: LayerSamplePlacement::regular(bbox),
+            target: None,
+        }
+    }
+
+    #[test]
+    fn layer_requests() {
+        let regular_kind = RecordedLayerKind::Regular;
+        let regular = LayerAllocationRequest::new(&open_layer(&regular_kind));
+        assert_eq!(regular.texture_parity, TextureParity::Odd);
+        assert_eq!(regular.region.size, SizeU16::from_wh(16, 24));
+        assert_eq!(regular.region.padding, 0);
+
+        let filter_kind = RecordedLayerKind::Filter {
+            filter_data: FilterData::new(
+                Filter::from_primitive(FilterPrimitive::Offset { dx: 1.0, dy: 2.0 }),
+                Affine::IDENTITY,
+            ),
+            placement: FilterLayerPlacement {
+                pixmap_bbox: RectU16::ZERO,
+                dest_bbox: RectU16::ZERO,
+                src_x: 0,
+                src_y: 0,
+            },
+        };
+        let filter = LayerAllocationRequest::new(&open_layer(&filter_kind));
+        assert_eq!(filter.texture_parity, TextureParity::Odd);
+        assert_eq!(filter.region.size, SizeU16::from_wh(16, 24));
+        assert_eq!(filter.region.padding, FILTER_ATLAS_PADDING);
+
+        let temporary = LayerAllocationRequest::filter_temporary(
+            RectU16::new(10, 20, 42, 68),
+            TextureParity::Even,
+        );
+        assert_eq!(temporary.texture_parity, TextureParity::Even);
+        assert_eq!(temporary.region.size, SizeU16::from_wh(32, 48));
+        assert_eq!(temporary.region.padding, FILTER_ATLAS_PADDING);
+    }
+
+    #[test]
+    fn page_selection() {
+        let size = SizeU16::new(8);
+        let mut atlases = Atlases::new(size, config(3));
+        let even = request(TextureParity::Even, size, 0);
+        let odd = request(TextureParity::Odd, size, 0);
+
+        atlases.add_layer_atlas(TextureParity::Even).unwrap();
+        let even_0 = atlases.allocate_layer(&even).unwrap();
+        assert_eq!(
+            even_0.region.target,
+            LayerTextureId::new(TextureParity::Even, 0)
+        );
+        // It's already full.
+        assert!(atlases.allocate_layer(&even).is_none());
+
+        atlases.add_layer_atlas(TextureParity::Even).unwrap();
+        let even_1 = atlases.allocate_layer(&even).unwrap();
+        assert_eq!(
+            even_1.region.target,
+            LayerTextureId::new(TextureParity::Even, 1)
+        );
+
+        atlases.add_layer_atlas(TextureParity::Odd).unwrap();
+        let odd_0 = atlases.allocate_layer(&odd).unwrap();
+        assert_eq!(
+            odd_0.region.target,
+            LayerTextureId::new(TextureParity::Odd, 0)
+        );
+
+        atlases.deallocate(even_0);
+        let reused = atlases.allocate_layer(&even).unwrap();
+        assert_eq!(
+            reused.region.target,
+            LayerTextureId::new(TextureParity::Even, 0)
+        );
+    }
+
+    #[test]
+    fn page_capacity() {
+        let mut atlases = Atlases::new(SizeU16::from_wh(16, 8), config(1));
+        let request = request(TextureParity::Even, SizeU16::new(8), 0);
+        atlases.add_layer_atlas(TextureParity::Even).unwrap();
+
+        let first = atlases.allocate_layer(&request).unwrap();
+        let second = atlases.allocate_layer(&request).unwrap();
+        assert_eq!(
+            first.region.target,
+            LayerTextureId::new(TextureParity::Even, 0)
+        );
+        assert_eq!(
+            second.region.target,
+            LayerTextureId::new(TextureParity::Even, 0)
+        );
+
+        assert!(atlases.allocate_layer(&request).is_none());
+        assert!(matches!(
+            atlases.add_layer_atlas(TextureParity::Even),
+            Err(AtlasError::NoSpaceAvailable)
+        ));
+    }
+
+    #[test]
+    fn padded_reuse() {
+        let mut atlas = Atlas::new(AtlasId::new(0), 8, 8);
+        let request = RegionAllocationRequest {
+            size: SizeU16::new(6),
+            padding: 1,
+        };
+
+        let allocation = atlas.allocate_region((), request).unwrap();
+        assert_eq!(allocation.region.rect, RectU16::new(1, 1, 7, 7));
+        assert_eq!(allocation.clear_region().rect, RectU16::new(1, 1, 7, 7));
+        assert_eq!(allocation.allocation_region(), RectU16::new(0, 0, 8, 8));
+        assert!(atlas.allocate_region((), request).is_none());
+
+        atlas.deallocate_region(allocation);
+        let reused = atlas.allocate_region((), request).unwrap();
+        assert_eq!(reused.region.rect, RectU16::new(1, 1, 7, 7));
+    }
+
+    #[test]
+    fn texture_budget() {
+        let mut atlases = Atlases::new(SizeU16::new(8), config(2));
+
+        atlases.add_layer_atlas(TextureParity::Even).unwrap();
+        atlases.require_scratch_texture().unwrap();
+        atlases.require_scratch_texture().unwrap();
+
+        assert!(atlases.scratch_texture());
+        assert!(matches!(
+            atlases.add_layer_atlas(TextureParity::Odd),
+            Err(AtlasError::NoSpaceAvailable)
+        ));
+    }
+
+    #[test]
+    fn oversized_regions() {
+        let mut atlas = Atlas::new(AtlasId::new(0), 8, 8);
+
+        assert!(
+            atlas
+                .allocate_region(
+                    (),
+                    RegionAllocationRequest {
+                        size: SizeU16::from_wh(9, 8),
+                        padding: 0,
+                    },
+                )
+                .is_none()
+        );
+        assert!(
+            atlas
+                .allocate_region(
+                    (),
+                    RegionAllocationRequest {
+                        size: SizeU16::new(8),
+                        padding: 1,
+                    },
+                )
+                .is_none()
+        );
+    }
+}
