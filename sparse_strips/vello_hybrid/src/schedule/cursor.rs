@@ -116,3 +116,116 @@ impl Cursor {
         self.current_round += 1;
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::Cursor;
+    use crate::scene::LayersConfig;
+    use crate::schedule::allocate::{Atlases, LayerAllocationRequest};
+    use crate::schedule::{LayerSamplePlacement, OpenLayer};
+    use crate::target::{LayerTextureId, TextureParity};
+    use vello_common::geometry::{RectU16, SizeU16};
+    use vello_common::multi_atlas::AtlasError;
+    use vello_common::record::RecordedLayerKind;
+
+    fn cursor(max_textures: usize) -> Cursor {
+        let config = LayersConfig {
+            max_textures: Some(max_textures),
+            ..Default::default()
+        };
+
+        Cursor::new(Atlases::new(SizeU16::new(8), config))
+    }
+
+    fn request(texture_parity: TextureParity, size: SizeU16) -> LayerAllocationRequest {
+        let kind = RecordedLayerKind::Regular;
+        let bbox = RectU16::new(0, 0, size.width(), size.height());
+        let layer = OpenLayer {
+            cmds: &[],
+            kind: &kind,
+            texture_parity,
+            bbox,
+            sample: LayerSamplePlacement::regular(bbox),
+            target: None,
+        };
+
+        LayerAllocationRequest::new(&layer)
+    }
+
+    #[test]
+    fn current_space() {
+        let mut cursor = cursor(1);
+        let request = request(TextureParity::Even, SizeU16::from_wh(4, 8));
+
+        let first = cursor.allocate_layer(request).unwrap();
+        let second = cursor.allocate_layer(request).unwrap();
+
+        assert_eq!(first.round_idx, 0);
+        assert_eq!(second.round_idx, 0);
+        assert_eq!(cursor.current_round(), 0);
+        assert_eq!(
+            first.allocation.region.target,
+            second.allocation.region.target
+        );
+        assert_ne!(first.allocation.region.rect, second.allocation.region.rect);
+    }
+
+    #[test]
+    fn deferred_reuse() {
+        let mut cursor = cursor(1);
+        let request = request(TextureParity::Even, SizeU16::new(8));
+        let first = cursor.allocate_layer(request).unwrap();
+        cursor.release(first.allocation, 2);
+
+        let reused = cursor.allocate_layer(request).unwrap();
+
+        assert_eq!(reused.round_idx, 3);
+        assert_eq!(cursor.current_round(), 3);
+    }
+
+    #[test]
+    fn page_growth() {
+        let mut cursor = cursor(3);
+        let even = request(TextureParity::Even, SizeU16::new(8));
+        let odd = request(TextureParity::Odd, SizeU16::new(8));
+        cursor.allocate_layer(even).unwrap();
+        let released = cursor.allocate_layer(odd).unwrap();
+        cursor.release(released.allocation, 1);
+
+        let grown = cursor.allocate_layer(even).unwrap();
+
+        assert_eq!(grown.round_idx, 2);
+        assert_eq!(cursor.current_round(), 2);
+        assert_eq!(
+            grown.allocation.region.target,
+            LayerTextureId::new(TextureParity::Even, 1)
+        );
+    }
+
+    #[test]
+    fn texture_limit() {
+        let mut cursor = cursor(2);
+        let even = request(TextureParity::Even, SizeU16::new(8));
+        let odd = request(TextureParity::Odd, SizeU16::new(8));
+        cursor.allocate_layer(even).unwrap();
+        let released = cursor.allocate_layer(odd).unwrap();
+        cursor.release(released.allocation, 1);
+
+        assert!(matches!(
+            cursor.allocate_layer(even),
+            Err(AtlasError::NoSpaceAvailable)
+        ));
+    }
+
+    #[test]
+    #[should_panic(expected = "cannot release an allocation in a round already passed")]
+    fn past_release() {
+        let mut cursor = cursor(1);
+        let allocation = cursor
+            .allocate_layer(request(TextureParity::Even, SizeU16::new(8)))
+            .unwrap();
+        cursor.advance();
+
+        cursor.release(allocation.allocation, 0);
+    }
+}
