@@ -812,6 +812,7 @@ impl ScheduleTarget for LayerTextureRegion {
 
 #[cfg(test)]
 mod tests {
+    use super::ScheduleStorage;
     use super::test_support::SceneCase;
     use crate::target::{RootRenderTarget, TextureParity};
     use vello_common::filter_effects::{Filter, FilterPrimitive};
@@ -1035,5 +1036,67 @@ mod tests {
         assert_eq!(views[0].filter_passes, [0, 1]);
         assert!(views[0].root.has_child_layer);
         assert_eq!(scheduled.total_clears(), 2);
+    }
+
+    #[test]
+    fn storage_reuse() {
+        let mut first = SceneCase::new(64, 16);
+        first.layer(|case| {
+            case.draw(Rect::new(0.0, 0.0, 32.0, 8.0), 0.5);
+            case.layer_with(
+                Some(Rect::new(8.0, 0.0, 24.0, 8.0)),
+                Some(BlendMode::new(Mix::Normal, Compose::Clear)),
+                None,
+                |case| case.draw(Rect::new(8.0, 0.0, 24.0, 8.0), 0.5),
+            );
+            case.layer_with(
+                None,
+                None,
+                Some(Filter::from_primitive(FilterPrimitive::Offset {
+                    dx: 4.0,
+                    dy: 0.0,
+                })),
+                |case| case.draw(Rect::new(32.0, 0.0, 40.0, 8.0), 0.5),
+            );
+        });
+
+        let mut storage = ScheduleStorage::default();
+        let first_schedule = first.schedule_into(
+            &mut storage,
+            RootRenderTarget::UserSurface,
+            SizeU16::new(128),
+            4,
+        );
+
+        assert!(!storage.buffers.draw_buffers.strips.is_empty());
+        assert!(!storage.buffers.blend_ops.is_empty());
+        assert!(!storage.buffers.blend_strips.is_empty());
+        assert!(!storage.buffers.filter_ops.is_empty());
+        assert!(!storage.filter_context.is_empty());
+        assert!(!first_schedule.rounds.rounds.is_empty());
+
+        let mut second = SceneCase::new(64, 16);
+        second.draw_at(48.0, 0.5);
+        let second_schedule = second.schedule_into(
+            &mut storage,
+            RootRenderTarget::UserSurface,
+            SizeU16::new(128),
+            4,
+        );
+
+        assert_eq!(storage.buffers.draw_buffers.strips.len(), 1);
+        assert!(storage.buffers.draw_buffers.opaque_strips.is_empty());
+        assert!(storage.buffers.blend_ops.is_empty());
+        assert!(storage.buffers.blend_strips.is_empty());
+        assert!(storage.buffers.filter_ops.is_empty());
+        assert!(storage.filter_context.is_empty());
+        assert_eq!(second_schedule.rounds.rounds.len(), 1);
+        let round = &second_schedule.rounds.rounds[0];
+        assert_eq!(round.root_draw.strip_ranges.len(), 1);
+        assert!(round.root_draw.external_texture_runs.is_empty());
+        assert_eq!(round.layer_texture_passes[0].filter_ranges.len(), 0);
+        assert_eq!(round.layer_texture_passes[1].filter_ranges.len(), 0);
+        assert_eq!(round.layer_texture_passes[0].blend_ranges.len(), 0);
+        assert_eq!(round.layer_texture_passes[1].blend_ranges.len(), 0);
     }
 }

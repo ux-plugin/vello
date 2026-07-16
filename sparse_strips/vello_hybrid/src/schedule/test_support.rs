@@ -1,4 +1,4 @@
-use super::{Schedule, ScheduleStorage};
+use super::{RendererBackend, Schedule, ScheduleStorage};
 use crate::draw::Draw;
 use crate::paint::PaintResolver;
 use crate::scene::LayersConfig;
@@ -57,10 +57,26 @@ impl SceneCase {
         max_textures: usize,
     ) -> ScheduledCase {
         let mut storage = ScheduleStorage::default();
+        let schedule = self.schedule_into(&mut storage, root_target, texture_size, max_textures);
+
+        ScheduledCase {
+            schedule,
+            storage,
+            root_target,
+        }
+    }
+
+    pub(super) fn schedule_into(
+        &self,
+        storage: &mut ScheduleStorage,
+        root_target: RootRenderTarget,
+        texture_size: SizeU16,
+        max_textures: usize,
+    ) -> Schedule {
         let encoded = self.scene.encoded_paints.borrow();
         let offsets = vec![0; encoded.len()];
-        let schedule = Schedule::try_new(
-            &mut storage,
+        Schedule::try_new(
+            storage,
             &self.scene,
             root_target,
             PaintResolver::new(&encoded, &offsets),
@@ -70,9 +86,7 @@ impl SceneCase {
                 ..Default::default()
             },
         )
-        .unwrap();
-
-        ScheduledCase { schedule, storage }
+        .unwrap()
     }
 
     pub(super) fn schedule_root(&self) -> ScheduledCase {
@@ -100,9 +114,14 @@ pub(super) struct RoundView {
 pub(super) struct ScheduledCase {
     pub(super) schedule: Schedule,
     pub(super) storage: ScheduleStorage,
+    root_target: RootRenderTarget,
 }
 
 impl ScheduledCase {
+    pub(super) fn execute<R: RendererBackend>(mut self, renderer: &mut R) {
+        super::execute(renderer, &mut self.storage, self.schedule, self.root_target);
+    }
+
     pub(super) fn page_counts(&self) -> [usize; 2] {
         self.schedule.layer_page_counts()
     }

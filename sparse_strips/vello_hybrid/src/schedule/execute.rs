@@ -147,3 +147,215 @@ impl Rounds {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::schedule::test_support::{SceneCase, ScheduledCase};
+    use alloc::vec::Vec;
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Call {
+        Opaque,
+        Draw(DrawPassTarget, Option<LayerTextureId>),
+        Filter(LayerTextureId),
+        Blend(TextureParity),
+        Clear(LayerTextureId),
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Stage {
+        Opaque,
+        EvenDraw,
+        EvenFilter,
+        EvenBlend,
+        OddDraw,
+        OddFilter,
+        OddBlend,
+        RootDraw,
+        EvenClear,
+        OddClear,
+    }
+
+    impl Call {
+        fn stage(self) -> Stage {
+            match self {
+                Self::Opaque => Stage::Opaque,
+                Self::Draw(DrawPassTarget::Layer(id), _) => match id.texture_parity {
+                    TextureParity::Even => Stage::EvenDraw,
+                    TextureParity::Odd => Stage::OddDraw,
+                },
+                Self::Draw(DrawPassTarget::Root(_), _) => Stage::RootDraw,
+                Self::Filter(id) => match id.texture_parity {
+                    TextureParity::Even => Stage::EvenFilter,
+                    TextureParity::Odd => Stage::OddFilter,
+                },
+                Self::Blend(TextureParity::Even) => Stage::EvenBlend,
+                Self::Blend(TextureParity::Odd) => Stage::OddBlend,
+                Self::Clear(id) => match id.texture_parity {
+                    TextureParity::Even => Stage::EvenClear,
+                    TextureParity::Odd => Stage::OddClear,
+                },
+            }
+        }
+    }
+
+    #[derive(Default)]
+    struct Recorder {
+        calls: Vec<Call>,
+    }
+
+    impl RendererBackend for Recorder {
+        fn opaque_pass(&mut self, _strips: &[GpuStrip]) {
+            self.calls.push(Call::Opaque);
+        }
+
+        fn draw_pass(
+            &mut self,
+            _strips: RangedSlice<'_, GpuStrip>,
+            _external_texture_runs: &[ExternalTextureRun],
+            target: DrawPassTarget,
+            child_layer_texture: Option<LayerTextureId>,
+        ) {
+            self.calls.push(Call::Draw(target, child_layer_texture));
+        }
+
+        fn clear_pass(&mut self, target: LayerTextureId, _rects: &[RectU16]) {
+            self.calls.push(Call::Clear(target));
+        }
+
+        fn blend_pass(
+            &mut self,
+            _blends: RangedSlice<'_, BlendOp>,
+            _blend_strips: &[BlendStrip],
+            parent_texture_parity: TextureParity,
+            _texture_pair: LayerTexturePair,
+        ) {
+            self.calls.push(Call::Blend(parent_texture_parity));
+        }
+
+        fn filter_pass(&mut self, _plan: &FilterPassPlan, textures: FilterTexturePair) {
+            self.calls.push(Call::Filter(textures.original()));
+        }
+    }
+
+    fn layer_id(parity: TextureParity) -> LayerTextureId {
+        LayerTextureId::new(parity, 0)
+    }
+
+    fn execution_case(root_target: RootRenderTarget, depth: usize) -> ScheduledCase {
+        fn chain(case: &mut SceneCase, depth: usize) {
+            case.layer(|case| {
+                if depth == 1 {
+                    case.draw_at(4.0, 0.5);
+                } else {
+                    chain(case, depth - 1);
+                }
+            });
+        }
+
+        let mut case = SceneCase::new(16, 8);
+        chain(&mut case, depth);
+        case.schedule(root_target, SizeU16::new(64), 2)
+    }
+
+    #[test]
+    fn round_order() {
+        let mut recorder = Recorder::default();
+        execution_case(RootRenderTarget::UserSurface, 2).execute(&mut recorder);
+
+        assert_eq!(
+            recorder
+                .calls
+                .into_iter()
+                .map(Call::stage)
+                .collect::<Vec<_>>(),
+            [
+                Stage::Opaque,
+                Stage::EvenDraw,
+                Stage::EvenFilter,
+                Stage::EvenBlend,
+                Stage::OddDraw,
+                Stage::OddFilter,
+                Stage::OddBlend,
+                Stage::RootDraw,
+                Stage::EvenClear,
+                Stage::OddClear,
+            ]
+        );
+    }
+
+    #[test]
+    fn two_round_order() {
+        let mut recorder = Recorder::default();
+        execution_case(RootRenderTarget::UserSurface, 3).execute(&mut recorder);
+
+        assert_eq!(
+            recorder
+                .calls
+                .into_iter()
+                .map(Call::stage)
+                .collect::<Vec<_>>(),
+            [
+                // First round.
+                Stage::Opaque,
+                Stage::EvenDraw,
+                Stage::EvenFilter,
+                Stage::EvenBlend,
+                Stage::OddDraw,
+                Stage::OddFilter,
+                Stage::OddBlend,
+                Stage::RootDraw,
+                Stage::EvenClear,
+                Stage::OddClear,
+                // Second round.
+                Stage::EvenDraw,
+                Stage::EvenFilter,
+                Stage::EvenBlend,
+                Stage::OddDraw,
+                Stage::OddFilter,
+                Stage::OddBlend,
+                Stage::RootDraw,
+                Stage::EvenClear,
+                Stage::OddClear,
+            ]
+        );
+    }
+
+    #[test]
+    fn child_bindings() {
+        let mut recorder = Recorder::default();
+        execution_case(RootRenderTarget::UserSurface, 2).execute(&mut recorder);
+
+        let draws = recorder
+            .calls
+            .into_iter()
+            .filter_map(|call| match call {
+                Call::Draw(target, child) => Some((target, child)),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(
+            draws,
+            [
+                (DrawPassTarget::Layer(layer_id(TextureParity::Even)), None,),
+                (
+                    DrawPassTarget::Layer(layer_id(TextureParity::Odd)),
+                    Some(layer_id(TextureParity::Even)),
+                ),
+                (
+                    DrawPassTarget::Root(RootRenderTarget::UserSurface),
+                    Some(layer_id(TextureParity::Odd)),
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn atlas_skips_opaque() {
+        let mut recorder = Recorder::default();
+        execution_case(RootRenderTarget::AtlasLayer, 2).execute(&mut recorder);
+
+        assert!(!recorder.calls.contains(&Call::Opaque));
+    }
+}
