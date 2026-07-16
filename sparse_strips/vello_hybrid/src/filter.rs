@@ -647,8 +647,114 @@ impl FilterContext {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::schedule::round::FilterTextureRegions;
+    use crate::target::{LayerTextureId, TextureParity, TextureRegion};
     use vello_common::color::AlphaColor;
     use vello_common::filter::gaussian_blur::{compute_gaussian_kernel, plan_decimated_blur};
+
+    fn region(parity: TextureParity) -> TextureRegion<LayerTextureId> {
+        TextureRegion {
+            target: LayerTextureId::new(parity, 0),
+            rect: RectU16::new(0, 0, 32, 24),
+        }
+    }
+
+    fn filter_op(gpu_filter: GpuFilterData, filter_data_offset: u32) -> FilterOp {
+        FilterOp {
+            textures: FilterTextureRegions::new(
+                region(TextureParity::Odd),
+                region(TextureParity::Even),
+            ),
+            filter_data_offset,
+            gpu_filter,
+        }
+    }
+
+    fn gpu_offset() -> GpuFilterData {
+        GpuOffset::from(&Offset::new(1.0, 2.0)).into()
+    }
+
+    fn gpu_blur(std_deviation: f32) -> GpuFilterData {
+        GpuGaussianBlur::from(&GaussianBlur::new(std_deviation, EdgeMode::None)).into()
+    }
+
+    fn gpu_shadow() -> GpuFilterData {
+        GpuDropShadow::from(&DropShadow::new(
+            3.0,
+            -4.0,
+            8.0,
+            EdgeMode::None,
+            AlphaColor::new([0.0, 0.0, 0.0, 1.0]),
+        ))
+        .into()
+    }
+
+    fn step_layout(plan: &FilterPassPlan) -> Vec<Vec<(u32, u32)>> {
+        plan.steps()
+            .map(|step| {
+                step.iter()
+                    .map(|instance| (instance.filter_data_offset, instance.other_data))
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn pass_batching() {
+        let mut plan = FilterPassPlan::default();
+        plan.init(
+            [
+                filter_op(gpu_offset(), 0),
+                filter_op(gpu_blur(8.0), 1),
+                filter_op(gpu_shadow(), 2),
+            ],
+            SizeU16::new(64),
+        );
+
+        assert_eq!(
+            step_layout(&plan),
+            alloc::vec![
+                alloc::vec![
+                    (0, pass_kind::OFFSET),
+                    (1, pass_kind::DOWNSCALE),
+                    (2, pass_kind::OFFSET),
+                ],
+                alloc::vec![
+                    (0, pass_kind::COPY),
+                    (1, pass_kind::DOWNSCALE),
+                    (2, pass_kind::DOWNSCALE),
+                ],
+                alloc::vec![(1, pass_kind::BLUR_H), (2, pass_kind::DOWNSCALE)],
+                alloc::vec![(1, pass_kind::BLUR_V), (2, pass_kind::BLUR_H)],
+                alloc::vec![(1, pass_kind::UPSCALE), (2, pass_kind::BLUR_V)],
+                alloc::vec![(1, pass_kind::UPSCALE), (2, pass_kind::UPSCALE)],
+                alloc::vec![(2, pass_kind::UPSCALE)],
+                alloc::vec![(2, pass_kind::COMPOSITE_DROP_SHADOW)],
+            ]
+        );
+    }
+
+    #[test]
+    fn plan_reinit() {
+        let mut plan = FilterPassPlan::default();
+        plan.init(
+            [filter_op(gpu_shadow(), 0), filter_op(gpu_blur(8.0), 1)],
+            SizeU16::new(64),
+        );
+        assert!(!plan.copy_pass().is_empty());
+        assert!(plan.steps().count() > 2);
+
+        plan.init([filter_op(gpu_offset(), 0)], SizeU16::new(64));
+
+        assert!(plan.copy_pass().is_empty());
+        assert_eq!(
+            step_layout(&plan),
+            [
+                alloc::vec![(0, pass_kind::OFFSET)],
+                alloc::vec![(0, pass_kind::COPY)],
+            ]
+        );
+    }
 
     #[test]
     fn test_offset_conversion() {
