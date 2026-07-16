@@ -2089,7 +2089,7 @@ fn create_webgl_resources(
     let strips_buffer = Buffer::new(gl);
     let view_config_buffer = Buffer::new(gl);
     let max_texture_dimension_2d = get_max_texture_dimension_2d(gl);
-    let texture_size = layer_config.initial_intermediate_texture_size();
+    let texture_size = layer_config.min_texture_size;
     let layer_config_buffers = core::array::from_fn(|_| {
         let buffer = Buffer::new(gl);
         upload_layer_config_buffer(gl, &buffer, texture_size, max_texture_dimension_2d);

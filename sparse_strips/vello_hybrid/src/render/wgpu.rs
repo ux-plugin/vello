@@ -1579,7 +1579,7 @@ impl Programs {
             &copy_vertex_state,
         );
 
-        let texture_size = layer_config.initial_intermediate_texture_size();
+        let texture_size = layer_config.min_texture_size;
         let filter_sampler = device.create_sampler(&wgpu::SamplerDescriptor {
             label: Some("Filter Linear Sampler"),
             mag_filter: wgpu::FilterMode::Linear,

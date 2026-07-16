@@ -11,7 +11,7 @@
 use crate::blend::GpuBlendInstance;
 use crate::copy::GpuCopyInstance;
 use crate::filter::FILTER_ATLAS_PADDING;
-use crate::scene::{LayersConfig, MemorySettings, RecordedDraw, TextureAllocationStrategy};
+use crate::scene::{LayersConfig, MemorySettings, RecordedDraw};
 use alloc::vec::Vec;
 use bytemuck::{Pod, Zeroable};
 use vello_common::geometry::{SizeU16, SizeU32};
@@ -123,13 +123,6 @@ impl MemorySettings {
 }
 
 impl LayersConfig {
-    pub(crate) fn initial_intermediate_texture_size(self) -> SizeU16 {
-        match self.grow_strategy {
-            TextureAllocationStrategy::Eager => self.max_texture_size,
-            TextureAllocationStrategy::Conservative => self.min_texture_size,
-        }
-    }
-
     pub(crate) fn required_intermediate_texture_size(
         self,
         recorder: &CommandRecorder<RecordedDraw>,
@@ -167,14 +160,7 @@ impl LayersConfig {
             layer_size = layer_size.max(SizeU32::from(recorder.scene_size));
         }
 
-        let layer_size = checked_size(layer_size)?;
-        // Always allocate at the maximum allowed by the user for `Eager`.
-        if self.grow_strategy == TextureAllocationStrategy::Eager {
-            return Ok(self.initial_intermediate_texture_size());
-        }
-
-        let layer_size = layer_size.max(min_size);
-        Ok(layer_size)
+        Ok(checked_size(layer_size)?.max(min_size))
     }
 }
 
@@ -182,7 +168,7 @@ impl LayersConfig {
 mod tests {
     use super::DeviceLimits;
     use crate::scene::RecordedDraw;
-    use crate::{LayersConfig, MemorySettings, SizeU16, TextureAllocationStrategy};
+    use crate::{LayersConfig, MemorySettings, SizeU16};
     use vello_common::multi_atlas::{AtlasConfig, AtlasError};
     use vello_common::record::CommandRecorder;
 
@@ -298,25 +284,19 @@ mod tests {
         let mut recorder = CommandRecorder::<RecordedDraw>::new(10, 10);
         recorder.largest_layer_size = Some(SizeU16::from_wh(513, 10));
 
-        for grow_strategy in [
-            TextureAllocationStrategy::Eager,
-            TextureAllocationStrategy::Conservative,
-        ] {
-            let config = LayersConfig {
-                min_texture_size: SizeU16::new(1),
-                max_texture_size: SizeU16::new(512),
-                grow_strategy,
-                ..Default::default()
-            };
+        let config = LayersConfig {
+            min_texture_size: SizeU16::new(1),
+            max_texture_size: SizeU16::new(512),
+            ..Default::default()
+        };
 
-            assert!(matches!(
-                config.required_intermediate_texture_size(&recorder),
-                Err(AtlasError::TextureTooLarge {
-                    width: 513,
-                    height: 10
-                })
-            ));
-        }
+        assert!(matches!(
+            config.required_intermediate_texture_size(&recorder),
+            Err(AtlasError::TextureTooLarge {
+                width: 513,
+                height: 10
+            })
+        ));
     }
 }
 
