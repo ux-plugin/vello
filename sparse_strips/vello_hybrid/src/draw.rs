@@ -426,3 +426,234 @@ impl StripAlphaFillSegmentExt for StripAlphaFillSegment {
         self.alpha_idx / u32::from(Tile::HEIGHT)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{Draw, DrawBuffers, DrawBuilder, DrawState, ExternalTextureRun};
+    use crate::paint::PaintResolver;
+    use crate::scene::{RecordedDraw, RecordedRect};
+    use crate::target::{
+        DrawTarget, LayerTextureId, LayerTextureRegion, RootRenderTarget, TextureParity,
+        TextureRegion,
+    };
+    use crate::util::VecExt;
+    use alloc::vec::Vec;
+    use vello_common::TextureId;
+    use vello_common::encode::{EncodedExternalTexture, EncodedPaint};
+    use vello_common::geometry::RectU16;
+    use vello_common::kurbo::{Affine, Rect};
+    use vello_common::paint::{IndexedPaint, Paint, PremulColor};
+    use vello_common::peniko::color::palette::css::BLUE;
+    use vello_common::peniko::{Extend, ImageQuality, ImageSampler};
+    use vello_common::strip_generator::StripStorage;
+    use vello_common::util::Clear;
+
+    struct DrawCase<T: DrawTarget> {
+        buffers: DrawBuffers,
+        state: DrawState<T>,
+        strip_storage: StripStorage,
+    }
+
+    impl<T: DrawTarget> DrawCase<T> {
+        fn new(target: T, bbox: RectU16) -> Self {
+            Self {
+                buffers: DrawBuffers::default(),
+                state: DrawState::new(target, bbox),
+                strip_storage: StripStorage::default(),
+            }
+        }
+
+        fn rect(
+            &mut self,
+            draw: &mut Draw,
+            rect: Rect,
+            paint: Paint,
+            paint_resolver: PaintResolver<'_>,
+        ) {
+            let recorded = RecordedDraw::Rect(RecordedRect { rect, paint });
+            DrawBuilder::new(draw, &mut self.buffers, &mut self.state).push_draw(
+                &recorded,
+                &self.strip_storage,
+                paint_resolver,
+            );
+        }
+
+        fn layer(&mut self, draw: &mut Draw, sample: LayerTextureRegion) {
+            DrawBuilder::new(draw, &mut self.buffers, &mut self.state).push_layer_fill(
+                sample,
+                1.0,
+                None,
+                &self.strip_storage,
+            );
+        }
+    }
+
+    fn solid(alpha: f32) -> Paint {
+        Paint::Solid(PremulColor::from_alpha_color(BLUE.with_alpha(alpha)))
+    }
+
+    fn indexed(index: usize) -> Paint {
+        Paint::Indexed(IndexedPaint::new(index))
+    }
+
+    fn rect(x: f64) -> Rect {
+        Rect::new(x, 0.0, x + 4.0, 4.0)
+    }
+
+    fn no_paints() -> PaintResolver<'static> {
+        PaintResolver::new(&[], &[])
+    }
+
+    fn external(texture_id: TextureId) -> EncodedPaint {
+        EncodedPaint::ExternalTexture(EncodedExternalTexture {
+            texture_id,
+            source_region: RectU16::new(0, 0, 8, 8),
+            sampler: ImageSampler {
+                x_extend: Extend::Pad,
+                y_extend: Extend::Pad,
+                quality: ImageQuality::Low,
+                alpha: 1.0,
+            },
+            may_have_transparency: true,
+            transform: Affine::IDENTITY,
+            tint: None,
+        })
+    }
+
+    fn layer(layer_bbox: RectU16) -> LayerTextureRegion {
+        LayerTextureRegion {
+            texture: TextureRegion {
+                target: LayerTextureId::new(TextureParity::Even, 0),
+                rect: RectU16::new(0, 0, layer_bbox.width(), layer_bbox.height()),
+            },
+            layer_bbox,
+        }
+    }
+
+    #[test]
+    fn texture_runs() {
+        let texture_a = TextureId(10);
+        let texture_b = TextureId(20);
+        let encoded = [external(texture_a), external(texture_b)];
+        let offsets = [0, 0];
+        let resolver = PaintResolver::new(&encoded, &offsets);
+        let mut case = DrawCase::new(RootRenderTarget::UserSurface, RectU16::new(0, 0, 32, 8));
+        let mut draw = Draw::default();
+        let mut other = Draw::default();
+
+        for (x, paint_index) in [(0.0, 0), (4.0, 0)] {
+            case.rect(&mut draw, rect(x), indexed(paint_index), resolver);
+        }
+        case.rect(&mut other, rect(8.0), solid(0.5), no_paints());
+        for (x, paint_index) in [(12.0, 1), (16.0, 1), (20.0, 0)] {
+            case.rect(&mut draw, rect(x), indexed(paint_index), resolver);
+        }
+
+        assert_eq!(
+            draw.external_texture_runs,
+            [
+                ExternalTextureRun {
+                    texture_id: texture_a,
+                    strips_start: 0,
+                },
+                ExternalTextureRun {
+                    texture_id: texture_b,
+                    strips_start: 2,
+                },
+                ExternalTextureRun {
+                    texture_id: texture_a,
+                    strips_start: 4,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn draw_clear() {
+        let texture_id = TextureId(10);
+        let encoded = [external(texture_id)];
+        let offsets = [0];
+        let resolver = PaintResolver::new(&encoded, &offsets);
+        let mut case = DrawCase::new(RootRenderTarget::UserSurface, RectU16::new(0, 0, 8, 8));
+        let mut draw = Draw::default();
+
+        case.rect(&mut draw, rect(0.0), indexed(0), resolver);
+        case.layer(&mut draw, layer(RectU16::new(0, 0, 8, 8)));
+        assert_eq!(draw.strip_ranges.len(), 2);
+        assert_eq!(draw.external_texture_runs.len(), 1);
+        assert!(draw.has_child_layer);
+
+        draw.clear();
+
+        assert_eq!(draw.strip_ranges.len(), 0);
+        assert!(draw.external_texture_runs.is_empty());
+        assert!(!draw.has_child_layer);
+
+        case.rect(&mut draw, rect(0.0), indexed(0), resolver);
+        assert_eq!(draw.strip_ranges.len(), 1);
+        assert_eq!(draw.external_texture_runs[0].strips_start, 0);
+    }
+
+    #[test]
+    fn opaque_routing() {
+        let mut user_case = DrawCase::new(RootRenderTarget::UserSurface, RectU16::new(0, 0, 16, 8));
+        let mut user_draw = Draw::default();
+        user_case.rect(&mut user_draw, rect(0.0), solid(1.0), no_paints());
+        user_case.rect(
+            &mut user_draw,
+            Rect::new(8.25, 0.0, 12.0, 4.0),
+            solid(1.0),
+            no_paints(),
+        );
+
+        assert_eq!(user_case.buffers.opaque_strips.len(), 1);
+        assert_eq!(user_draw.strip_ranges.len(), 1);
+
+        let mut atlas_case = DrawCase::new(RootRenderTarget::AtlasLayer, RectU16::new(0, 0, 8, 8));
+        let mut atlas_draw = Draw::default();
+        atlas_case.rect(&mut atlas_draw, rect(0.0), solid(1.0), no_paints());
+
+        assert!(atlas_case.buffers.opaque_strips.is_empty());
+        assert_eq!(atlas_draw.strip_ranges.len(), 1);
+    }
+
+    #[test]
+    fn child_binding() {
+        let mut case = DrawCase::new(RootRenderTarget::UserSurface, RectU16::new(0, 0, 8, 8));
+        let mut draw = Draw::default();
+
+        case.layer(&mut draw, layer(RectU16::new(0, 0, 8, 8)));
+        assert!(draw.has_child_layer);
+        assert_eq!(draw.strip_ranges.len(), 1);
+    }
+
+    #[test]
+    fn depth_progression() {
+        let mut case = DrawCase::new(RootRenderTarget::UserSurface, RectU16::new(0, 0, 64, 8));
+        let mut draw = Draw::default();
+        let opacity = [0.5, 0.5, 1.0, 0.5, 0.5, 1.0, 0.5];
+        let positions = [0.0, 8.0, 16.0, 24.0, 32.0, 40.0, 48.0];
+
+        for (x, alpha) in positions.into_iter().zip(opacity) {
+            case.rect(&mut draw, rect(x), solid(alpha), no_paints());
+        }
+
+        assert_eq!(
+            case.buffers
+                .strips
+                .ranged(&draw.strip_ranges)
+                .iter()
+                .map(|strip| strip.depth_index)
+                .collect::<Vec<_>>(),
+            [0, 0, 1, 1, 2]
+        );
+        assert_eq!(
+            case.buffers
+                .opaque_strips
+                .iter()
+                .map(|strip| strip.depth_index)
+                .collect::<Vec<_>>(),
+            [1, 2]
+        );
+    }
+}
