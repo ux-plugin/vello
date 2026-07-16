@@ -195,7 +195,54 @@ impl<'a, T> RangedSlice<'a, T> {
 
 #[cfg(test)]
 mod tests {
-    use super::DimensionConstraints;
+    use super::{DimensionConstraints, Ranges, VecExt};
+    use alloc::vec;
+    use alloc::vec::Vec;
+    use vello_common::util::Clear;
+
+    #[test]
+    fn ranged_slices() {
+        let mut buffer = Vec::new();
+        let mut selected = Ranges::default();
+        let mut other = Ranges::default();
+
+        buffer.push_ranged(&mut selected, 1);
+        buffer.push_ranged(&mut selected, 2);
+        buffer.push_ranged(&mut other, 10);
+        buffer.push_ranged(&mut selected, 3);
+        buffer.push_ranged(&mut selected, 4);
+        buffer.push_ranged(&mut selected, 5);
+        buffer.push_ranged(&mut other, 11);
+        buffer.push_ranged(&mut other, 12);
+        buffer.push_ranged(&mut selected, 6);
+
+        let view = buffer.ranged(&selected);
+        assert_eq!(view.len(), 6);
+        assert_eq!(
+            view.slices().collect::<Vec<_>>(),
+            vec![&[1, 2][..], &[3, 4, 5], &[6]]
+        );
+        assert_eq!(view.iter().copied().collect::<Vec<_>>(), [1, 2, 3, 4, 5, 6]);
+    }
+
+    #[test]
+    fn ranges_clear() {
+        let mut buffer = Vec::new();
+        let mut ranges = Ranges::default();
+
+        buffer.push_ranged(&mut ranges, 1);
+        buffer.push_ranged(&mut ranges, 2);
+        ranges.clear();
+
+        assert_eq!(ranges.len(), 0);
+        assert_eq!(buffer.ranged(&ranges).iter().count(), 0);
+
+        buffer.push_ranged(&mut ranges, 3);
+        assert_eq!(
+            buffer.ranged(&ranges).iter().copied().collect::<Vec<_>>(),
+            [3]
+        );
+    }
 
     #[test]
     fn calculate_dimensions_in_range() {
