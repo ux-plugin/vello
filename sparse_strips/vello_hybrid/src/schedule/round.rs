@@ -228,7 +228,7 @@ impl FilterTextureRegions {
     pub(crate) fn texture_binding(self) -> LayerTexturePairConstraint {
         LayerTexturePairConstraint::new(self.original.target)
             .merge(LayerTexturePairConstraint::new(self.temporary.target))
-            .expect("filter textures must form a valid texture pair")
+            .unwrap()
     }
 }
 
@@ -248,4 +248,269 @@ pub(crate) struct BlendOp {
     pub(crate) opacity: f32,
     /// Range of strips used for clipping the blend layer. If `None`, the blend spans its bbox.
     pub(crate) clip_strips: Option<Range<u32>>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        BlendOp, FilterOp, FilterTextureRegions, LayerStage, RoundStage, Rounds, SchedulePoint,
+    };
+    use crate::filter::GpuFilterData;
+    use crate::schedule::ScheduleBuffers;
+    use crate::target::{
+        LayerTextureId, LayerTexturePair, LayerTexturePairConstraint, LayerTextureRegion,
+        TextureParity, TextureRegion,
+    };
+    use crate::util::VecExt;
+    use bytemuck::Zeroable;
+    use vello_common::geometry::RectU16;
+    use vello_common::peniko::BlendMode;
+
+    fn layer_id(texture_parity: TextureParity, page_index: u16) -> LayerTextureId {
+        LayerTextureId::new(texture_parity, page_index)
+    }
+
+    fn region(texture_parity: TextureParity, page_index: u16) -> TextureRegion<LayerTextureId> {
+        TextureRegion {
+            target: layer_id(texture_parity, page_index),
+            rect: RectU16::new(0, 0, 16, 16),
+        }
+    }
+
+    fn layer_region(texture_parity: TextureParity, page_index: u16) -> LayerTextureRegion {
+        LayerTextureRegion {
+            texture: region(texture_parity, page_index),
+            layer_bbox: RectU16::new(0, 0, 16, 16),
+        }
+    }
+
+    fn filter_op(filter_data_offset: u32) -> FilterOp {
+        FilterOp {
+            textures: FilterTextureRegions::new(
+                region(TextureParity::Even, 0),
+                region(TextureParity::Odd, 0),
+            ),
+            filter_data_offset,
+            gpu_filter: GpuFilterData::zeroed(),
+        }
+    }
+
+    #[test]
+    fn schedule_point_next() {
+        let draw = SchedulePoint {
+            round: 4,
+            stage: RoundStage::Even(LayerStage::Draw),
+        };
+
+        assert_eq!(
+            draw.next(RoundStage::Even(LayerStage::Filter)),
+            SchedulePoint {
+                round: 4,
+                stage: RoundStage::Even(LayerStage::Filter),
+            }
+        );
+        assert_eq!(
+            draw.next(RoundStage::Odd(LayerStage::Draw)),
+            SchedulePoint {
+                round: 4,
+                stage: RoundStage::Odd(LayerStage::Draw),
+            }
+        );
+        assert_eq!(
+            draw.next(RoundStage::Even(LayerStage::Draw)),
+            SchedulePoint {
+                round: 5,
+                stage: RoundStage::Even(LayerStage::Draw),
+            }
+        );
+        assert_eq!(
+            draw.next(RoundStage::Start),
+            SchedulePoint {
+                round: 5,
+                stage: RoundStage::Start,
+            }
+        );
+    }
+
+    #[test]
+    fn binding_conflicts_even() {
+        let mut rounds = Rounds::default();
+        let requested = SchedulePoint {
+            round: 0,
+            stage: RoundStage::Even(LayerStage::Draw),
+        };
+
+        let even_page_1 = LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 1));
+        let odd_page_2 = LayerTexturePairConstraint::new(layer_id(TextureParity::Odd, 2));
+        let even_page_3 = LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 3));
+
+        // First round gets assigned even page 1.
+        assert_eq!(
+            rounds.resolve_binding_point(requested, even_page_1),
+            requested
+        );
+
+        // First round gets assigned odd page 2.
+        assert_eq!(
+            rounds.resolve_binding_point(requested, odd_page_2),
+            requested
+        );
+
+        // First round already has even page binding, so we much advance
+        // to next round.
+        assert_eq!(
+            rounds.resolve_binding_point(requested, even_page_3),
+            SchedulePoint {
+                round: 1,
+                ..requested
+            }
+        );
+
+        assert_eq!(
+            rounds.rounds[0].resolve_texture_binding(),
+            LayerTexturePair {
+                page_indices: [1, 2]
+            }
+        );
+        assert_eq!(
+            rounds.rounds[1].resolve_texture_binding(),
+            LayerTexturePair {
+                // 0 is just chosen as a dummy here.
+                page_indices: [3, 0]
+            }
+        );
+        assert_eq!(rounds.layer_page_counts, [4, 3]);
+    }
+
+    #[test]
+    fn binding_conflicts_odd() {
+        let mut rounds = Rounds::default();
+        let requested = SchedulePoint {
+            round: 0,
+            stage: RoundStage::Odd(LayerStage::Filter),
+        };
+
+        let even_page_1 = LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 1));
+        let odd_page_2 = LayerTexturePairConstraint::new(layer_id(TextureParity::Odd, 2));
+        let odd_page_4 = LayerTexturePairConstraint::new(layer_id(TextureParity::Odd, 4));
+
+        assert_eq!(
+            rounds.resolve_binding_point(requested, even_page_1),
+            requested
+        );
+        assert_eq!(
+            rounds.resolve_binding_point(requested, odd_page_2),
+            requested
+        );
+        assert_eq!(
+            rounds.resolve_binding_point(requested, odd_page_4),
+            SchedulePoint {
+                round: 1,
+                ..requested
+            }
+        );
+
+        assert_eq!(
+            rounds.rounds[0].resolve_texture_binding(),
+            LayerTexturePair {
+                page_indices: [1, 2]
+            }
+        );
+        assert_eq!(
+            rounds.rounds[1].resolve_texture_binding(),
+            LayerTexturePair {
+                page_indices: [0, 4]
+            }
+        );
+        assert_eq!(rounds.layer_page_counts, [2, 5]);
+    }
+
+    #[test]
+    fn binding_conflicts_skip_rounds() {
+        let mut rounds = Rounds::default();
+        let point = |round| SchedulePoint {
+            round,
+            stage: RoundStage::RootDraw,
+        };
+
+        rounds.resolve_binding_point(
+            point(0),
+            LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 0)),
+        );
+
+        rounds.resolve_binding_point(
+            point(1),
+            LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 1)),
+        );
+
+        assert_eq!(
+            rounds.resolve_binding_point(
+                point(0),
+                LayerTexturePairConstraint::new(layer_id(TextureParity::Even, 2)),
+            ),
+            point(2)
+        );
+        assert_eq!(rounds.rounds.len(), 3);
+        assert_eq!(rounds.layer_page_counts, [3, 0]);
+    }
+
+    #[test]
+    fn operation_ranges() {
+        let mut rounds = Rounds::default();
+        let mut buffers = ScheduleBuffers::default();
+        rounds.ensure_exists(0);
+
+        let round = &mut rounds.rounds[0];
+        round.push_filter_op(TextureParity::Even, &mut buffers, filter_op(10));
+        round.push_filter_op(TextureParity::Odd, &mut buffers, filter_op(20));
+        round.push_filter_op(TextureParity::Even, &mut buffers, filter_op(30));
+        round.push_blend_op(
+            TextureParity::Odd,
+            &mut buffers,
+            BlendOp {
+                parent_region: layer_region(TextureParity::Odd, 0),
+                child_region: layer_region(TextureParity::Even, 0),
+                blend_bbox: RectU16::new(0, 0, 16, 16),
+                blend_mode: BlendMode::default(),
+                opacity: 1.0,
+                clip_strips: None,
+            },
+        );
+
+        let even_clear_1 = RectU16::new(0, 0, 8, 8);
+        let odd_clear = RectU16::new(8, 0, 16, 8);
+        let even_clear_2 = RectU16::new(0, 8, 8, 16);
+        rounds.push_layer_clear(0, TextureParity::Even, even_clear_1);
+        rounds.push_layer_clear(0, TextureParity::Odd, odd_clear);
+        rounds.push_layer_clear(0, TextureParity::Even, even_clear_2);
+
+        let round = &rounds.rounds[0];
+        let even_pass = &round.layer_texture_passes[TextureParity::Even.get_parity()];
+        let odd_pass = &round.layer_texture_passes[TextureParity::Odd.get_parity()];
+        let even_offsets: alloc::vec::Vec<_> = buffers
+            .filter_ops
+            .ranged(&even_pass.filter_ranges)
+            .iter()
+            .map(|op| op.filter_data_offset)
+            .collect();
+        let odd_offsets: alloc::vec::Vec<_> = buffers
+            .filter_ops
+            .ranged(&odd_pass.filter_ranges)
+            .iter()
+            .map(|op| op.filter_data_offset)
+            .collect();
+
+        assert_eq!(even_offsets, [10, 30]);
+        assert_eq!(odd_offsets, [20]);
+        assert_eq!(even_pass.blend_ranges.len(), 0);
+        assert_eq!(odd_pass.blend_ranges.len(), 1);
+        assert_eq!(
+            round.layer_texture_clears[TextureParity::Even.get_parity()],
+            [even_clear_1, even_clear_2]
+        );
+        assert_eq!(
+            round.layer_texture_clears[TextureParity::Odd.get_parity()],
+            [odd_clear]
+        );
+    }
 }
