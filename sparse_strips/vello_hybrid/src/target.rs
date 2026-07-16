@@ -219,6 +219,7 @@ impl LayerTextureRegion {
     ///
     /// The given bbox must be fully contained within the layer bbox.
     pub(crate) fn texture_rect(self, bbox: RectU16) -> RectU16 {
+        // TODO: Explain
         let x0 = self.texture.rect.x0 + (bbox.x0.checked_sub(self.layer_bbox.x0).unwrap());
         let y0 = self.texture.rect.y0 + (bbox.y0.checked_sub(self.layer_bbox.y0).unwrap());
 
@@ -252,5 +253,50 @@ impl DrawTarget for LayerTextureRegion {
             self.texture.rect.x0 as i32 - i32::from(self.layer_bbox.x0),
             self.texture.rect.y0 as i32 - i32::from(self.layer_bbox.y0),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        LayerTextureId, LayerTexturePair, LayerTexturePairConstraint, LayerTextureRegion,
+        TextureParity, TextureRegion,
+    };
+    use vello_common::geometry::RectU16;
+
+    #[test]
+    fn texture_pair_constraints() {
+        let constraint = |pages| LayerTexturePairConstraint { pages };
+        let empty = constraint([None, None]);
+        let even = constraint([Some(2), None]);
+        let odd = constraint([None, Some(5)]);
+
+        assert_eq!(even.merge(empty).unwrap().pages, [Some(2), None]);
+        assert_eq!(empty.merge(even).unwrap().pages, [Some(2), None]);
+        assert_eq!(
+            even.merge(odd).unwrap().resolve(),
+            LayerTexturePair {
+                page_indices: [2, 5]
+            }
+        );
+        assert_eq!(even.merge(even).unwrap().pages, [Some(2), None]);
+        assert!(even.merge(constraint([Some(3), None])).is_none());
+        assert!(odd.merge(constraint([None, Some(6)])).is_none());
+    }
+
+    #[test]
+    fn texture_rect_translation() {
+        let layer = LayerTextureRegion {
+            texture: TextureRegion {
+                target: LayerTextureId::new(TextureParity::Even, 0),
+                rect: RectU16::new(100, 200, 150, 250),
+            },
+            layer_bbox: RectU16::new(10, 20, 60, 70),
+        };
+
+        assert_eq!(
+            layer.texture_rect(RectU16::new(15, 30, 25, 42)),
+            RectU16::new(105, 210, 115, 222)
+        );
     }
 }
