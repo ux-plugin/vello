@@ -814,6 +814,7 @@ impl ScheduleTarget for LayerTextureRegion {
 mod tests {
     use super::ScheduleStorage;
     use super::test_support::{SceneCase, ScheduledCase};
+    use crate::filter::FILTER_ATLAS_PADDING;
     use crate::target::{RootRenderTarget, TextureParity};
     use vello_common::filter_effects::{Filter, FilterPrimitive};
     use vello_common::geometry::SizeU16;
@@ -911,6 +912,14 @@ mod tests {
             case.layer(|case| case.draw_at(f64::from(index * 4), 0.5));
         }
         case
+    }
+
+    fn offset_filter() -> Filter {
+        Filter::from_primitive(FilterPrimitive::Offset { dx: 0.0, dy: 0.0 })
+    }
+
+    fn filter_page_size() -> SizeU16 {
+        SizeU16::new(8 + 2 * FILTER_ATLAS_PADDING)
     }
 
     #[test]
@@ -1194,15 +1203,20 @@ mod tests {
     }
 
     #[test]
-    fn binding_delay() {
+    fn filter_binding_conflict() {
         let scheduled = binding_case();
         let rounds_view = scheduled.views();
+        let filter = scheduled.storage.buffers.filter_ops[0];
 
         assert_eq!(rounds_view[0].filter_passes, [0, 0]);
         assert_eq!(rounds_view[1].filter_passes, [1, 0]);
-        assert_eq!(rounds_view[1].blend_passes, [0, 0]);
-        assert_eq!(rounds_view[2].blend_passes, [0, 1]);
-        assert!(rounds_view[2].root.has_child_layer);
+        for region in [filter.textures.original, filter.textures.temporary] {
+            let target = region.target;
+            assert_eq!(
+                rounds_view[1].binding[target.texture_parity.get_parity()],
+                target.page_index
+            );
+        }
     }
 
     #[test]
@@ -1226,7 +1240,7 @@ mod tests {
         assert_eq!(scheduled.total_clears(), DEPTH);
     }
 
-    // For the next 4 cases: They show that our scheduler has the ability
+    // For the next 3 cases: They show that our scheduler has the ability
     // to render arbitrarily deeply nested layers as well as arbitrarily many
     // sibling layers using just two textures, as long as they have
     // at most one child.
@@ -1415,6 +1429,70 @@ mod tests {
         assert_eq!(rounds_view[0].filter_passes, [0, 1]);
         assert!(rounds_view[0].root.has_child_layer);
         assert_eq!(scheduled.total_clears(), 2);
+    }
+
+    #[test]
+    fn filter_round_resolving() {
+        let mut case = SceneCase::new(8, 8);
+
+        case.layer_with(None, None, Some(offset_filter()), |case| {
+            case.layer(|case| case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5));
+        });
+
+        let scheduled = case
+            .schedule(RootRenderTarget::UserSurface, filter_page_size(), 2)
+            .unwrap();
+        let rounds_view = scheduled.views();
+        let filter = scheduled.storage.buffers.filter_ops[0];
+
+        // The filter source and its ping-pong temporary use opposite parities.
+        assert_eq!(
+            (
+                filter.textures.original.target.texture_parity,
+                filter.textures.temporary.target.texture_parity,
+            ),
+            (TextureParity::Odd, TextureParity::Even)
+        );
+        // No additional pages are created; the even page is reused after the child release.
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert_eq!(rounds_view.len(), 2);
+        // The child is first drawn into an even texture in round 0.
+        // The child is composed into the odd filter source **in round 0**. This is
+        // possible because within a round, we first handle draws to even pages, then
+        // odd pages.
+        assert_eq!(rounds_view[0].odd.x.len(), 1);
+        // The child allocation is released from the even page at the end of round 0.
+        assert_eq!(
+            rounds_view[0].clears[TextureParity::Even.get_parity()].len(),
+            1
+        );
+
+        // The temporary is not available soon enough to filter in round 0.
+        assert_eq!(rounds_view[0].filter_passes, [0, 0]);
+        // After the even page becomes reusable, the filter runs in round 1.
+        assert_eq!(rounds_view[1].filter_passes, [0, 1]);
+    }
+
+    #[test]
+    fn filter_siblings() {
+        let mut case = SceneCase::new(8, 8);
+
+        for _ in 0..2 {
+            case.layer_with(None, None, Some(offset_filter()), |case| {
+                case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5);
+            });
+        }
+
+        let scheduled = case
+            .schedule(RootRenderTarget::UserSurface, filter_page_size(), 2)
+            .unwrap();
+
+        // Sibling filter layers should also reuse pages.
+        assert_eq!(scheduled.page_counts(), [1, 1]);
+        assert_eq!(scheduled.storage.buffers.filter_ops.len(), 2);
+
+        // Each filter clears its source allocation and its temporary allocation.
+        assert_eq!(scheduled.total_clears(), 4);
     }
 
     #[test]
