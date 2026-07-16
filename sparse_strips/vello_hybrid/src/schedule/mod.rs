@@ -870,6 +870,18 @@ mod tests {
         );
     }
 
+    fn add_tree(case: &mut SceneCase, depth: usize, children: usize) {
+        case.layer(|case| {
+            if depth == 1 {
+                case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5);
+            } else {
+                for _ in 0..children {
+                    add_tree(case, depth - 1, children);
+                }
+            }
+        });
+    }
+
     fn chain_case(depth: usize) -> ScheduledCase {
         let mut case = SceneCase::new(8, 8);
 
@@ -918,11 +930,11 @@ mod tests {
         }
 
         let scheduled = case.schedule_root();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].root.x, [0, 8, 16]);
-        assert!(!views[0].root.has_child_layer);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].root.x, [0, 8, 16]);
+        assert!(!rounds_view[0].root.has_child_layer);
         assert_eq!(scheduled.page_counts(), [0, 0]);
     }
 
@@ -934,11 +946,11 @@ mod tests {
         case.draw_at(16.0, 0.5);
 
         let scheduled = case.schedule_root();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].root.x, [0, 8, 16]);
-        assert!(views[0].root.has_child_layer);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].root.x, [0, 8, 16]);
+        assert!(rounds_view[0].root.has_child_layer);
     }
 
     #[test]
@@ -966,11 +978,11 @@ mod tests {
         case.layer(|case| case.draw_at(8.0, 0.5));
 
         let scheduled = case.schedule_root();
-        let views = scheduled.views();
-        let round = &views[0];
+        let rounds_view = scheduled.views();
+        let round = &rounds_view[0];
 
         assert_eq!(scheduled.page_counts(), [0, 1]);
-        assert_eq!(views.len(), 1);
+        assert_eq!(rounds_view.len(), 1);
         assert_eq!(round.odd.x.len(), 1);
         assert_eq!(round.root.x, [8]);
         assert!(round.root.has_child_layer);
@@ -991,10 +1003,10 @@ mod tests {
     #[test]
     fn non_default_blend_into_layer() {
         let scheduled = blend_case();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].blend_passes, [0, 1]);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].blend_passes, [0, 1]);
     }
 
     #[test]
@@ -1023,8 +1035,8 @@ mod tests {
     #[test]
     fn blend_release() {
         let scheduled = blend_case();
-        let views = scheduled.views();
-        let blend_round = views
+        let rounds_view = scheduled.views();
+        let blend_round = rounds_view
             .iter()
             .find(|round| round.blend_passes[TextureParity::Odd.get_parity()] == 1)
             .unwrap();
@@ -1041,7 +1053,6 @@ mod tests {
         let scheduled = root_blend_case()
             .schedule(RootRenderTarget::UserSurface, SizeU16::new(16), 3)
             .unwrap();
-        let views = scheduled.views();
 
         // Root lands in the first odd layer, its child in the even one.
         assert_eq!(scheduled.page_counts(), [1, 1]);
@@ -1053,8 +1064,8 @@ mod tests {
         let scheduled = root_blend_case()
             .schedule(RootRenderTarget::UserSurface, SizeU16::new(16), 3)
             .unwrap();
-        let views = scheduled.views();
-        let root_round = views
+        let rounds_view = scheduled.views();
+        let root_round = rounds_view
             .iter()
             .find(|round| round.root.has_child_layer)
             .unwrap();
@@ -1084,11 +1095,11 @@ mod tests {
         });
 
         let scheduled = case.schedule_root();
-        let views = scheduled.views();
-        let round = &views[0];
+        let rounds_view = scheduled.views();
+        let round = &rounds_view[0];
 
         assert_eq!(scheduled.page_counts(), [1, 1]);
-        assert_eq!(views.len(), 1);
+        assert_eq!(rounds_view.len(), 1);
         assert_eq!(round.even.x.len(), 1);
         assert_eq!(round.odd.x.len(), 1);
         assert!(round.odd.has_child_layer);
@@ -1101,22 +1112,22 @@ mod tests {
     #[test]
     fn even_child() {
         let scheduled = chain_case(2);
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].even.x.len(), 1);
-        assert!(views[0].odd.has_child_layer);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].even.x.len(), 1);
+        assert!(rounds_view[0].odd.has_child_layer);
     }
 
     #[test]
     fn odd_child() {
         let scheduled = chain_case(3);
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views.len(), 2);
-        assert_eq!(views[0].odd.x.len(), 1);
-        assert!(views[0].even.x.is_empty());
-        assert!(views[1].even.has_child_layer);
+        assert_eq!(rounds_view.len(), 2);
+        assert_eq!(rounds_view[0].odd.x.len(), 1);
+        assert!(rounds_view[0].even.x.is_empty());
+        assert!(rounds_view[1].even.has_child_layer);
     }
 
     #[test]
@@ -1134,11 +1145,14 @@ mod tests {
         });
 
         let scheduled = case.schedule_root();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views[0].odd.x.len(), 1);
-        assert_eq!(views[0].blend_passes[TextureParity::Odd.get_parity()], 1);
-        assert_eq!(views[1].odd.x.len(), 1);
+        assert_eq!(rounds_view[0].odd.x.len(), 1);
+        assert_eq!(
+            rounds_view[0].blend_passes[TextureParity::Odd.get_parity()],
+            1
+        );
+        assert_eq!(rounds_view[1].odd.x.len(), 1);
     }
 
     #[test]
@@ -1151,11 +1165,11 @@ mod tests {
         let scheduled = case
             .schedule(RootRenderTarget::UserSurface, SizeU16::from_wh(16, 8), 1)
             .unwrap();
-        let views = scheduled.views();
-        let round = &views[0];
+        let rounds_view = scheduled.views();
+        let round = &rounds_view[0];
 
         assert_eq!(scheduled.page_counts(), [0, 1]);
-        assert_eq!(views.len(), 1);
+        assert_eq!(rounds_view.len(), 1);
         assert_eq!(round.odd.x.len(), 3);
         assert_eq!(round.root.x, [0, 8, 16]);
         assert_eq!(round.clears[TextureParity::Odd.get_parity()].len(), 3);
@@ -1164,31 +1178,31 @@ mod tests {
     #[test]
     fn incompatible_siblings() {
         let scheduled = binding_case();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
         // Root is blend target, so it lands in odd texture page 1.
         // Sibling layer lands in even texture page 1, and since it has
         // a filter we need a new page allocation in odd, so texthre page 2.
         assert_eq!(scheduled.page_counts(), [1, 2]);
-        assert_eq!(views.len(), 3);
+        assert_eq!(rounds_view.len(), 3);
         // Round 0 binds the texture where the root is.
-        assert_eq!(views[0].binding[TextureParity::Odd.get_parity()], 0);
+        assert_eq!(rounds_view[0].binding[TextureParity::Odd.get_parity()], 0);
         // Round 1 binds the texture where the filter layer is.
-        assert_eq!(views[1].binding[TextureParity::Odd.get_parity()], 1);
+        assert_eq!(rounds_view[1].binding[TextureParity::Odd.get_parity()], 1);
         // Round 0 again binds to the root.
-        assert_eq!(views[2].binding[TextureParity::Odd.get_parity()], 0);
+        assert_eq!(rounds_view[2].binding[TextureParity::Odd.get_parity()], 0);
     }
 
     #[test]
     fn binding_delay() {
         let scheduled = binding_case();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
-        assert_eq!(views[0].filter_passes, [0, 0]);
-        assert_eq!(views[1].filter_passes, [1, 0]);
-        assert_eq!(views[1].blend_passes, [0, 0]);
-        assert_eq!(views[2].blend_passes, [0, 1]);
-        assert!(views[2].root.has_child_layer);
+        assert_eq!(rounds_view[0].filter_passes, [0, 0]);
+        assert_eq!(rounds_view[1].filter_passes, [1, 0]);
+        assert_eq!(rounds_view[1].blend_passes, [0, 0]);
+        assert_eq!(rounds_view[2].blend_passes, [0, 1]);
+        assert!(rounds_view[2].root.has_child_layer);
     }
 
     #[test]
@@ -1200,13 +1214,13 @@ mod tests {
         let scheduled = case
             .schedule(RootRenderTarget::UserSurface, SizeU16::new(8), 2)
             .unwrap();
-        let views = scheduled.views();
-        let layer_draws = views
+        let rounds_view = scheduled.views();
+        let layer_draws = rounds_view
             .iter()
             .map(|round| round.even.x.len() + round.odd.x.len())
             .sum::<usize>();
 
-        assert!(views.len() > 1);
+        assert!(rounds_view.len() > 1);
         assert_eq!(scheduled.page_counts(), [1, 1]);
         assert_eq!(layer_draws, DEPTH);
         assert_eq!(scheduled.total_clears(), DEPTH);
@@ -1256,8 +1270,70 @@ mod tests {
             let scheduled = sibling_case(count)
                 .schedule(RootRenderTarget::UserSurface, SizeU16::from_wh(64, 8), 1)
                 .unwrap();
+            let rounds_view = scheduled.views();
 
-            assert_eq!(scheduled.views().len(), 1, "failed at width {count}");
+            // Many sibling layers are batched into a single round, if atlas space
+            // permits it.
+            assert_eq!(rounds_view.len(), 1, "failed at width {count}");
+            assert_eq!(
+                rounds_view[0].odd.x.len(),
+                usize::from(count),
+                "missing child at width {count}"
+            );
+        }
+    }
+
+    #[test]
+    fn nested_children() {
+        const CHILDREN: usize = 3;
+
+        // If we have enough atlas space, even deeply and widely nested layer graphs can
+        // be batched efficiently. The expected round count will be `layer_depth` / 2.
+        // No additional pages need to be created as all layers fit.
+        for (depth, expected_rounds) in (2..=6).zip([1, 2, 2, 3, 3]) {
+            let mut case = SceneCase::new(8, 8);
+            add_tree(&mut case, depth, CHILDREN);
+            let scheduled = case
+                .schedule(RootRenderTarget::UserSurface, SizeU16::new(256), 2)
+                .unwrap();
+            let layers = (CHILDREN.pow(depth as u32) - 1) / (CHILDREN - 1);
+
+            assert_eq!(scheduled.page_counts(), [1, 1], "failed at depth {depth}");
+            assert_eq!(
+                scheduled.views().len(),
+                expected_rounds,
+                "failed at depth {depth}"
+            );
+            assert_eq!(scheduled.total_clears(), layers);
+        }
+    }
+
+    #[test]
+    fn nested_children_spilled() {
+        const CHILDREN: usize = 3;
+
+        // If our atlas dimensions are constrained, the scheduler will still find
+        // a valid schedule and keep the number of allocated pages to a minimum.
+        // However, this is at the cost of a larger round count.
+        for (depth, expected_rounds) in (3..=6).zip([21, 39, 201, 363]) {
+            let mut case = SceneCase::new(8, 8);
+            add_tree(&mut case, depth, CHILDREN);
+            let scheduled = case
+                .schedule(RootRenderTarget::UserSurface, SizeU16::new(8), 16)
+                .unwrap();
+            let layers = (CHILDREN.pow(depth as u32) - 1) / (CHILDREN - 1);
+
+            assert_eq!(
+                scheduled.page_counts(),
+                [depth / 2, (depth + 1) / 2],
+                "failed at depth {depth}"
+            );
+            assert_eq!(
+                scheduled.views().len(),
+                expected_rounds,
+                "failed at depth {depth}"
+            );
+            assert_eq!(scheduled.total_clears(), layers);
         }
     }
 
@@ -1300,12 +1376,15 @@ mod tests {
             case.draw(Rect::new(0.0, 0.0, 24.0, 8.0), 0.5);
         });
         let scheduled = clipped.schedule_root();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
         assert_eq!(scheduled.page_counts(), [0, 1]);
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].odd.x.len(), 1);
-        assert!(views[0].root.has_child_layer);
-        assert_eq!(views[0].clears[TextureParity::Odd.get_parity()].len(), 1);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].odd.x.len(), 1);
+        assert!(rounds_view[0].root.has_child_layer);
+        assert_eq!(
+            rounds_view[0].clears[TextureParity::Odd.get_parity()].len(),
+            1
+        );
 
         let mut disjoint = SceneCase::new(32, 8);
         disjoint.layer_with(Some(Rect::new(24.0, 0.0, 32.0, 8.0)), None, None, |case| {
@@ -1328,13 +1407,13 @@ mod tests {
         let scheduled = case
             .schedule(RootRenderTarget::UserSurface, SizeU16::new(128), 2)
             .unwrap();
-        let views = scheduled.views();
+        let rounds_view = scheduled.views();
 
         assert_eq!(scheduled.page_counts(), [1, 1]);
-        assert_eq!(views.len(), 1);
-        assert_eq!(views[0].odd.x.len(), 1);
-        assert_eq!(views[0].filter_passes, [0, 1]);
-        assert!(views[0].root.has_child_layer);
+        assert_eq!(rounds_view.len(), 1);
+        assert_eq!(rounds_view[0].odd.x.len(), 1);
+        assert_eq!(rounds_view[0].filter_passes, [0, 1]);
+        assert!(rounds_view[0].root.has_child_layer);
         assert_eq!(scheduled.total_clears(), 2);
     }
 
