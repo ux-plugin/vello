@@ -256,7 +256,7 @@ mod tests {
 
         let mut case = SceneCase::new(16, 8);
         chain(&mut case, depth);
-        case.schedule(root_target, SizeU16::new(64), 2)
+        case.schedule(root_target, SizeU16::new(64), 2).unwrap()
     }
 
     #[test]

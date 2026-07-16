@@ -3,7 +3,7 @@ use crate::draw::Draw;
 use crate::paint::PaintResolver;
 use crate::scene::LayersConfig;
 use crate::target::RootRenderTarget;
-use crate::{GpuStrip, Scene};
+use crate::{GpuStrip, RenderError, Scene};
 use alloc::vec;
 use alloc::vec::Vec;
 use vello_common::filter_effects::Filter;
@@ -55,15 +55,15 @@ impl SceneCase {
         root_target: RootRenderTarget,
         texture_size: SizeU16,
         max_textures: usize,
-    ) -> ScheduledCase {
+    ) -> Result<ScheduledCase, RenderError> {
         let mut storage = ScheduleStorage::default();
-        let schedule = self.schedule_into(&mut storage, root_target, texture_size, max_textures);
+        let schedule = self.schedule_into(&mut storage, root_target, texture_size, max_textures)?;
 
-        ScheduledCase {
+        Ok(ScheduledCase {
             schedule,
             storage,
             root_target,
-        }
+        })
     }
 
     pub(super) fn schedule_into(
@@ -72,7 +72,7 @@ impl SceneCase {
         root_target: RootRenderTarget,
         texture_size: SizeU16,
         max_textures: usize,
-    ) -> Schedule {
+    ) -> Result<Schedule, RenderError> {
         let encoded = self.scene.encoded_paints.borrow();
         let offsets = vec![0; encoded.len()];
         Schedule::try_new(
@@ -86,11 +86,11 @@ impl SceneCase {
                 ..Default::default()
             },
         )
-        .unwrap()
     }
 
     pub(super) fn schedule_root(&self) -> ScheduledCase {
         self.schedule(RootRenderTarget::UserSurface, SizeU16::new(64), 8)
+            .unwrap()
     }
 }
 
