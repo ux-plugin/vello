@@ -38,6 +38,7 @@ mod external_texture;
 mod filter;
 mod glyph;
 mod gradient;
+mod hybrid_schedule;
 mod image;
 mod issues;
 mod layer;
