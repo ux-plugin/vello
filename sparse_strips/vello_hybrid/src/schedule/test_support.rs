@@ -1,3 +1,6 @@
+// Copyright 2026 the Vello Authors
+// SPDX-License-Identifier: Apache-2.0 OR MIT
+
 use super::{RendererBackend, Schedule, ScheduleStorage};
 use crate::draw::Draw;
 use crate::paint::PaintResolver;

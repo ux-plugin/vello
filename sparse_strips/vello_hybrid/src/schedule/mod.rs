@@ -1431,7 +1431,8 @@ mod tests {
             let scheduled = case
                 .schedule(RootRenderTarget::UserSurface, SizeU16::new(256), 2)
                 .unwrap();
-            let layers = (CHILDREN.pow(depth as u32) - 1) / (CHILDREN - 1);
+            let layers = (CHILDREN.pow(depth.try_into().expect("test depth fits in u32")) - 1)
+                / (CHILDREN - 1);
 
             assert_eq!(scheduled.page_counts(), [1, 1], "failed at depth {depth}");
             assert_eq!(
@@ -1456,11 +1457,12 @@ mod tests {
             let scheduled = case
                 .schedule(RootRenderTarget::UserSurface, SizeU16::new(8), 16)
                 .unwrap();
-            let layers = (CHILDREN.pow(depth as u32) - 1) / (CHILDREN - 1);
+            let layers = (CHILDREN.pow(depth.try_into().expect("test depth fits in u32")) - 1)
+                / (CHILDREN - 1);
 
             assert_eq!(
                 scheduled.page_counts(),
-                [depth / 2, (depth + 1) / 2],
+                [depth / 2, depth.div_ceil(2)],
                 "failed at depth {depth}"
             );
             assert_eq!(
@@ -1523,7 +1525,7 @@ mod tests {
 
         let mut disjoint = SceneCase::new(32, 8);
         disjoint.layer_with(Some(Rect::new(24.0, 0.0, 32.0, 8.0)), None, None, |case| {
-            case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5)
+            case.draw(Rect::new(0.0, 0.0, 8.0, 8.0), 0.5);
         });
         let scheduled = disjoint.schedule_root();
         assert!(scheduled.views().is_empty());
