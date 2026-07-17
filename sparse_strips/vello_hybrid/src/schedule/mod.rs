@@ -1,7 +1,111 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Builds and executes dependency-ordered rendering rounds for `vello_hybrid`.
+//! The core scheduler.
+//!
+//! After recording the render commands provided by the user, we have a DAG-like representation
+//! of the scene, with individual nodes that represent a contiguous sequence of batched draws,
+//! followed by an optional layer composition. The task of the scheduler is to consume this
+//! representation and, given the constraints on intermediate resources imposed by [`LayersConfig`],
+//! schedule draw and layer operations in such a way that they can be executed by the GPU, to
+//! achieve the final intended visual result.
+//!
+//! There are many different ways of finding such a schedule, each with different advantages and
+//! disadvantages. Vello Hybrid's scheduling algorithm has the following core properties:
+//!
+//! - It always finds a valid schedule for any scene, assuming such a schedule exists given the
+//!   resource constraints.
+//! - It always chooses a schedule that minimizes the number of texture allocations, even if that
+//!   means increasing the number of render passes (and thus sacrificing performance), and even
+//!   if the user allows allocating more resources.
+//! - If the _already_ allocated resources are abundant enough, it employs batching to reduce
+//!   the number of render passes. However, the schedule is not necessarily the globally most
+//!   optimal one in terms of render passes.
+//!
+//! The above is achieved by following the below three principles.
+//!
+//! ## Bottom-up layer scheduling
+//!
+//! The scheduler descends into a child layer before scheduling the part of its parent that
+//! composes it. Layer depth determines which intermediate texture group is used: even-depth layers
+//! use the even group and odd-depth layers use the odd group. A simple chain can therefore render
+//! by ping-ponging between one page from each group:
+//!
+//! ```text
+//! L1 (even)
+//! `-- L2 (odd)
+//!     `-- L3 (even)
+//!         `-- L4 (odd)
+//!             `-- L5 (even)
+//! ```
+//!
+//! `L5` is rendered first into the even page. `L4` is then rendered into the odd page and composes
+//! `L5`, after which the `L5` allocation can be released. `L3` reuses the even page and composes
+//! `L4`; `L2` reuses the odd page and composes `L3`; and finally `L1` reuses the even page and
+//! composes `L2`. This pattern continues for arbitrarily deep chains, with at most two adjacent
+//! layer allocations live at once.
+//!
+//! ## Lazy layer allocation
+//!
+//! Bottom-up traversal only provides this memory behavior because entering a layer does not
+//! immediately allocate its target. The target is allocated lazily when the layer first has draws
+//! or a completed child to receive. In the chain above, `L1` through `L4` do not occupy atlas space
+//! while the scheduler descends to `L5`. If their targets were allocated eagerly, the outer layers
+//! would occupy the even and odd pages before the inner layers could reuse them, defeating the
+//! two-page ping-pong scheme.
+//!
+//! Branching can require more than two live allocations. Consider a parent with two children,
+//! where the second child itself has a child:
+//!
+//! ```text
+//! L1 (even)
+//! |-- L2 (odd)
+//! `-- L3 (odd)
+//!     `-- L4 (even)
+//! ```
+//!
+//! After `L2` is composed, `L1` has an even allocation containing that result. This allocation must
+//! remain live while `L3` is scheduled. Descending into `L3` then reaches `L4`, which also needs an
+//! even allocation. `L1` and `L4` may share an even atlas page if both regions fit; otherwise `L4`
+//! requires a second even page. Together with the odd page used by `L3`, this means the branch can
+//! require three intermediate textures. Lazy allocation minimizes the overlap, but cannot remove
+//! allocations whose contents are simultaneously live. However, it should become apparent that,
+//! even for complexly nested layer graphs, the number of allocations kept alive at the same time
+//! is basically as small as possible.
+//!
+//! ## Batching into rounds
+//!
+//! Memory minimization does not imply one layer per render pass. Intermediate textures are atlases,
+//! so independent layers can occupy different regions of the same page. The scheduler places work
+//! at the earliest round and stage allowed by its dependencies. Operations can batch into the same
+//! round when they require the same even and odd pages and their stages are compatible; otherwise
+//! scheduling advances until the dependency is satisfied or the required page pair can be bound.
+//! The scheduler does not allocate additional pages merely to improve batching.
+//!
+//! This process is monotonic and conservative: it does not backtrack to find a globally minimal
+//! number of render passes. This is accepted as a downside of the current algorithm in the interest
+//! of keeping the already non-trivial logic as simple as possible. The concrete contents and
+//! texture bindings of a round are described in the [`round`] module.
+//!
+//! ## Filters and non-default blends
+//!
+//! A filter layer first follows the same bottom-up and lazy allocation process as a regular layer.
+//! Its main allocation covers the filter's expanded bounds. Once the layer draws are ready, the
+//! scheduler allocates an equally sized temporary region from the opposite texture group and
+//! places the filter in the first compatible filter stage. The main and temporary regions provide
+//! the input/output pair for the GPU pass sequence, whose final result is written back to the main
+//! allocation. The temporary region is then cleared and released. Filters that must preserve the
+//! unfiltered pixels, such as drop shadows, additionally reserve the shared scratch texture. The
+//! layer is not made available to its parent until the filter is complete.
+//!
+//! Default source-over composition needs no separate blend operation: the completed child is
+//! sampled by the parent's next draw. A non-default blend instead waits until both the child and
+//! the existing parent contents are ready. It is placed in the next compatible blend stage for the
+//! parent's texture group and constrains the round to bind both required layer pages. The backend
+//! blends through the shared scratch texture and copies the result back into the parent, after
+//! which the child can be cleared and released. If a non-default blend targets the root, the root
+//! is first rendered into an intermediate layer because the user-provided target cannot be sampled
+//! directly. Apart from that, this case is handled the same as any other layer.
 
 mod allocate;
 mod cursor;
@@ -37,10 +141,14 @@ use vello_common::tile::Tile;
 
 const REGULAR_LAYER_KIND: RecordedLayerKind = RecordedLayerKind::Regular;
 
+/// Dependency-ordered rendering rounds and their intermediate texture requirements.
 #[derive(Debug)]
 pub(crate) struct Schedule {
+    /// Rendering rounds in execution order.
     rounds: Rounds,
+    /// Dimensions shared by every intermediate texture.
     texture_size: SizeU16,
+    /// Whether execution requires the shared scratch texture.
     scratch_texture: bool,
 }
 
@@ -87,19 +195,24 @@ impl Schedule {
     }
 }
 
-// TODO: Explain how the scheduling algorithm works.
-
 /// Plans concrete, executable rounds from a recorded scene.
 #[derive(Debug)]
 struct Scheduler<'a, 'p> {
+    /// Recorded scene graph and draws being scheduled.
     recorder: &'a CommandRecorder<RecordedDraw>,
+    /// Bounds of the root target in scene coordinates.
     scene_bbox: RectU16,
+    /// Strip data referenced by recorded path draws and clips.
     strip_storage: &'a StripStorage,
+    /// Destination used for root-level draws.
     root_render_target: RootRenderTarget,
+    /// Resolves recorded paints to their GPU representation.
     paint_resolver: PaintResolver<'a>,
+    /// Allocation cursor defining the earliest round new work can use.
     cursor: Cursor,
-    unreleased_layer_count: usize,
+    /// Dimensions shared by every intermediate texture.
     texture_size: SizeU16,
+    /// Reusable buffers populated while constructing the schedule.
     storage: &'p mut ScheduleStorage,
 }
 
@@ -121,7 +234,6 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             root_render_target,
             paint_resolver,
             cursor: Cursor::new(Atlases::new(texture_size, layer_config)),
-            unreleased_layer_count: 0,
             texture_size,
             storage,
         }
@@ -130,11 +242,6 @@ impl<'a, 'p> Scheduler<'a, 'p> {
     fn build(mut self) -> Result<Schedule, RenderError> {
         let mut rounds = Rounds::default();
         self.schedule_root(&mut rounds)?;
-
-        assert_eq!(
-            self.unreleased_layer_count, 0,
-            "all layers should have been released"
-        );
 
         // Since the strips should be rendered front-to-back.
         self.storage.buffers.draw_buffers.opaque_strips.reverse();
@@ -308,20 +415,8 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             // First make sure that the child node is scheduled, in case it exists.
             let child = self.prepare_node(cmd, layer.sample.bbox, rounds)?;
 
-            // This is probably one of the most crucial lines in this scheduling algorithm: As can
-            // be seen, when traversing the render graph, we only allocate space for the current
-            // layer lazily **after** we have scheduled any potential child node (which happens
-            // in the line above), not before. So allocations of layers happens in a bottom-up
-            // fashion instead up top-down.
-            //
-            // This is crucial for memory reasons: Imagine if we had a render graph with 10 nested
-            // layers. If we reserved space up eagerly top-down, at peak we would need to reserve
-            // space for all 10 layers in the layer texture atlas. On the other hand, by doing
-            // bottom-up, we need to retain 2 layers at most if we want to be memory-efficient:
-            // Once the child layer has been composed into the parent, it's atlas allocation can
-            // be released and therefore the paren't parent can reuse that same space in the next round.
-            // In the best case, if we have many small layers, we can still batch many layers
-            // in the same round, which is also what we currently do.
+            // Important: Keep this after `prepare_node`: allocating lazily is what makes traversal
+            // bottom-up with respect to memory, while still allowing compatible layers to batch.
             let target = self.ensure_layer_target(&mut layer)?;
 
             // Now schedule the draws + optionally the composition of the child layer node.
@@ -388,7 +483,6 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             allocation: target.allocation,
             ready,
         };
-        self.unreleased_layer_count = self.unreleased_layer_count.checked_add(1).unwrap();
 
         Ok(scheduled)
     }
@@ -539,7 +633,6 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             point >= layer.ready,
             "layer released before it became ready"
         );
-        self.unreleased_layer_count = self.unreleased_layer_count.checked_sub(1).unwrap();
         rounds.ensure_exists(point.round);
 
         let layer_region = layer.allocation.clear_region();
@@ -566,7 +659,7 @@ impl<'a, 'p> Scheduler<'a, 'p> {
             };
 
             let request = LayerAllocationRequest::new(layer);
-            // Note: this might advance the base round, in case the atlas is already full
+            // Note: this might advance the base round, in case the atlas is already full,
             // and we therefore need to advance the round cursor until enough space has been
             // freed.
             let allocation = self.cursor.allocate_layer(request)?;
@@ -593,30 +686,46 @@ impl<'a, 'p> Scheduler<'a, 'p> {
 #[must_use = "scheduled layers must be released"]
 #[derive(Debug)]
 struct ScheduledLayer {
+    /// Atlas allocation retained until the parent finishes sampling this layer.
     allocation: AllocatedTextureRegion<LayerTextureId>,
+    /// Texture region and scene-space bounds sampled by the parent.
     sample_region: LayerTextureRegion,
+    /// Point after which the rendered layer contents are available.
     ready: SchedulePoint,
 }
 
+/// A recorded child node paired with its scheduled layer contents.
 #[derive(Debug)]
 struct PreparedChild<'a> {
+    /// Composition properties recorded on the child invocation.
     props: &'a LayerProps,
+    /// Scheduled contents to compose into the parent.
     layer: ScheduledLayer,
 }
 
+/// A recorded layer whose intermediate target may not have been allocated yet.
 #[derive(Debug)]
 struct OpenLayer<'a> {
+    /// Recorded command nodes belonging to the layer.
     cmds: &'a [Node],
+    /// Layer kind, including filter data when applicable.
     kind: &'a RecordedLayerKind,
+    /// Texture group into which this layer must be allocated.
     texture_parity: TextureParity,
+    /// Bounds that must be rendered into the layer allocation.
     bbox: RectU16,
+    /// Placement used when the completed layer is sampled by its parent.
     sample: LayerSamplePlacement,
+    /// Lazily allocated target and its scheduling state.
     target: Option<LayerTarget>,
 }
 
+/// Maps a rendered layer allocation to the region sampled by its parent.
 #[derive(Debug, Clone, Copy)]
 struct LayerSamplePlacement {
+    /// Offset of the sampled contents from the allocation origin.
     src_offset: (u16, u16),
+    /// Bounds of the sampled contents in scene coordinates.
     bbox: RectU16,
 }
 
@@ -649,10 +758,14 @@ impl LayerSamplePlacement {
     }
 }
 
+/// Allocated render target and state associated with an open layer.
 #[derive(Debug)]
 struct LayerTarget {
+    /// Atlas allocation backing the layer.
     allocation: AllocatedTextureRegion<LayerTextureId>,
+    /// Prepared filter applied after the layer's draws, if any.
     filter: Option<PreparedGpuFilter>,
+    /// Dependency state for operations targeting this layer.
     schedule_state: TargetScheduleState<LayerTextureRegion>,
 }
 
@@ -687,11 +800,16 @@ impl Rounds {
     }
 }
 
+/// Reusable operation data referenced by ranges in a [`Schedule`].
 #[derive(Debug, Default)]
 pub(crate) struct ScheduleBuffers {
+    /// Strip data and per-draw range metadata.
     pub(crate) draw_buffers: DrawBuffers,
+    /// Filter operations referenced by ranges in scheduled rounds.
     pub(crate) filter_ops: Vec<FilterOp>,
+    /// Blend operations referenced by ranges in scheduled rounds.
     pub(crate) blend_ops: Vec<BlendOp>,
+    /// Clip strips referenced by non-default blend operations.
     pub(crate) blend_strips: Vec<BlendStrip>,
 }
 
@@ -707,8 +825,11 @@ impl ScheduleBuffers {
 /// Persistent buffers used to build schedules across frames.
 #[derive(Debug, Default)]
 pub(crate) struct ScheduleStorage {
+    /// Reusable operation and strip buffers.
     pub(crate) buffers: ScheduleBuffers,
+    /// GPU filter data accumulated while scheduling the scene.
     pub(crate) filter_context: FilterContext,
+    /// Reusable pass plan populated immediately before filter execution.
     filter_pass_plan: FilterPassPlan,
 }
 

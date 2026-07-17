@@ -12,6 +12,7 @@ use vello_common::geometry::{RectU16, SizeU16, SizeU32};
 use vello_common::multi_atlas::{AllocId, Atlas, AtlasError, AtlasId};
 use vello_common::record::RecordedLayerKind;
 
+/// An allocation and the first round in which it can be used.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct Allocation<T> {
     /// The underlying allocation.
@@ -20,11 +21,16 @@ pub(super) struct Allocation<T> {
     pub(super) round_idx: usize,
 }
 
+/// Intermediate texture atlases and their shared texture budget.
 #[derive(Debug)]
 pub(super) struct Atlases {
+    /// The atlases for each texture parity.
     layer_atlases: [Vec<Atlas>; 2],
+    /// Whether the texture budget includes the shared scratch texture.
     scratch_texture: bool,
+    /// Number of additional intermediate textures allowed by the configured limit.
     remaining_textures: usize,
+    /// Dimensions of every atlas page and the scratch texture.
     texture_size: SizeU16,
 }
 
@@ -113,9 +119,12 @@ impl Atlases {
     }
 }
 
+/// Atlas allocation requirements for an intermediate layer region.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct LayerAllocationRequest {
+    /// Texture group from which the region must be allocated.
     pub(super) texture_parity: TextureParity,
+    /// Size and padding required within the selected atlas.
     region: RegionAllocationRequest,
 }
 
@@ -151,16 +160,23 @@ impl LayerAllocationRequest {
     }
 }
 
+/// Size and padding of a region requested from one atlas page.
 #[derive(Debug, Clone, Copy)]
 struct RegionAllocationRequest {
+    /// Size of the usable region.
     size: SizeU16,
+    /// Transparent padding reserved around the usable region.
     padding: u16,
 }
 
+/// Texture region and allocator metadata needed to release it.
 #[derive(Debug, Clone, Copy)]
 pub(super) struct AllocatedTextureRegion<T> {
+    /// Usable portion of the allocation.
     pub(super) region: TextureRegion<T>,
+    /// Padding surrounding the usable region.
     padding: u16,
+    /// Identifier used to return the allocation to its atlas.
     alloc_id: AllocId,
 }
 

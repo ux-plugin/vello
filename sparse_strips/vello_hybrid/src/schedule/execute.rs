@@ -15,8 +15,13 @@ use crate::util::{RangedSlice, VecExt};
 use crate::{GpuStrip, blend::BlendStrip};
 use vello_common::geometry::{RectU16, SizeU16};
 
+/// A sink for rendering operations.
 pub(crate) trait RendererBackend {
+    /// Execute the single opaque pass against the root target with the given strips.
+    ///
+    /// This method is called first before any of the other ones and only once.
     fn opaque_pass(&mut self, strips: &[GpuStrip]);
+    /// Execute a draw pass against the given target.
     fn draw_pass(
         &mut self,
         strips: RangedSlice<'_, GpuStrip>,
@@ -24,7 +29,9 @@ pub(crate) trait RendererBackend {
         target: DrawPassTarget,
         child_layer_texture: Option<LayerTextureId>,
     );
+    /// Execute a clear pass with the given rectangles against the target.
     fn clear_pass(&mut self, target: LayerTextureId, rects: &[RectU16]);
+    /// Execute a blend bass between a parent and child texture.
     fn blend_pass(
         &mut self,
         blends: RangedSlice<'_, BlendOp>,
@@ -32,6 +39,7 @@ pub(crate) trait RendererBackend {
         parent_texture_parity: TextureParity,
         texture_pair: LayerTexturePair,
     );
+    /// Execute a filter pass according to the filter plan between two textures.
     fn filter_pass(&mut self, plan: &FilterPassPlan, textures: FilterTexturePair);
 }
 
@@ -46,6 +54,7 @@ pub(crate) fn execute<R: RendererBackend>(
         filter_pass_plan,
         ..
     } = storage;
+
     schedule.execute(renderer, root_output_target, buffers, filter_pass_plan);
 }
 
@@ -116,6 +125,7 @@ impl Rounds {
                     filter_plan,
                     FilterTexturePair::new(texture_pair, texture_parity),
                 );
+
                 // Finally, we apply all blend operations.
                 renderer.blend_pass(
                     buffers.blend_ops.ranged(&pass.blend_ranges),
@@ -125,7 +135,7 @@ impl Rounds {
                 );
             }
 
-            // Once layers are done, we perform any possibly scheduled draws to the root target.
+            // Once layers are done, we perform draws against the root target.
             renderer.draw_pass(
                 buffers
                     .draw_buffers
@@ -139,7 +149,7 @@ impl Rounds {
                     .then(|| texture_pair.layer_id(TextureParity::Odd)),
             );
 
-            // Finally, clear layer regions that are deallocated in this round.
+            // And in the end, clear layer regions that are deallocated in this round.
             for (index, layer_clears) in round.layer_texture_clears.iter().enumerate() {
                 let texture_parity = TextureParity::from_parity(index);
                 renderer.clear_pass(texture_pair.layer_id(texture_parity), layer_clears);

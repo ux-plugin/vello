@@ -10,9 +10,12 @@ use vello_common::kurbo::Rect;
 /// into multiple smaller ones.
 const LARGE_RECT_SPLIT_THRESHOLD: u16 = 32;
 
+/// Integer rectangle geometry and its packed fractional edge coverage.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct RectPart {
+    /// Pixel-aligned bounds of this rectangle part.
     pub(crate) rect: RectU16,
+    /// Packed fractional coverage for the four edges.
     pub(crate) frac: u32,
 }
 
@@ -25,12 +28,18 @@ impl RectPart {
     }
 }
 
+/// A decomposed rectangle.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct SplitRect {
+    /// Main rectangle interior, or the complete rectangle when it is not split.
     pub(crate) main: RectPart,
+    /// Top antialiased strip, if required.
     pub(crate) top: Option<RectPart>,
+    /// Bottom antialiased strip, if required.
     pub(crate) bottom: Option<RectPart>,
+    /// Left antialiased strip between the top and bottom strips, if required.
     pub(crate) left: Option<RectPart>,
+    /// Right antialiased strip between the top and bottom strips, if required.
     pub(crate) right: Option<RectPart>,
 }
 

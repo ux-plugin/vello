@@ -1,7 +1,7 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! GPU paint packing for the hybrid renderer.
+//! GPU paint packing for scheduled strip draws.
 
 use crate::util::pack_u16_pair;
 use vello_common::TextureId;
@@ -18,17 +18,25 @@ const PAINT_TYPE_RADIAL_GRADIENT: u32 = 3;
 const PAINT_TYPE_SWEEP_GRADIENT: u32 = 4;
 const PAINT_TYPE_BLURRED_ROUNDED_RECT: u32 = 5;
 
+/// Shader-ready paint metadata for a strip.
 #[derive(Clone, Copy)]
 pub(crate) struct PackedPaint {
+    /// Value source for the strip's payload field.
     payload: PaintPayload,
+    /// Packed paint kind, source, and data offset.
     pub(crate) paint: u32,
+    /// External texture required by this paint, if any.
     pub(crate) external_texture_id: Option<TextureId>,
+    /// Whether the paint is fully opaque.
     pub(crate) opaque: bool,
 }
 
+/// Source used to populate a strip's paint payload.
 #[derive(Clone, Copy)]
 enum PaintPayload {
+    /// Premultiplied RGBA value for a solid paint.
     Solid(u32),
+    /// Scene-space position used to evaluate a non-solid paint.
     Position,
 }
 
@@ -41,9 +49,12 @@ impl PackedPaint {
     }
 }
 
+/// Resolves recorded paints to their encoded GPU offsets.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PaintResolver<'a> {
+    /// Encoded non-solid paints indexed by [`Paint`].
     encoded: &'a [EncodedPaint],
+    /// GPU data offset corresponding to each encoded paint.
     gpu_offsets: &'a [u32],
 }
 

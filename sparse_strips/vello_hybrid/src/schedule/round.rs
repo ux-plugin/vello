@@ -1,7 +1,30 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Concrete round representation for the new hybrid scheduler.
+//! Round execution.
+//!
+//! Complex scenes require multiple rendering passes against different texture targets for
+//! successful rendering. Therefore, rendering a single scene is split into multiple "rounds".
+//!
+//! A [`Round`] is the largest unit of scheduled work that can execute with one fixed pair of
+//! layer texture pages: one page from the even texture group and one from the odd texture group.
+//! It contains the following work:
+//!
+//! - One [`LayerTexturePass`] for the even page.
+//! - One [`LayerTexturePass`] for the odd page.
+//! - A [`Draw`] targeting the root output.
+//! - Rectangles to clear in each layer page after the rendering work completes.
+//!
+//! ## Texture bindings
+//!
+//! All layer work in a round uses the same [`LayerTexturePair`]. Scheduling an operation adds a
+//! [`LayerTexturePairConstraint`] for every page that the operation renders to or samples. Partial
+//! constraints can be merged, so operations that require only the even or only the odd page can
+//! still batch together. If two operations require different pages of the same parity, their
+//! constraints conflict and the later operation is placed in a subsequent compatible round.
+//!
+//! The fixed pair is also used by filter and blend operations, which may need to access both
+//! parities.
 
 use super::ScheduleBuffers;
 use crate::draw::Draw;
@@ -23,16 +46,24 @@ use vello_common::peniko::BlendMode;
 /// A stage in the execution of a rendering round.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum RoundStage {
+    /// Start of a round, before any rendering stage.
     Start,
+    /// Draw, filter, or blend stage targeting the even layer texture.
     Even(LayerStage),
+    /// Draw, filter, or blend stage targeting the odd layer texture.
     Odd(LayerStage),
+    /// Draw stage targeting the root output.
     RootDraw,
 }
 
+/// Stages executed for one parity of the layer texture pair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) enum LayerStage {
+    /// Render recorded draws and child layer fills.
     Draw,
+    /// Apply filter passes to rendered layer contents.
     Filter,
+    /// Apply non-default blend operations.
     Blend,
 }
 
@@ -63,7 +94,9 @@ impl RoundStage {
 /// A precise point in the execution timeline of the schedule.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub(super) struct SchedulePoint {
+    /// Index of the round containing this point.
     pub(super) round: usize,
+    /// Stage within the round.
     pub(super) stage: RoundStage,
 }
 
@@ -91,17 +124,25 @@ impl SchedulePoint {
     }
 }
 
+/// Completed rounds and the layer texture pages required to execute them.
 #[derive(Debug, Default)]
 pub(super) struct Rounds {
+    /// Rounds in execution order.
     pub(super) rounds: Vec<Round>,
+    /// Required page count for the even and odd texture groups.
     pub(super) layer_page_counts: [usize; 2],
 }
 
+/// Operations and texture binding requirements for one rendering round.
 #[derive(Debug, Default)]
 pub(super) struct Round {
+    /// Page required from each layer texture parity.
     texture_binding: LayerTexturePairConstraint,
+    /// Draw targeting the root output after both layer passes.
     pub(super) root_draw: Draw,
+    /// Draw, filter, and blend work for the even and odd layer textures.
     pub(super) layer_texture_passes: [LayerTexturePass; 2],
+    /// Regions cleared after all rendering work in this round.
     pub(super) layer_texture_clears: [Vec<RectU16>; 2],
 }
 
@@ -204,16 +245,23 @@ impl Rounds {
     }
 }
 
+/// Work targeting one parity of the layer texture pair in a round.
 #[derive(Debug, Default)]
 pub(super) struct LayerTexturePass {
+    /// Strip draw executed at the start of the layer pass.
     pub(super) draw: Draw,
+    /// Ranges of filter operations executed after the draw.
     pub(super) filter_ranges: Ranges,
+    /// Ranges of blend operations executed after the filters.
     pub(super) blend_ranges: Ranges,
 }
 
+/// Original and temporary regions used to ping-pong a filter sequence.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FilterTextureRegions {
+    /// Region containing the input and final filtered result.
     pub(crate) original: LayerRegion,
+    /// Opposite-parity region used for intermediate passes.
     pub(crate) temporary: LayerRegion,
 }
 
@@ -232,19 +280,29 @@ impl FilterTextureRegions {
     }
 }
 
+/// A scheduled filter and the texture regions on which it operates.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FilterOp {
+    /// Original and temporary regions used by the filter passes.
     pub(crate) textures: FilterTextureRegions,
+    /// Texel offset of this filter's parameters in the filter data texture.
     pub(crate) filter_data_offset: u32,
+    /// Prepared filter parameters used to select and size passes.
     pub(crate) gpu_filter: GpuFilterData,
 }
 
+/// A scheduled non-default blend between a parent and child layer.
 #[derive(Debug, Clone)]
 pub(crate) struct BlendOp {
+    /// Parent layer serving as both backdrop and blend destination.
     pub(crate) parent_region: LayerTextureRegion,
+    /// Child layer serving as the blend source.
     pub(crate) child_region: LayerTextureRegion,
+    /// Scene-space bounds affected by the blend.
     pub(crate) blend_bbox: RectU16,
+    /// The blend mode that should be applied.
     pub(crate) blend_mode: BlendMode,
+    /// Opacity applied to the child before composition.
     pub(crate) opacity: f32,
     /// Range of strips used for clipping the blend layer. If `None`, the blend spans its bbox.
     pub(crate) clip_strips: Option<Range<u32>>,

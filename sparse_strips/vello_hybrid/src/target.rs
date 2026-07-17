@@ -1,10 +1,11 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Render targets and regions used by the hybrid renderer.
+//! Render targets, texture bindings, and coordinate-space mappings.
 
 use vello_common::geometry::RectU16;
 
+/// Destination used for root-level scene rendering.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RootRenderTarget {
     /// The root render target is the user-provided surface.
@@ -13,12 +14,12 @@ pub(crate) enum RootRenderTarget {
     AtlasLayer,
 }
 
-/// A render target whose layer variant carries target-specific data.
+/// Root or intermediate-layer destination for a render pass.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RenderTarget<L> {
-    /// Render to the root output target.
+    /// Render directly to a root destination.
     Root(RootRenderTarget),
-    /// Render to a layer target.
+    /// Render to an intermediate layer destination.
     Layer(L),
 }
 
@@ -28,10 +29,13 @@ impl<L> RenderTarget<L> {
     }
 }
 
+/// Even or odd intermediate texture group.
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) enum TextureParity {
+    /// Texture group used by even layer depths.
     Even = 0,
+    /// Texture group used by odd layer depths.
     Odd = 1,
 }
 
@@ -71,7 +75,7 @@ impl From<TextureParity> for u32 {
     }
 }
 
-/// An identifier for a layer texture.
+/// Identifies one page in an intermediate layer texture group.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct LayerTextureId {
     /// The parity of the texture.
@@ -93,6 +97,7 @@ impl LayerTextureId {
 /// that should be bound during a draw call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct LayerTexturePair {
+    /// Page index bound for the even and odd texture groups.
     pub(crate) page_indices: [u16; 2],
 }
 
@@ -102,10 +107,12 @@ impl LayerTexturePair {
     }
 }
 
-/// A pair of two layer textures used for a filter operation.
+/// Pair of texture pages used to ping-pong a filter sequence.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub(crate) struct FilterTexturePair {
+    /// Even and odd pages used by the filter sequence.
     pair: LayerTexturePair,
+    /// Parity of the texture containing the original input and final result.
     original_parity: TextureParity,
 }
 
@@ -149,18 +156,17 @@ impl FilterTexturePair {
 /// A constraint for layer texture pairs.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct LayerTexturePairConstraint {
+    /// Required page for each parity, or no requirement for that parity.
     pages: [Option<u16>; 2],
 }
 
 impl LayerTexturePairConstraint {
-    /// Create a new layer texture pair constraint with the given layer texture ID.
     pub(crate) const fn new(id: LayerTextureId) -> Self {
         let mut pages = [None; 2];
         pages[id.texture_parity.get_parity()] = Some(id.page_index);
         Self { pages }
     }
 
-    /// Try to merge a layer texture pair constraint with the current one.
     pub(crate) fn merge(mut self, other: Self) -> Option<Self> {
         for (current, required) in self.pages.iter_mut().zip(other.pages) {
             match (*current, required) {
@@ -173,14 +179,14 @@ impl LayerTexturePairConstraint {
         Some(self)
     }
 
-    /// Resolve the layer texture pair constraint into a concrete texture pair.
     pub(crate) fn resolve(self) -> LayerTexturePair {
         LayerTexturePair {
+            // In case any is `None`, we just bind page 0 which always exist if
+            // there is at least one layer.
             page_indices: self.pages.map(|page| page.unwrap_or(0)),
         }
     }
 
-    /// Return the layer textures required by this constraint.
     pub(crate) fn required_textures(self) -> [Option<LayerTextureId>; 2] {
         core::array::from_fn(|index| {
             self.pages[index].map(|page_index| {
@@ -190,22 +196,20 @@ impl LayerTexturePairConstraint {
     }
 }
 
-/// The target of an executable draw pass.
 pub(crate) type DrawPassTarget = RenderTarget<LayerTextureId>;
 
-/// A rectangular region in one of the intermediate textures.
+/// Rectangular region within a render target.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct TextureRegion<T> {
-    /// The texture containing this region.
+    /// Render target containing the region.
     pub(crate) target: T,
-    /// Region in the texture.
+    /// Bounds of the region in target coordinates.
     pub(crate) rect: RectU16,
 }
 
-/// A rectangular region in a layer texture.
 pub(crate) type LayerRegion = TextureRegion<LayerTextureId>;
 
-/// A layer texture region with its corresponding viewport-space bounds.
+/// Intermediate texture region paired with its scene-space layer bounds.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct LayerTextureRegion {
     /// Region in the layer texture.
@@ -219,7 +223,6 @@ impl LayerTextureRegion {
     ///
     /// The given bbox must be fully contained within the layer bbox.
     pub(crate) fn texture_rect(self, bbox: RectU16) -> RectU16 {
-        // TODO: Explain
         let x0 = self.texture.rect.x0 + (bbox.x0.checked_sub(self.layer_bbox.x0).unwrap());
         let y0 = self.texture.rect.y0 + (bbox.y0.checked_sub(self.layer_bbox.y0).unwrap());
 
@@ -249,6 +252,8 @@ impl DrawTarget for LayerTextureRegion {
     }
 
     fn geometry_shift(&self) -> (i32, i32) {
+        // We always render layers such that their bbox starts at (0, 0), to minimize
+        // the consumed space.
         (
             self.texture.rect.x0 as i32 - i32::from(self.layer_bbox.x0),
             self.texture.rect.y0 as i32 - i32::from(self.layer_bbox.y0),

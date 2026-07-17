@@ -1,7 +1,7 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Draw construction for scheduled strip render passes.
+//! Draw construction for strip render passes.
 
 use crate::GpuStrip;
 use crate::paint::{COLOR_SOURCE_LAYER, PaintResolver};
@@ -20,10 +20,14 @@ use vello_common::strip_generator::StripStorage;
 use vello_common::tile::Tile;
 use vello_common::util::Clear;
 
+/// Strip ranges and texture-binding state for one scheduled draw pass.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Draw {
+    /// Ranges selecting this draw's strips from [`DrawBuffers::strips`].
     pub(crate) strip_ranges: Ranges,
+    /// Runs that require an externally supplied texture binding.
     pub(crate) external_texture_runs: Vec<ExternalTextureRun>,
+    /// Whether any strip in this draw samples a child layer.
     pub(crate) has_child_layer: bool,
 }
 
@@ -67,11 +71,16 @@ impl Clear for Draw {
     }
 }
 
+/// Appends recorded draws to a scheduled [`Draw`] and its shared buffers.
 #[derive(Debug)]
 pub(crate) struct DrawBuilder<'a, T: DrawTarget> {
+    /// Draw whose ranges and binding state are being built.
     draw: &'a mut Draw,
+    /// Shared buffer receiving alpha-blended strips.
     strips: &'a mut Vec<GpuStrip>,
+    /// Shared buffer receiving root-level opaque strips.
     opaque: &'a mut Vec<GpuStrip>,
+    /// Target and depth state used to encode strips.
     state: &'a mut DrawState<T>,
 }
 
@@ -282,9 +291,12 @@ impl<'a, T: DrawTarget> DrawBuilder<'a, T> {
     }
 }
 
+/// Reusable strip storage shared by all draws in a schedule.
 #[derive(Debug, Default)]
 pub(crate) struct DrawBuffers {
+    /// Opaque root strips rendered in the early depth-writing pass.
     pub(crate) opaque_strips: Vec<GpuStrip>,
+    /// Alpha-blended strips selected by each draw's ranges.
     pub(crate) strips: Vec<GpuStrip>,
 }
 
@@ -295,10 +307,14 @@ impl DrawBuffers {
     }
 }
 
+/// Target-specific state used while encoding a draw.
 #[derive(Debug)]
 pub(crate) struct DrawState<T: DrawTarget> {
+    /// Destination into which strips will be rendered.
     pub(crate) target: T,
+    /// Assigns depth values to opaque strips.
     depth_counter: DepthCounter,
+    /// Scene-space bounds visible in the target.
     pub(crate) target_bbox: RectU16,
 }
 
@@ -373,14 +389,17 @@ impl LayerTextureRegion {
 /// binding.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct ExternalTextureRun {
+    /// External texture bound for the run.
     pub(crate) texture_id: TextureId,
     /// Start index of the strip range for this run. The end is implicitly the start of the next
     /// run, or, for the last run, the total number of strips.
     pub(crate) strips_start: usize,
 }
 
+/// Assigns monotonically increasing depth values to opaque strips.
 #[derive(Debug, Default, Clone, Copy)]
 pub(crate) struct DepthCounter {
+    /// Number of opaque strips assigned so far.
     count: u32,
 }
 

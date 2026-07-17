@@ -39,21 +39,30 @@ use vello_common::viewport::ViewportState;
 /// Default tolerance for curve flattening
 pub(crate) const DEFAULT_TOLERANCE: f64 = 0.1;
 
+/// Path or rectangle draw retained by the scene recorder.
 #[derive(Debug)]
 pub(crate) enum RecordedDraw {
+    /// Path represented by generated strips.
     Path(RecordedPath),
+    /// Rectangle retained for the direct GPU rectangle path.
     Rect(RecordedRect),
 }
 
+/// Recorded path strips and their paint.
 #[derive(Debug)]
 pub(crate) struct RecordedPath {
+    /// Range selecting the path's strips from scene strip storage.
     pub(crate) strips: Range<usize>,
+    /// Paint applied to the path.
     pub(crate) paint: Paint,
 }
 
+/// Recorded rectangle and its paint.
 #[derive(Debug)]
 pub(crate) struct RecordedRect {
+    /// Rectangle in scene coordinates.
     pub(crate) rect: Rect,
+    /// Paint applied to the rectangle.
     pub(crate) paint: Paint,
 }
 
@@ -110,91 +119,57 @@ pub struct MemorySettings {
     pub layers_config: LayersConfig,
 }
 
-/// Configuration for intermediate layer and scratch textures.
+/// Configuration for temporary textures used to render layers and effects.
 ///
-/// In order for Vello Hybrid to be able to render layers (including blending and filters),
-/// it inevitably needs to allocate a number of intermediate textures. There are a number of
-/// trade-offs and decisions that need to be made relating to how performant rendering should be,
-/// what the maximum peak memory usage can be and what kind of scenes should render successfully.
+/// Layers, blend modes, and filters need temporary GPU textures before their results can be
+/// composited into the main scene. This configuration allows you to specify some limits to prevent
+/// excessive allocations for complex or adverserial scenes.
 ///
-/// Since this is very application-specific, you can tune the parameters here according to your
-/// own needs.
+/// In general, Vello Hybrid has the following priorities in that specific order:
+/// - Render as many scenes as possible successfully.
+/// - Use as little memory as possible.
+/// - Be as performant as possible.
+///
+/// In general Vello Hybrid will always prefer minimizing memory usage, even if at the
+/// cost of worse performance. However, since the exact tradeoff is very application-dependent,
+/// this configuration still allows you to tune the exact parameters such that better performance
+/// is accepted at the cost of larger memory consumption.
 #[derive(Copy, Clone, Debug)]
 pub struct LayersConfig {
     /// Maximum number of intermediate textures that may be allocated.
     ///
-    /// In general, if you want to be able to render _any_ scene successfully (subject to device limits)
-    /// with arbitrarily nested layer groups, you need to set this to `None`. This way, Vello Hybrid
-    /// can make all the layer texture allocations necessary to render the scene successfully.
+    /// `None` permits growth up to device limits. A finite value allows you to impose a hard limit,
+    /// but might result in certain scenes being rejected. The exact texture requirements for
+    /// different types of scenes are considered an implementation detail, but in general:
     ///
-    /// However, in many cases it's better to enforce a limit to guard against adversarial inputs,
-    /// at the cost of potentially rejecting certain scenes. This parameter allows you to tune that.
+    /// - `0` for scenes without layers, including layers introduced by COLR glyphs.
+    /// - `1` for scenes with only single-child layers and no blend modes / filters.
+    /// - `4` for scenes with only single-child layers with potential blend modes and simple filters.
     ///
-    /// **If the below doesn't make sense to you, but you still want to have some kind of limit,
-    /// setting this to `Some(6)` should be appropriate for most scenarios.**
-    ///
-    /// Below you can find a number of hints that should help guide your decision:
-    /// 1) If you don't use layers at all (including COLR glyphs!), you can set this to 0.
-    /// 2) If you have a maximum layer depth of 1 without blending or filters (and no COLR glyphs),
-    ///    you can set this to 1.
-    /// 3) If your scene graph resembles a "grid structure" (you can have arbitrarily deeply nested
-    ///    layers and multiple of those, but a layer must not have more than 1 child), have no
-    ///    blending and no filters or COLR glyphs, you can set this to 2.
-    /// 4) If your scene graph resembles a "grid structure" and uses blend operations, drop
-    ///    shadows, or COLR glyphs, you can set this to 3. The third texture is the shared scratch
-    ///    texture. Other filters ping-pong directly between the two layer textures and do not need
-    ///    it.
-    /// 5) If you have blend operations against the root output target, add one to the applicable
-    ///    value above.
-    /// 7) If your scenes can contain layers with multiple children, it is not possible to
-    ///    determine the maximum number of texture that need to be allocated. Therefore, either
-    ///    leave this at `None` or set a limit > 5, depending on what you are comfortable with.
+    /// Any other type of complex nested scene might need more intermediate textures depending on
+    /// the exact structure. Although, as mentioned, Vello Hybrid will always make sure to use as
+    /// little space as feasible.
     pub max_textures: Option<usize>,
     /// Minimum width and height of each allocated intermediate texture.
     ///
-    /// Intermediate textures are initially allocated at this size and grow as needed, up to
-    /// `max_texture_size`.
+    /// Textures grow to fit the largest required layer, up to [`Self::max_texture_size`], and do not
+    /// currently shrink between frames. Larger minima can batch more small layers into fewer
+    /// render passes at higher baseline memory cost.
     ///
-    /// Larger textures allow the scheduler to batch more compatible layer draws and blending
-    /// operations, reducing the number of render passes at the cost of higher memory usage. Smaller
-    /// textures keep memory usage down, but can require more render passes.
+    /// Desktop GPUs may benefit from a larger minimum when rendering scenes with many layers. On
+    /// mobile GPUs, experiments showed that keeping intermediate textures smaller is
+    /// more important for both memory usage and performance, even if it requires more render passes.
+    /// This is likely because the tile-based architecture common on mobile GPUs makes
+    /// repeatedly reading and writing large intermediate textures particularly expensive.
     ///
-    /// On desktop GPUs, a larger minimum can improve performance for scenes with many layers.
-    /// On mobile GPUs, our testing suggests that keeping intermediate textures smaller is generally
-    /// more important, both in terms of memory and performance, even if it implies more render
-    /// passes. This is likely related to the tiled rendering architecture commonly used by mobile
-    /// GPUs, which makes texture ping-ponging prohibitively expensive for large textures.
-    ///
-    /// The appropriate value therefore depends on the expected layer sizes, available memory, and
-    /// target hardware. It is recommended not to make this smaller than the default value of
-    /// 512x512. Otherwise, you might unnecessarily tank performance in scenes that consists of
-    /// many small layers, for example when rendering lots of COLR glyphs. Consider raising it up to
-    /// 1024x1024 on mobile devices; going even higher is not recommented for those devices.
-    /// For desktop devices, depending on your expected workloads, it might be beneficial to go
-    /// up to 2048 or even 4096, but it is highly recommended to only do so if benchmarks show
-    /// improvements for your use case.
-    ///
-    /// Should not be larger than `max_texture_size`.
+    /// The default of 512 by 512 is intended as a conservative starting point. Setting this to
+    /// 1024 by 1024 is a reasonable choice, too. Higher values are only recommended if benchmarks
+    /// show that your target workload profits from this.
     pub min_texture_size: SizeU16,
-    /// Maximum width and height, of each allocated intermediate texture.
+    /// Maximum width and height of each allocated intermediate texture.
     ///
-    /// In order to render most scenes correctly, this value should be at least as large as the size
-    /// of the main scene. If you ensure this is the case, then you will be able to render all
-    /// scenes successfully as long as `max_textures` is large enough. Filter layers can require
-    /// allocations larger than the main scene, however.
-    ///
-    /// For example, filter layers might require larger allocations.
-    /// If you have a circle that spans the whole size of the scene but has a Gaussian blur with `std`
-    /// 100, a texture that is larger than the size of the scene is required. Therefore, the
-    /// appropriate value for this parameter once again depends on your exact use case.
-    ///
-    /// In general, it is recommended to set this to 4096x4096. If you are running on
-    /// memory-constrained devices (e.g. phones), you can consider setting this even lower, only
-    /// covering the main scene size plus some additional padding for some filters. **It is not
-    /// recommended that you set this value higher than 8192x8192.**
-    ///
-    /// In any case, Vello Hybrid will also honor the maximum texture size enforced by the device
-    /// it is running on.
+    /// This should be at least the size of the scene (and potentially more to account for padding
+    /// of large filters), unless you explicitly want to reject too large layers.
     pub max_texture_size: SizeU16,
 }
 
@@ -227,8 +202,10 @@ pub struct Scene {
     pub(crate) width: u16,
     /// Height of the rendering surface in pixels.
     pub(crate) height: u16,
+    /// Viewport-dependent path and clip generation state.
     viewport_state: ViewportState,
     pub(crate) render_state: RenderState,
+    /// Root transform stack.
     root_transforms: RootTransforms,
     pub(crate) aliasing_threshold: Option<u8>,
     // The reason we use `RefCell` here is that during `render`, we need
@@ -242,6 +219,7 @@ pub struct Scene {
     pub(crate) strip_storage: RefCell<StripStorage>,
     /// Current filter effect applied to individual draw operations.
     filter: Option<Filter>,
+    /// The command recorder.
     pub(crate) recorder: CommandRecorder<RecordedDraw>,
 }
 

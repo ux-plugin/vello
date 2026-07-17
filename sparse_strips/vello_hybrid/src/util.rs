@@ -108,9 +108,12 @@ pub(crate) fn pack_opacity(opacity: f32) -> u8 {
     (opacity.clamp(0.0, 1.0) * 255.0).round() as u8
 }
 
+/// Coalesced ranges selecting values from a shared buffer.
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Ranges {
+    /// Non-contiguous ranges, with adjacent insertions merged.
     ranges: Vec<Range<usize>>,
+    /// Total number of selected values across all ranges.
     len: usize,
 }
 
@@ -159,8 +162,11 @@ impl<T> VecExt<T> for Vec<T> {
 /// Read-only view of values selected from a shared buffer by [`Ranges`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RangedSlice<'a, T> {
+    /// Shared buffer from which values are selected.
     buffer: &'a [T],
+    /// Ranges selecting values from `buffer`.
     ranges: &'a [Range<usize>],
+    /// Total number of selected values.
     len: usize,
 }
 
