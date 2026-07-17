@@ -1,7 +1,12 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-//! Monotonic allocation cursor for scheduled rounds.
+//! Cursor for round scheduling.
+//!
+//! Scheduling works by having a "cursor" that keeps track of the current base round as well
+//! as the live atlas allocations. The cursor tries to keep peak memory usage to a minimum by
+//! preferring to advance the base round count in case a requested allocation doesn't fit
+//! into the current round, and only resorting to adding more textures as a last resort.
 
 use crate::schedule::allocate::{
     AllocatedTextureRegion, Allocation, Atlases, LayerAllocationRequest,
@@ -10,10 +15,14 @@ use crate::target::LayerTextureId;
 use alloc::vec::Vec;
 use vello_common::multi_atlas::AtlasError;
 
+/// The round cursor.
 #[derive(Debug)]
 pub(super) struct Cursor {
+    /// The current base round.
     current_round: usize,
+    /// Atlas pages and intermediate texture accounting.
     atlases: Atlases,
+    /// Allocations to deallocate after each indexed round completes.
     pending_releases: Vec<Vec<AllocatedTextureRegion<LayerTextureId>>>,
 }
 
@@ -30,10 +39,12 @@ impl Cursor {
         self.current_round
     }
 
+    /// Whether access to the scratch texture has been requested.
     pub(super) fn scratch_texture(&self) -> bool {
         self.atlases.scratch_texture()
     }
 
+    /// Indicate that access to the scratch texture is required.
     pub(super) fn require_scratch_texture(&mut self) -> Result<(), AtlasError> {
         self.atlases.require_scratch_texture()
     }
@@ -42,16 +53,16 @@ impl Cursor {
         &mut self,
         request: LayerAllocationRequest,
     ) -> Result<Allocation<AllocatedTextureRegion<LayerTextureId>>, AtlasError> {
-        if let Some(allocation) =
-            self.allocate_reusing(|atlases| Ok(atlases.allocate_layer(&request)))?
+        if let Some(allocation) = self.allocate_reusing(|atlases| atlases.allocate_layer(&request))
         {
             return Ok(allocation);
         }
 
         // The currently available layer textures do not have enough room to store our layer.
-        // Therefore, we need to create a new one.
+        // Therefore, we need to attempt to create a new one.
 
         self.atlases.add_layer_atlas(request.texture_parity)?;
+        // If this still fails, it means the layer itself is larger than the maximum texture size.
         let allocation = self
             .atlases
             .allocate_layer(&request)
@@ -64,30 +75,30 @@ impl Cursor {
     }
 
     /// Advance the round counter until enough resources have been freed such that
-    /// the given allocation succeeds.
-    ///
-    /// Return `Ok(None)` in case it's not possible to perform the allocation using the
-    /// currently available resources.
+    /// the given allocation succeeds, if possible.
     fn allocate_reusing<T: Copy>(
         &mut self,
-        mut allocate: impl FnMut(&mut Atlases) -> Result<Option<T>, AtlasError>,
-    ) -> Result<Option<Allocation<T>>, AtlasError> {
+        mut allocate: impl FnMut(&mut Atlases) -> Option<T>,
+    ) -> Option<Allocation<T>> {
         loop {
-            if let Some(allocation) = allocate(&mut self.atlases)? {
-                return Ok(Some(Allocation {
+            if let Some(allocation) = allocate(&mut self.atlases) {
+                return Some(Allocation {
                     allocation,
                     round_idx: self.current_round,
-                }));
+                });
             }
 
+            // If there's no more releases pending and the previous allocation failed, it means
+            // we simply don't have enough space right now.
             if self.current_round >= self.pending_releases.len() {
-                return Ok(None);
+                return None;
             }
 
             self.advance();
         }
     }
 
+    /// Mark the given allocation as ready to release in the given round.
     pub(super) fn release(
         &mut self,
         allocation: AllocatedTextureRegion<LayerTextureId>,

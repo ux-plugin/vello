@@ -1,6 +1,8 @@
 // Copyright 2025 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+//! Rectangle decomposition for the fast GPU rect path.
+
 use vello_common::geometry::RectU16;
 use vello_common::kurbo::Rect;
 

@@ -1,24 +1,7 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
-// A brief high-level explanation of how filters work in the hybrid renderer:
-//
-// Filter layers are recorded as normal layers with an attached filter description. During schedule
-// building, the layer is allocated in one of the two layer atlas textures with enough space for the
-// expanded filter bounds rather than only the raw layer contents. Each filter also reserves a
-// temporary region in the opposite-parity layer atlas for ping-ponging.
-//
-// While executing the schedule, each layer texture pass expands its filters into a sequence of GPU
-// passes such as offset, downscale, blur, upscale, and drop-shadow composite. Passes at the same
-// step with matching input/output textures are batched together. The round first renders the layer
-// contents into the allocated layer texture region, then the backend executes the filter plan
-// before the layer is blended or sampled by its parent.
-//
-// Every filter sequence has an even number of passes, so the final pixels end up back in the
-// original layer allocation. Drop shadows first run a copy pass from the original layer to
-// mirrored coordinates in the shared scratch texture; other filters never need that pass.
-
-//! GPU filter types and conversion utilities.
+//! GPU filter encoding and executable pass planning.
 
 use crate::copy::GpuCopyInstance;
 use crate::schedule::round::FilterOp;
@@ -392,15 +375,24 @@ pub(crate) struct FilterContext {
     filters: Vec<GpuFilterData>,
 }
 
+/// Offset and encoded parameters for one filter recorded in [`FilterContext`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct PreparedGpuFilter {
+    /// Texel offset of the parameter block in the filter data texture.
     pub(crate) data_offset: u32,
+    /// Encoded filter parameters used while planning passes.
     pub(crate) data: GpuFilterData,
 }
 
+/// The concrete filter-execution plan for a single pass, split into two steps:
+///
+/// First an optional copy step which moves the original layer contents into the scratch texture.
+/// Then, the actual sequence of filter passes.
 #[derive(Debug, Default)]
 pub(crate) struct FilterPassPlan {
+    /// Copies preserving original layer contents in the shared scratch texture.
     copy_pass: Vec<GpuCopyInstance>,
+    /// Filter instances grouped by their index in each filter's pass sequence.
     steps: RetainVec<Vec<FilterInstanceData>>,
 }
 
@@ -468,13 +460,20 @@ impl FilterPassPlan {
     }
 }
 
+/// Expands one scheduled filter into entries in a shared [`FilterPassPlan`].
 #[derive(Debug)]
 struct FilterPassBuilder<'a> {
+    /// Scheduled filter and its original/temporary texture regions.
     op: FilterOp,
+    /// Full dimensions of the intermediate texture pages.
     texture_size: SizeU16,
+    /// The filter pass plan we are writing into.
     passes: &'a mut FilterPassPlan,
+    /// Tracks dimensions through blur downscaling and upscaling.
     sizer: DecimationSizer,
+    /// Whether the next pass reads from the original region.
     current_is_original: bool,
+    /// Index of the next pass in this filter's sequence.
     step: usize,
 }
 

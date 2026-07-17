@@ -3,7 +3,7 @@
 
 // This file is a modified version of the vello/src/util.rs file.
 
-//! Simple helpers for managing wgpu state and surfaces.
+//! A number of utility helper methods.
 
 use alloc::vec::Vec;
 use core::ops::{Range, RangeInclusive};
@@ -156,6 +156,7 @@ impl<T> VecExt<T> for Vec<T> {
     }
 }
 
+/// Read-only view of values selected from a shared buffer by [`Ranges`].
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct RangedSlice<'a, T> {
     buffer: &'a [T],

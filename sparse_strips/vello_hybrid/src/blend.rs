@@ -1,6 +1,8 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+//! GPU instance construction for non-default layer blending.
+
 use crate::copy::GpuCopyInstance;
 use crate::schedule::round::BlendOp;
 use crate::target::TextureParity;
@@ -138,11 +140,21 @@ pub(crate) fn gpu_blend_instance(
     }
 }
 
+/// Packed geometry fields shared while constructing a [`GpuBlendInstance`].
+///
+/// Either represents a simple rectangle, or a strip with potential alpha, in case the blend layer
+/// has clipping.
 #[derive(Debug, Copy, Clone)]
 struct GpuBlendGeometry {
+    /// Atlas-space origin packed as `u16x2`.
     xy: u32,
+    /// Width and optional rectangle height packed as `u16x2`.
     extent: u32,
+    /// Alpha texture column used by clipped strip geometry.
+    ///
+    /// Irrelevant if the "alpha-presence" flag is not activated.
     alpha_col_idx: u32,
+    /// Packed rectangle and alpha-presence flags.
     flags: u32,
 }
 

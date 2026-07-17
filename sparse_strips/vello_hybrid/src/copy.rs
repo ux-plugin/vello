@@ -1,6 +1,8 @@
 // Copyright 2026 the Vello Authors
 // SPDX-License-Identifier: Apache-2.0 OR MIT
 
+//! GPU instance data for copies between intermediate textures.
+
 use bytemuck::{Pod, Zeroable};
 
 /// Per-instance data for `copy.wgsl`.

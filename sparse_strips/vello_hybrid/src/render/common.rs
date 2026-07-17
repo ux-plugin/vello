@@ -35,7 +35,9 @@ pub(crate) const IMAGE_PADDING: u16 = 0;
 /// Texture limits reported by the rendering device.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct DeviceLimits {
+    /// Maximum width or height of a two-dimensional texture.
     pub(crate) max_texture_dimension_2d: u32,
+    /// Maximum number of layers in an image atlas texture array.
     pub(crate) max_texture_array_layers: u32,
 }
 
@@ -70,17 +72,24 @@ impl<T> ScratchTexture<T> {
 /// Scratch allocations reused while rendering a frame.
 #[derive(Debug, Default)]
 pub(crate) struct ScratchBuffers {
+    /// Clear instances scratch buffer.
     #[cfg(feature = "wgpu")]
     pub(crate) clear_instances: Vec<GpuClearInstance>,
+    /// Blend instances scratch buffer.
     pub(crate) blend_instances: Vec<GpuBlendInstance>,
+    /// Copy instances scratch buffer.
     pub(crate) copy_instances: Vec<GpuCopyInstance>,
 }
 
+/// Per-instance data for clearing a rectangle in an intermediate texture.
 #[repr(C)]
 #[derive(Debug, Copy, Clone, Pod, Zeroable)]
 pub(crate) struct GpuClearInstance {
+    /// Atlas-space rectangle origin.
     pub(crate) origin: [u32; 2],
+    /// Width and height of the cleared rectangle.
     pub(crate) size: [u32; 2],
+    /// Width and height of the target texture.
     pub(crate) target_size: [u32; 2],
 }
 
