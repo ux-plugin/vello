@@ -38,44 +38,81 @@ struct RendererWrapper {
     device: wgpu::Device,
     queue: wgpu::Queue,
     surface: wgpu::Surface<'static>,
+    surface_format: wgpu::TextureFormat,
 }
 
 impl RendererWrapper {
     async fn new(canvas: HtmlCanvasElement) -> Self {
         let width = canvas.width();
         let height = canvas.height();
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::GL,
-            ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(OurDisplayHandle))
-        });
-        let surface = instance
-            .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
-            .expect("Canvas surface to be valid");
 
-        let adapter = instance
-            .request_adapter(&wgpu::RequestAdapterOptions {
-                compatible_surface: Some(&surface),
-                ..Default::default()
-            })
-            .await
-            .expect("Adapter to be valid");
+        // Try real WebGPU first, then fall back to wgpu-over-WebGL2. Each backend needs its
+        // own instance+surface (the surface is bound to the instance), so build them together
+        // per attempt and keep whichever yields an adapter.
+        async fn try_backend(
+            backends: wgpu::Backends,
+            canvas: &HtmlCanvasElement,
+        ) -> Option<(wgpu::Instance, wgpu::Surface<'static>, wgpu::Adapter)> {
+            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+                backends,
+                ..wgpu::InstanceDescriptor::new_with_display_handle(Box::new(OurDisplayHandle))
+            });
+            let surface = instance
+                .create_surface(wgpu::SurfaceTarget::Canvas(canvas.clone()))
+                .ok()?;
+            let adapter = instance
+                .request_adapter(&wgpu::RequestAdapterOptions {
+                    compatible_surface: Some(&surface),
+                    ..Default::default()
+                })
+                .await
+                .ok()?;
+            Some((instance, surface, adapter))
+        }
 
+        let (_instance, surface, adapter) =
+            match try_backend(wgpu::Backends::BROWSER_WEBGPU, &canvas).await {
+                Some(triple) => triple,
+                None => {
+                    log::warn!("WebGPU unavailable, falling back to WebGL2");
+                    try_backend(wgpu::Backends::GL, &canvas)
+                        .await
+                        .expect("Neither WebGPU nor WebGL2 adapter available")
+                }
+            };
+
+        let info = adapter.get_info();
+        log::info!(
+            "vello_hybrid backend = {:?} | adapter = {} ({:?})",
+            info.backend,
+            info.name,
+            info.device_type
+        );
+
+        // Use the adapter's full limits. On WebGPU this unlocks far higher texture/buffer
+        // limits than `downlevel_webgl2_defaults`; on the GL fallback it already reflects the
+        // WebGL2 caps, so requesting exactly what the adapter offers always succeeds.
         let (device, queue) = adapter
             .request_device(&wgpu::DeviceDescriptor {
                 label: None,
                 required_features: wgpu::Features::empty(),
-                required_limits: wgpu::Limits {
-                    max_texture_dimension_2d: adapter.limits().max_texture_dimension_2d,
-                    max_buffer_size: adapter.limits().max_buffer_size,
-                    ..wgpu::Limits::downlevel_webgl2_defaults()
-                },
+                required_limits: adapter.limits(),
                 ..Default::default()
             })
             .await
             .expect("Device to be valid");
 
-        // Configure the surface
-        let surface_format = wgpu::TextureFormat::Rgba8Unorm;
+        // Configure the surface using the canvas's *preferred* format (wgpu reports it first).
+        // On a WebGPU canvas that's `bgra8unorm`; forcing a non-preferred format makes the
+        // browser insert an extra per-frame copy/swizzle before compositing. The renderer builds
+        // its final-target pipeline against whatever format we pass, so targeting the preferred
+        // one directly is both correct and avoids that copy.
+        let surface_caps = surface.get_capabilities(&adapter);
+        let surface_format = surface_caps
+            .formats
+            .first()
+            .copied()
+            .unwrap_or(wgpu::TextureFormat::Rgba8Unorm);
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
             format: surface_format,
@@ -97,6 +134,16 @@ impl RendererWrapper {
             },
             RenderSettings {
                 level: Level::try_detect().unwrap_or(Level::baseline()),
+                // The stacked-effects stress scene renders many multi-pass blur layers at once,
+                // each needing initial + ping-pong scratch textures in the filter atlas. The
+                // default cap (8 × 4096²) is exhausted when zoomed in; raise it so the demo can
+                // push much further before it hits Vello's hard limit. Clamped down automatically
+                // by `normalize_atlas_config` to the WebGL2 backend's real texture-layer limit.
+                filter_atlas_config: vello_common::multi_atlas::AtlasConfig {
+                    initial_atlas_count: 0,
+                    max_atlases: 32,
+                    ..Default::default()
+                },
                 ..Default::default()
             },
         );
@@ -106,13 +153,14 @@ impl RendererWrapper {
             device,
             queue,
             surface,
+            surface_format,
         }
     }
 
     fn resize(&mut self, width: u32, height: u32) {
         let surface_config = wgpu::SurfaceConfiguration {
             usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
-            format: wgpu::TextureFormat::Rgba8Unorm,
+            format: self.surface_format,
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
@@ -138,6 +186,10 @@ struct AppState {
     renderer_wrapper: RendererWrapper,
     need_render: bool,
     canvas: HtmlCanvasElement,
+    /// Timestamp (ms) of the last successfully presented frame, for cadence measurement.
+    last_present_ms: Option<f64>,
+    /// Exponential moving average of the present-to-present interval, in ms.
+    frame_interval_ema_ms: f64,
 }
 
 impl AppState {
@@ -161,6 +213,8 @@ impl AppState {
             renderer_wrapper,
             need_render: true,
             canvas,
+            last_present_ms: None,
+            frame_interval_ema_ms: 0.0,
         };
 
         // Upload images to the WebGL atlas
@@ -173,6 +227,8 @@ impl AppState {
         if !self.need_render {
             return;
         }
+
+        let frame_start = now_ms();
 
         self.scene.reset();
 
@@ -206,22 +262,58 @@ impl AppState {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
 
-        self.renderer_wrapper
-            .renderer
-            .render(
-                &self.scene,
-                self.scenes[self.current_scene].resources_mut(),
-                &self.renderer_wrapper.device,
-                &self.renderer_wrapper.queue,
-                &mut encoder,
-                &render_size,
-                &surface_texture_view,
-                &vello_hybrid::TextureBindings::new(),
-            )
-            .unwrap();
+        if let Err(e) = self.renderer_wrapper.renderer.render(
+            &self.scene,
+            self.scenes[self.current_scene].resources_mut(),
+            &self.renderer_wrapper.device,
+            &self.renderer_wrapper.queue,
+            &mut encoder,
+            &render_size,
+            &surface_texture_view,
+            &vello_hybrid::TextureBindings::new(),
+        ) {
+            // A filter-heavy scene zoomed in far enough can exhaust Vello's fixed
+            // filter scratch-atlas capacity (`AtlasError::AtlasLimitReached`). That's a
+            // recoverable resource limit, not a fatal error — skip this frame, keep the
+            // last good frame on screen, and surface the reason instead of panicking.
+            log::warn!("frame skipped: {e:?}");
+            update_frame_stats(
+                self.frame_interval_ema_ms,
+                now_ms() - frame_start,
+                Some(format!("⚠ {e:?} — zoom out or use fewer stacked effects")),
+            );
+            self.need_render = false;
+            return;
+        }
 
         self.renderer_wrapper.queue.submit([encoder.finish()]);
         surface_texture.present();
+
+        // CPU-side portion: time spent building the scene and encoding/submitting commands.
+        let encode_ms = now_ms() - frame_start;
+
+        // Perceived frame rate = wall-clock interval between frames that actually reach the
+        // screen. With continuous rendering the browser paces `requestAnimationFrame` to real
+        // display cadence and applies GPU backpressure (a saturated swapchain returns early
+        // above without updating `last_present_ms`), so this present-to-present delta reflects
+        // what the user sees — vsync-capped when the GPU has headroom, GPU-limited when it does
+        // not. Unlike a GPU-completion fence, it is immune to event-loop scheduling lag.
+        let now = now_ms();
+        if let Some(prev) = self.last_present_ms {
+            let interval = now - prev;
+            self.frame_interval_ema_ms = if self.frame_interval_ema_ms <= 0.0 {
+                interval
+            } else {
+                self.frame_interval_ema_ms * 0.9 + interval * 0.1
+            };
+        }
+        self.last_present_ms = Some(now);
+
+        update_frame_stats(
+            self.frame_interval_ema_ms,
+            encode_ms,
+            self.scenes[self.current_scene].status(),
+        );
 
         self.need_render = false;
     }
@@ -258,6 +350,18 @@ impl AppState {
 
     fn reset_transform(&mut self) {
         self.transform = Affine::IDENTITY;
+        self.need_render = true;
+    }
+
+    /// Rotate the view about the cursor (or the canvas center if the cursor has left),
+    /// matching the upstream `with_winit` demo's Q/E controls.
+    fn rotate(&mut self, clockwise: bool) {
+        let pivot = self.last_cursor_position.unwrap_or(Point {
+            x: 0.5 * self.width as f64,
+            y: 0.5 * self.height as f64,
+        });
+        let angle = if clockwise { -0.05 } else { 0.05 };
+        self.transform = self.transform.then_rotate_about(angle, pivot);
         self.need_render = true;
     }
 
@@ -408,6 +512,36 @@ extern "C" {
 
 /// Creates a `HTMLCanvasElement` of the given dimensions and renders the given scenes into it,
 /// with interactive controls for panning, zooming, and switching between scenes.
+/// Current high-resolution timestamp in milliseconds.
+fn now_ms() -> f64 {
+    web_sys::window()
+        .and_then(|w| w.performance())
+        .map_or(0.0, |p| p.now())
+}
+
+/// Update the on-screen overlay. `interval_avg_ms` is the smoothed present-to-present frame
+/// interval (perceived cadence), from which fps is derived; `encode_ms` is the CPU-side scene
+/// build + command encoding time for this frame.
+fn update_frame_stats(interval_avg_ms: f64, encode_ms: f64, status: Option<String>) {
+    let Some(doc) = web_sys::window().and_then(|w| w.document()) else {
+        return;
+    };
+    if let Some(el) = doc.get_element_by_id("frame-stats") {
+        let fps = if interval_avg_ms > 0.0 {
+            1000.0 / interval_avg_ms
+        } else {
+            0.0
+        };
+        let mut text =
+            format!("{fps:.0} fps  ·  frame {interval_avg_ms:.2} ms  ·  encode {encode_ms:.2} ms");
+        if let Some(status) = status {
+            text.push_str("  ·  ");
+            text.push_str(&status);
+        }
+        el.set_text_content(Some(&text));
+    }
+}
+
 pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     let canvas = web_sys::Window::document(&web_sys::window().unwrap())
         .unwrap()
@@ -454,7 +588,14 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         let app_state = app_state.clone();
 
         *g.borrow_mut() = Some(Closure::wrap(Box::new(move || {
-            app_state.borrow_mut().render();
+            // Use `try_borrow_mut` so a slow frame (heavy stacked effects) that lets the
+            // browser dispatch an input event mid-render can't re-enter and panic.
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                // Render every animation frame so the fps readout reflects steady-state
+                // present cadence, not just frames triggered by input events.
+                state.need_render = true;
+                state.render();
+            }
             request_animation_frame(f.borrow().as_ref().unwrap());
         }) as Box<dyn FnMut()>));
 
@@ -471,7 +612,9 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
             let width = window.inner_width().unwrap().as_f64().unwrap() as u32 * dpr as u32;
             let height = window.inner_height().unwrap().as_f64().unwrap() as u32 * dpr as u32;
 
-            app_state.borrow_mut().resize(width, height);
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                state.resize(width, height);
+            }
         }) as Box<dyn FnMut(_)>);
 
         let window = web_sys::window().unwrap();
@@ -487,9 +630,9 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     {
         let app_state = app_state.clone();
         let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
-            app_state
-                .borrow_mut()
-                .handle_mouse_down(event.client_x() as f64, event.client_y() as f64);
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                state.handle_mouse_down(event.client_x() as f64, event.client_y() as f64);
+            }
         }) as Box<dyn FnMut(_)>);
         canvas
             .add_event_listener_with_callback("mousedown", closure.as_ref().unchecked_ref())
@@ -501,7 +644,9 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     {
         let app_state = app_state.clone();
         let closure = Closure::wrap(Box::new(move |_event: MouseEvent| {
-            app_state.borrow_mut().handle_mouse_up();
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                state.handle_mouse_up();
+            }
         }) as Box<dyn FnMut(_)>);
         canvas
             .add_event_listener_with_callback("mouseup", closure.as_ref().unchecked_ref())
@@ -513,9 +658,9 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     {
         let app_state = app_state.clone();
         let closure = Closure::wrap(Box::new(move |event: MouseEvent| {
-            app_state
-                .borrow_mut()
-                .handle_mouse_move(event.client_x() as f64, event.client_y() as f64);
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                state.handle_mouse_move(event.client_x() as f64, event.client_y() as f64);
+            }
         }) as Box<dyn FnMut(_)>);
         canvas
             .add_event_listener_with_callback("mousemove", closure.as_ref().unchecked_ref())
@@ -529,7 +674,9 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         let closure = Closure::wrap(Box::new(move |event: WheelEvent| {
             event.prevent_default();
             let delta = -event.delta_y() / 100.0; // Normalize and invert
-            app_state.borrow_mut().handle_wheel(delta);
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                state.handle_wheel(delta);
+            }
         }) as Box<dyn FnMut(_)>);
         canvas
             .add_event_listener_with_callback("wheel", closure.as_ref().unchecked_ref())
@@ -543,11 +690,17 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         let document = web_sys::window().unwrap().document().unwrap();
         let closure = Closure::wrap(Box::new(move |event: KeyboardEvent| {
             let key = event.key();
-            match key.as_str() {
-                "ArrowRight" => app_state.borrow_mut().next_scene(),
-                "ArrowLeft" => app_state.borrow_mut().prev_scene(),
-                " " => app_state.borrow_mut().reset_transform(),
-                _ => app_state.borrow_mut().handle_key(key.as_str()),
+            if let Ok(mut state) = app_state.try_borrow_mut() {
+                match key.as_str() {
+                    "ArrowRight" => state.next_scene(),
+                    "ArrowLeft" => state.prev_scene(),
+                    " " => state.reset_transform(),
+                    "q" | "Q" => state.rotate(false),
+                    "e" | "E" => state.rotate(true),
+                    _ => {
+                        state.handle_key(key.as_str());
+                    }
+                }
             }
         }) as Box<dyn FnMut(_)>);
         document
@@ -560,7 +713,7 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
     let document = web_sys::window().unwrap().document().unwrap();
     let instructions = document.create_element("div").unwrap();
     instructions.set_inner_html(
-        "Left/Right Arrow: Change scene | Space: Reset view | Mouse Drag: Pan | Mouse Wheel: Zoom",
+        "Left/Right Arrow: Change scene | Q/E: Rotate | Space: Reset view | Mouse Drag: Pan | Mouse Wheel: Zoom",
     );
     let style = instructions
         .dyn_ref::<web_sys::HtmlElement>()
@@ -583,6 +736,24 @@ pub async fn run_interactive(canvas_width: u16, canvas_height: u16) {
         .unwrap()
         .append_child(&instructions)
         .unwrap();
+
+    // Create the frame-time stats overlay (lower-right, updated on GPU completion each frame).
+    let stats = document.create_element("div").unwrap();
+    stats.set_id("frame-stats");
+    stats.set_text_content(Some("— fps"));
+    let stats_style = stats.dyn_ref::<web_sys::HtmlElement>().unwrap().style();
+    stats_style.set_property("position", "fixed").unwrap();
+    stats_style.set_property("bottom", "10px").unwrap();
+    stats_style.set_property("right", "10px").unwrap();
+    stats_style
+        .set_property("background", "rgba(0, 0, 0, 0.6)")
+        .unwrap();
+    stats_style.set_property("color", "#4ade80").unwrap();
+    stats_style.set_property("padding", "5px 10px").unwrap();
+    stats_style.set_property("border-radius", "5px").unwrap();
+    stats_style.set_property("font-family", "monospace").unwrap();
+    stats_style.set_property("pointer-events", "none").unwrap();
+    document.body().unwrap().append_child(&stats).unwrap();
 }
 
 /// Creates a `HTMLCanvasElement` and renders a single scene into it
@@ -611,6 +782,7 @@ pub async fn render_scene(scene: Scene, width: u16, height: u16) {
         device,
         queue,
         surface,
+        surface_format: _,
     } = RendererWrapper::new(canvas).await;
 
     let render_size = vello_hybrid::RenderSize {

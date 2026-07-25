@@ -1,7 +1,7 @@
 [package]
-name = "wgpu_webgl"
+name = "focus_embed"
 version.workspace = true
-description = "An example showing Vello Hybrid using WebGL2."
+description = "Phase 0: an embeddable wasm-bindgen + wgpu Vello renderer for Penpot focus mode."
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
@@ -21,6 +21,9 @@ log = { workspace = true }
 vello_common = { workspace = true }
 vello_hybrid = { workspace = true }
 vello_example_scenes = { workspace = true }
+# The backend-neutral model, shared with render-wasm. This is the crate render-wasm's converter
+# projects Shapes into; here we render it with Vello — the second half of the end-to-end pipeline.
+render-core = { path = "../../../../../render-wasm/render-core" }
 wasm-bindgen = { workspace = true }
 wasm-bindgen-futures = { workspace = true }
 web-sys = { workspace = true, features = [
@@ -32,11 +35,6 @@ web-sys = { workspace = true, features = [
     "HtmlCanvasElement",
     "CssStyleDeclaration",
     "WebGl2RenderingContext",
-    "MouseEvent",
-    "WheelEvent",
     "KeyboardEvent",
 ] }
 wgpu = { workspace = true, default-features = true, features = ["webgl"] }
-
-[dev-dependencies]
-wasm-bindgen-test = { workspace = true }

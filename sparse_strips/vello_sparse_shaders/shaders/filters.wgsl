@@ -21,6 +21,7 @@ const FILTER_TYPE_OFFSET: u32 = 0u;
 const FILTER_TYPE_FLOOD: u32 = 1u;
 const FILTER_TYPE_GAUSSIAN_BLUR: u32 = 2u;
 const FILTER_TYPE_DROP_SHADOW: u32 = 3u;
+const FILTER_TYPE_CUSTOM: u32 = 4u;
 
 const PASS_COPY: u32 = 0u;
 const PASS_FLOOD: u32 = 1u;
@@ -30,6 +31,7 @@ const PASS_BLUR_H: u32 = 4u;
 const PASS_BLUR_V: u32 = 5u;
 const PASS_UPSCALE: u32 = 6u;
 const PASS_COMPOSITE_DROP_SHADOW: u32 = 7u;
+const PASS_CUSTOM: u32 = 8u;
 
 const MAX_TAPS_PER_SIDE: u32 = 3u;
 
@@ -302,6 +304,39 @@ fn convolve(
 const HORIZONTAL: vec2<f32> = vec2<f32>(1.0, 0.0);
 const VERTICAL: vec2<f32> = vec2<f32>(0.0, 1.0);
 
+// ============================================================================
+// CUSTOM EFFECT HOOK  ---  the "② filter" insertion point.
+//
+// Author your WGSL here. Arguments:
+//   effect : which effect branch to run (from `FilterPrimitive::Custom { effect }`)
+//   color  : this layer's pixel, premultiplied alpha
+//   coord  : pixel position relative to the layer origin
+//   size   : layer size in pixels
+//   p      : uniforms forwarded from `FilterPrimitive::Custom { params }` (up to 10)
+// Return the filtered premultiplied color. Switch on `effect` to host many effects.
+// This is the compile-time path; a runtime-compiled per-effect pipeline is the
+// planned follow-up.
+// ============================================================================
+fn custom_effect(
+    effect: u32,
+    color: vec4<f32>,
+    coord: vec2<f32>,
+    size: vec2<f32>,
+    p: array<f32, 10>,
+) -> vec4<f32> {
+    switch effect {
+        // Effect 0 --- tint: mix the layer toward an RGB color by amount p[3].
+        // Proves params flow end-to-end. p[0..2] = rgb (0..1), p[3] = amount (0..1).
+        case 0u: {
+            let tint = vec4<f32>(p[0], p[1], p[2], 1.0) * color.a;
+            return mix(color, tint, clamp(p[3], 0.0, 1.0));
+        }
+        default: {
+            return color;
+        }
+    }
+}
+
 @fragment
 fn fs_main(
     @location(0) @interpolate(flat) filter_offset: u32,
@@ -387,6 +422,24 @@ fn fs_main(
 
             // Simple source-over compositing.
             return original + shadow_result * (1.0 - original.a);
+        }
+        case PASS_CUSTOM: {
+            let color = sample_input(src_offset, rel_coord);
+            let t0 = load_filter_texel(filter_offset, 0u);
+            let t1 = load_filter_texel(filter_offset, 1u);
+            let t2 = load_filter_texel(filter_offset, 2u);
+            var p: array<f32, 10>;
+            p[0] = bitcast<f32>(t0.z);
+            p[1] = bitcast<f32>(t0.w);
+            p[2] = bitcast<f32>(t1.x);
+            p[3] = bitcast<f32>(t1.y);
+            p[4] = bitcast<f32>(t1.z);
+            p[5] = bitcast<f32>(t1.w);
+            p[6] = bitcast<f32>(t2.x);
+            p[7] = bitcast<f32>(t2.y);
+            p[8] = bitcast<f32>(t2.z);
+            p[9] = bitcast<f32>(t2.w);
+            return custom_effect(t0.y, color, rel_coord, vec2<f32>(src_size), p);
         }
         // Shouldn't be reached.
         default: {

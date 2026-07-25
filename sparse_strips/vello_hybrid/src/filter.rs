@@ -32,6 +32,7 @@ use hashbrown::HashMap;
 use vello_common::coarse::{WideTile, WideTilesBbox};
 use vello_common::encode::{EncodedImage, EncodedPaint};
 use vello_common::filter::PreparedFilter;
+use vello_common::filter::custom::Custom;
 use vello_common::filter::drop_shadow::DropShadow;
 use vello_common::filter::flood::Flood;
 use vello_common::filter::gaussian_blur::{DecimationSizer, GaussianBlur, MAX_KERNEL_SIZE};
@@ -84,12 +85,17 @@ const _: () = assert!(
     size_of::<GpuGaussianBlur>() == FILTER_SIZE_BYTES,
     "memory size of filters need to match"
 );
+const _: () = assert!(
+    size_of::<GpuCustom>() == FILTER_SIZE_BYTES,
+    "memory size of filters need to match"
+);
 
 pub(crate) mod filter_type {
     pub(crate) const OFFSET: u32 = 0;
     pub(crate) const FLOOD: u32 = 1;
     pub(crate) const GAUSSIAN_BLUR: u32 = 2;
     pub(crate) const DROP_SHADOW: u32 = 3;
+    pub(crate) const CUSTOM: u32 = 4;
 }
 
 pub(crate) mod edge_mode {
@@ -109,6 +115,7 @@ pub(crate) mod pass_kind {
     pub(crate) const BLUR_V: u32 = 5;
     pub(crate) const UPSCALE: u32 = 6;
     pub(crate) const COMPOSITE_DROP_SHADOW: u32 = 7;
+    pub(crate) const CUSTOM: u32 = 8;
 }
 
 pub(crate) fn edge_mode_to_gpu(mode: EdgeMode) -> u32 {
@@ -327,6 +334,32 @@ impl From<&DropShadow> for GpuDropShadow {
     }
 }
 
+/// GPU representation of a custom (user WGSL) filter.
+///
+/// Layout must stay in sync with the `PASS_CUSTOM` branch in `filters.wgsl`:
+/// `header` (data[0]), `effect` (data[1]), then 10 uniform floats (data[2..12]).
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, Zeroable, Pod)]
+pub(crate) struct GpuCustom {
+    header: u32,
+    effect: u32,
+    params: [f32; 10],
+}
+
+impl From<&Custom> for GpuCustom {
+    fn from(custom: &Custom) -> Self {
+        let mut params = [0.0_f32; 10];
+        for (dst, src) in params.iter_mut().zip(custom.params.iter()) {
+            *dst = *src;
+        }
+        Self {
+            header: pack_header(filter_type::CUSTOM),
+            effect: custom.effect,
+            params,
+        }
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]
 pub(crate) struct GpuFilterData {
@@ -364,6 +397,7 @@ impl CastToFilterData for GpuOffset {}
 impl CastToFilterData for GpuFlood {}
 impl CastToFilterData for GpuGaussianBlur {}
 impl CastToFilterData for GpuDropShadow {}
+impl CastToFilterData for GpuCustom {}
 
 impl<T: CastToFilterData> From<T> for GpuFilterData {
     fn from(filter: T) -> Self {
@@ -378,6 +412,7 @@ impl From<&PreparedFilter> for GpuFilterData {
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
             PreparedFilter::DropShadow(f) => GpuDropShadow::from(f).into(),
+            PreparedFilter::Custom(f) => GpuCustom::from(f).into(),
         }
     }
 }
@@ -945,6 +980,7 @@ impl FilterContext {
             let pass = match filter_type {
                 filter_type::OFFSET => pass_kind::OFFSET,
                 filter_type::FLOOD => pass_kind::FLOOD,
+                filter_type::CUSTOM => pass_kind::CUSTOM,
                 // The above are the only single-pass filters currently implemented.
                 _ => unimplemented!(),
             };

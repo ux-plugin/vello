@@ -79,6 +79,10 @@ pub(crate) fn filter_lowp(
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_lowp(pixmap, filter_scratch);
         }
+        PreparedFilter::Custom(_) => {
+            // Custom effects are authored in WGSL and only execute on the GPU backend
+            // (`vello_hybrid`). On the CPU backend they are a no-op passthrough.
+        }
     }
 }
 
@@ -116,6 +120,10 @@ pub(crate) fn filter_highp(
         }
         PreparedFilter::DropShadow(drop_shadow) => {
             drop_shadow.execute_highp(pixmap, filter_scratch);
+        }
+        PreparedFilter::Custom(_) => {
+            // Custom effects are authored in WGSL and only execute on the GPU backend
+            // (`vello_hybrid`). On the CPU backend they are a no-op passthrough.
         }
     }
 }

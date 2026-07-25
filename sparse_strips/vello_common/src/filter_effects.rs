@@ -410,6 +410,26 @@ pub enum FilterPrimitive {
         /// Default is `EdgeMode::None` per SVG spec.
         edge_mode: EdgeMode,
     },
+    /// A custom, user-authored effect implemented in WGSL.
+    ///
+    /// This is the `②` insertion point: it runs a fragment effect over the rendered
+    /// layer. The effect body lives in the `custom_effect` hook in `filters.wgsl` and
+    /// is selected by `effect`; `params` are uniform floats forwarded to that shader
+    /// (up to 10 in the current single-pass encoding). `expansion` declares how far the
+    /// effect writes beyond the source bounds, in user space, and MUST contain the
+    /// origin (`x0 <= 0`, `y0 <= 0`, `x1 >= 0`, `y1 >= 0`).
+    ///
+    /// This slice runs on the `vello_hybrid` GPU backend (wgpu + WebGL2). Runtime
+    /// compilation of per-effect WGSL source into a dedicated pipeline is the planned
+    /// follow-up; on `vello_cpu` the effect is a no-op passthrough.
+    Custom {
+        /// Selects which branch of the `custom_effect` hook runs in the shader.
+        effect: u32,
+        /// Uniform parameters forwarded to the shader.
+        params: SmallVec<[f32; 8]>,
+        /// Expansion beyond source bounds in user space: `[x0 <= 0, y0 <= 0, x1 >= 0, y1 >= 0]`.
+        expansion: [f32; 4],
+    },
     //
     // ============================================================
     // TODO: The following filter primitives are not yet implemented
@@ -591,6 +611,12 @@ impl FilterPrimitive {
                     blur_radius + dy.max(0.0),
                 )
             }
+            Self::Custom { expansion, .. } => Rect::new(
+                f64::from(expansion[0]),
+                f64::from(expansion[1]),
+                f64::from(expansion[2]),
+                f64::from(expansion[3]),
+            ),
             // Most other filters don't expand bounds
             _ => Rect::ZERO,
         }

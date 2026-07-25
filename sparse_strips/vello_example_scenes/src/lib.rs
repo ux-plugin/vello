@@ -6,6 +6,7 @@
 pub mod blend;
 pub mod blurred_rounded_rect;
 pub mod clip;
+pub mod custom_filter;
 pub mod emoji_grid;
 pub mod filter;
 pub mod filter_blur_circle;
@@ -13,10 +14,12 @@ pub mod filter_elements;
 pub mod gradient;
 pub mod image;
 pub mod multi_image;
+pub mod nested_ui;
 pub mod path;
 pub mod random_text;
 pub mod simple;
 pub mod spritesheet;
+pub mod stacked_effects;
 pub mod svg;
 pub mod text;
 
@@ -495,6 +498,11 @@ where
         blurred_rounded_rect::BlurredRoundedRectScene::new(),
     ));
     scenes.push(AnyScene::new(clip::ClipScene::new()));
+    scenes.push(AnyScene::new(custom_filter::CustomFilterScene::new()));
+    scenes.push(AnyScene::new(
+        stacked_effects::StackedEffectsScene::new(),
+    ));
+    scenes.push(AnyScene::new(nested_ui::NestedUiScene::new()));
     scenes.push(AnyScene::new(filter::FilterScene::new()));
     scenes.push(AnyScene::new(blend::BlendScene::new()));
     let flower_source = img_sources[0].clone();
@@ -533,6 +541,9 @@ where
     T::Resources: Default,
 {
     let mut scenes = vec![
+        AnyScene::new(nested_ui::NestedUiScene::new()),
+        AnyScene::new(custom_filter::CustomFilterScene::new()),
+        AnyScene::new(stacked_effects::StackedEffectsScene::new()),
         AnyScene::new(svg::SvgScene::tiger()),
         AnyScene::new(text::TextScene::new("Hello, Vello!")),
         AnyScene::new(emoji_grid::EmojiGridScene::new()),

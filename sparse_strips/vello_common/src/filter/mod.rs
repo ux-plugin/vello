@@ -7,6 +7,7 @@
 //! represent a special representation of each filter to be used as the basis for rendering in
 //! `vello_hybrid` and `vello_cpu`.
 
+use crate::filter::custom::Custom;
 use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
@@ -18,6 +19,7 @@ use crate::math::snap_up;
 use crate::tile::Tile;
 use crate::util::RectExt;
 
+pub mod custom;
 pub mod drop_shadow;
 pub mod flood;
 pub mod gaussian_blur;
@@ -34,6 +36,8 @@ pub enum PreparedFilter {
     Offset(Offset),
     /// A drop shadow filter.
     DropShadow(DropShadow),
+    /// A custom, user-authored WGSL filter.
+    Custom(Custom),
 }
 
 impl PreparedFilter {
@@ -77,6 +81,9 @@ impl PreparedFilter {
 
                 Self::Offset(offset)
             }
+            FilterPrimitive::Custom {
+                effect, params, ..
+            } => Self::Custom(Custom::new(*effect, params.to_vec())),
             _ => {
                 // Other primitives like Blend, ColorMatrix, ComponentTransfer, etc.
                 // are not yet implemented
