@@ -11,6 +11,7 @@ use crate::filter::custom::Custom;
 use crate::filter::drop_shadow::{DropShadow, transform_shadow_params};
 use crate::filter::flood::Flood;
 use crate::filter::gaussian_blur::{GaussianBlur, transform_blur_params};
+use crate::filter::inner_shadow::InnerShadow;
 use crate::filter::offset::Offset;
 use crate::filter_effects::{Filter, FilterPrimitive};
 use crate::geometry::{PaddingU16, RectU16};
@@ -23,6 +24,7 @@ pub mod custom;
 pub mod drop_shadow;
 pub mod flood;
 pub mod gaussian_blur;
+pub mod inner_shadow;
 pub mod offset;
 
 /// A filter that has been prepared for rendering.
@@ -36,6 +38,8 @@ pub enum PreparedFilter {
     Offset(Offset),
     /// A drop shadow filter.
     DropShadow(DropShadow),
+    /// An inner (inset) shadow filter.
+    InnerShadow(InnerShadow),
     /// A custom, user-authored WGSL filter.
     Custom(Custom),
 }
@@ -74,6 +78,20 @@ impl PreparedFilter {
                     DropShadow::new(scaled_dx, scaled_dy, scaled_std_dev, *edge_mode, *color);
 
                 Self::DropShadow(drop_shadow)
+            }
+            FilterPrimitive::InnerShadow {
+                dx,
+                dy,
+                std_deviation,
+                color,
+                edge_mode,
+            } => {
+                let (scaled_dx, scaled_dy, scaled_std_dev) =
+                    transform_shadow_params(*dx, *dy, *std_deviation, transform);
+                let inner_shadow =
+                    InnerShadow::new(scaled_dx, scaled_dy, scaled_std_dev, *edge_mode, *color);
+
+                Self::InnerShadow(inner_shadow)
             }
             FilterPrimitive::Offset { dx, dy } => {
                 let (scaled_dx, scaled_dy) = transform_offset_params(*dx, *dy, transform);

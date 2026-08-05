@@ -410,6 +410,23 @@ pub enum FilterPrimitive {
         /// Default is `EdgeMode::None` per SVG spec.
         edge_mode: EdgeMode,
     },
+    /// An inner (inset) shadow — a shadow drawn *inside* the shape's boundaries.
+    ///
+    /// The mirror of `DropShadow`: same offset+blur pipeline, but the composite draws the shadow
+    /// where the shape is opaque and the offset-blurred copy has pulled away, giving a recessed
+    /// look. Because the result stays within the shape, it does not expand the layer bounds.
+    InnerShadow {
+        /// Horizontal offset of the shadow in pixels. Positive values shift right.
+        dx: f32,
+        /// Vertical offset of the shadow in pixels. Positive values shift down.
+        dy: f32,
+        /// Blur standard deviation for the shadow. Larger values create softer shadows.
+        std_deviation: f32,
+        /// Shadow color with alpha channel. Alpha controls shadow opacity.
+        color: AlphaColor<Srgb>,
+        /// Edge mode for handling boundaries during blur operation.
+        edge_mode: EdgeMode,
+    },
     /// A custom, user-authored effect implemented in WGSL.
     ///
     /// This is the `②` insertion point: it runs a fragment effect over the rendered

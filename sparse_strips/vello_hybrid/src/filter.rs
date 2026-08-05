@@ -34,6 +34,7 @@ use vello_common::encode::{EncodedImage, EncodedPaint};
 use vello_common::filter::PreparedFilter;
 use vello_common::filter::custom::Custom;
 use vello_common::filter::drop_shadow::DropShadow;
+use vello_common::filter::inner_shadow::InnerShadow;
 use vello_common::filter::flood::Flood;
 use vello_common::filter::gaussian_blur::{DecimationSizer, GaussianBlur, MAX_KERNEL_SIZE};
 use vello_common::filter::offset::Offset;
@@ -82,6 +83,10 @@ const _: () = assert!(
     "memory size of filters need to match"
 );
 const _: () = assert!(
+    size_of::<GpuInnerShadow>() == FILTER_SIZE_BYTES,
+    "memory size of filters need to match"
+);
+const _: () = assert!(
     size_of::<GpuGaussianBlur>() == FILTER_SIZE_BYTES,
     "memory size of filters need to match"
 );
@@ -96,6 +101,7 @@ pub(crate) mod filter_type {
     pub(crate) const GAUSSIAN_BLUR: u32 = 2;
     pub(crate) const DROP_SHADOW: u32 = 3;
     pub(crate) const CUSTOM: u32 = 4;
+    pub(crate) const INNER_SHADOW: u32 = 5;
 }
 
 pub(crate) mod edge_mode {
@@ -116,6 +122,7 @@ pub(crate) mod pass_kind {
     pub(crate) const UPSCALE: u32 = 6;
     pub(crate) const COMPOSITE_DROP_SHADOW: u32 = 7;
     pub(crate) const CUSTOM: u32 = 8;
+    pub(crate) const COMPOSITE_INNER_SHADOW: u32 = 9;
 }
 
 pub(crate) fn edge_mode_to_gpu(mode: EdgeMode) -> u32 {
@@ -338,6 +345,47 @@ impl From<&DropShadow> for GpuDropShadow {
 ///
 /// Layout must stay in sync with the `PASS_CUSTOM` branch in `filters.wgsl`:
 /// `header` (data[0]), `effect` (data[1]), then 10 uniform floats (data[2..12]).
+/// GPU representation of an inner shadow filter. Identical layout to [`GpuDropShadow`] — the two
+/// share the offset+blur pipeline and differ only in the composite pass — with `filter_type` set to
+/// `INNER_SHADOW` in the header.
+#[repr(C, align(16))]
+#[derive(Debug, Clone, Copy, PartialEq, Zeroable, Pod)]
+pub(crate) struct GpuInnerShadow {
+    pub header: u32,
+    pub center_weight: f32,
+    pub linear_weights: [f32; MAX_TAPS_PER_SIDE],
+    pub linear_offsets: [f32; MAX_TAPS_PER_SIDE],
+    pub dx: f32,
+    pub dy: f32,
+    pub color: u32,
+    pub _padding: [u32; 1],
+}
+
+impl From<&InnerShadow> for GpuInnerShadow {
+    #[expect(
+        clippy::cast_possible_truncation,
+        reason = "n_decimations fits in 4 bits"
+    )]
+    fn from(shadow: &InnerShadow) -> Self {
+        let lk = LinearKernel::new(&shadow.kernel, shadow.kernel_size);
+        Self {
+            header: pack_header_with_gaussian_params(
+                filter_type::INNER_SHADOW,
+                edge_mode_to_gpu(shadow.edge_mode),
+                shadow.n_decimations as u32,
+                lk.n_taps as u32,
+            ),
+            center_weight: lk.center_weight,
+            linear_weights: lk.weights,
+            linear_offsets: lk.offsets,
+            dx: shadow.dx,
+            dy: shadow.dy,
+            color: shadow.color.premultiply().to_rgba8().to_u32(),
+            _padding: [0; 1],
+        }
+    }
+}
+
 #[repr(C, align(16))]
 #[derive(Debug, Clone, Copy, Zeroable, Pod)]
 pub(crate) struct GpuCustom {
@@ -386,7 +434,7 @@ impl GpuFilterData {
     pub(crate) fn is_multi_pass(&self) -> bool {
         matches!(
             self.filter_type(),
-            filter_type::GAUSSIAN_BLUR | filter_type::DROP_SHADOW
+            filter_type::GAUSSIAN_BLUR | filter_type::DROP_SHADOW | filter_type::INNER_SHADOW
         )
     }
 }
@@ -397,6 +445,7 @@ impl CastToFilterData for GpuOffset {}
 impl CastToFilterData for GpuFlood {}
 impl CastToFilterData for GpuGaussianBlur {}
 impl CastToFilterData for GpuDropShadow {}
+impl CastToFilterData for GpuInnerShadow {}
 impl CastToFilterData for GpuCustom {}
 
 impl<T: CastToFilterData> From<T> for GpuFilterData {
@@ -412,6 +461,7 @@ impl From<&PreparedFilter> for GpuFilterData {
             PreparedFilter::Flood(f) => GpuFlood::from(f).into(),
             PreparedFilter::GaussianBlur(f) => GpuGaussianBlur::from(f).into(),
             PreparedFilter::DropShadow(f) => GpuDropShadow::from(f).into(),
+            PreparedFilter::InnerShadow(f) => GpuInnerShadow::from(f).into(),
             PreparedFilter::Custom(f) => GpuCustom::from(f).into(),
         }
     }
@@ -1064,6 +1114,15 @@ impl FilterContext {
                 builder.emit_to_scratch(pass_kind::OFFSET);
                 builder.emit_blur_sequence(n_decimations, false);
                 builder.emit_composite_to_dest(pass_kind::COMPOSITE_DROP_SHADOW);
+            }
+            filter_type::INNER_SHADOW => {
+                // Same offset+blur pipeline as the drop shadow; only the composite differs (the
+                // shadow is drawn inside the shape rather than behind it).
+                let n_decimations = gpu_filter.n_decimations();
+
+                builder.emit_to_scratch(pass_kind::OFFSET);
+                builder.emit_blur_sequence(n_decimations, false);
+                builder.emit_composite_to_dest(pass_kind::COMPOSITE_INNER_SHADOW);
             }
             // The above are the only supported multi-pass filters for now.
             _ => unimplemented!(),

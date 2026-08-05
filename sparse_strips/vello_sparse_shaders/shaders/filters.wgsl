@@ -32,6 +32,7 @@ const PASS_BLUR_V: u32 = 5u;
 const PASS_UPSCALE: u32 = 6u;
 const PASS_COMPOSITE_DROP_SHADOW: u32 = 7u;
 const PASS_CUSTOM: u32 = 8u;
+const PASS_COMPOSITE_INNER_SHADOW: u32 = 9u;
 
 const MAX_TAPS_PER_SIDE: u32 = 3u;
 
@@ -422,6 +423,19 @@ fn fs_main(
 
             // Simple source-over compositing.
             return original + shadow_result * (1.0 - original.a);
+        }
+        case PASS_COMPOSITE_INNER_SHADOW: {
+            let filter_texel2 = load_filter_texel(filter_offset, 2u);
+            // Inner shadow: the shadow appears INSIDE the shape, where the shape is opaque but the
+            // offset-blurred copy of its alpha has pulled away. `shadow_color` is premultiplied.
+            let blurred = sample_input(src_offset, rel_coord);
+            let shadow_color = unpack4x8unorm(get_drop_shadow_color(filter_texel2));
+            let original = sample_original(original_offset, rel_coord);
+            // Coverage of the inner shadow: inside the shape (original.a) AND outside the
+            // offset-blurred shape (1 - blurred.a).
+            let inner = shadow_color * (original.a * (1.0 - blurred.a));
+            // Draw the shadow over the shape (source-over), staying within the shape's alpha.
+            return original * (1.0 - inner.a) + inner;
         }
         case PASS_CUSTOM: {
             let color = sample_input(src_offset, rel_coord);
