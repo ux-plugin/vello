@@ -360,6 +360,86 @@ impl Renderer {
         result
     }
 
+    /// Like [`render`](Self::render) but *loads* (does not clear) the target, so a surface can be
+    /// built up by several render calls in z-order. The Penpot scheduler's production sink
+    /// composites many shape bodies into one tile output this way — the first write clears via
+    /// [`render`](Self::render), subsequent writes load via this. (Fork addition.)
+    pub fn render_load(
+        &mut self,
+        scene: &Scene,
+        resources: &mut Resources,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut CommandEncoder,
+        render_size: &RenderSize,
+        view: &TextureView,
+        texture_bindings: &TextureBindings,
+    ) -> Result<(), RenderError> {
+        #[cfg(feature = "text")]
+        {
+            resources.before_render(
+                self,
+                |renderer, glyph_renderer, atlas_count, atlas_config, atlas_id| {
+                    renderer
+                        .render_to_atlas(
+                            glyph_renderer,
+                            atlas_count,
+                            atlas_config,
+                            device,
+                            queue,
+                            atlas_id,
+                            texture_bindings,
+                        )
+                        .expect("Failed to render glyphs to atlas");
+                },
+                |renderer, image_cache, upload, dst_x, dst_y| {
+                    renderer.write_to_atlas(
+                        image_cache,
+                        device,
+                        queue,
+                        encoder,
+                        upload.image_id,
+                        &upload.pixmap,
+                        Some([dst_x, dst_y]),
+                    );
+                },
+            );
+        }
+
+        let mut encoded_paints = scene.encoded_paints.borrow_mut();
+        let scene_paint_count = encoded_paints.len();
+
+        self.prepare_filter_textures(
+            scene,
+            device,
+            encoder,
+            &mut resources.image_cache,
+            &mut encoded_paints,
+        )?;
+
+        // The only difference from `render`: `false` here loads the target instead of clearing it.
+        let result = self.render_scene(
+            scene,
+            device,
+            queue,
+            encoder,
+            render_size,
+            view,
+            &resources.image_cache,
+            &encoded_paints,
+            false,
+            RootRenderTarget::UserSurface,
+            texture_bindings,
+        );
+
+        encoded_paints.truncate(scene_paint_count);
+        #[cfg(feature = "text")]
+        resources.after_render(self, |renderer, rect| {
+            clear_atlas_region(queue, renderer, rect);
+        });
+        result
+    }
+
     /// Render a `scene` directly into an atlas layer.
     ///
     /// This renders the scene's content into the specified atlas layer, which can then
