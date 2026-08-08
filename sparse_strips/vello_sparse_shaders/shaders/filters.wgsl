@@ -22,6 +22,7 @@ const FILTER_TYPE_FLOOD: u32 = 1u;
 const FILTER_TYPE_GAUSSIAN_BLUR: u32 = 2u;
 const FILTER_TYPE_DROP_SHADOW: u32 = 3u;
 const FILTER_TYPE_CUSTOM: u32 = 4u;
+const FILTER_TYPE_INNER_SHADOW: u32 = 5u;
 
 const PASS_COPY: u32 = 0u;
 const PASS_FLOOD: u32 = 1u;
@@ -371,7 +372,13 @@ fn fs_main(
             let filter_texel0 = load_filter_texel(filter_offset, 0u);
             var dxdy: vec2<f32>;
 
-            if get_filter_type(filter_texel0) == FILTER_TYPE_DROP_SHADOW {
+            let offset_filter_type = get_filter_type(filter_texel0);
+            if offset_filter_type == FILTER_TYPE_DROP_SHADOW || offset_filter_type == FILTER_TYPE_INNER_SHADOW {
+                // Drop and inner shadow share the `GpuDropShadow`/`GpuInnerShadow` layout: the offset
+                // lives in texel2, NOT the generic offset fields of texel0 (which for a shadow hold the
+                // blur's center weight and first linear weight). The old check matched only the drop
+                // shadow, so the inner shadow fell to the else branch and applied a ~0 offset — leaving
+                // only the blur fringe visible (band width tracked sigma instead of the offset).
                 let filter_texel2 = load_filter_texel(filter_offset, 2u);
                 dxdy = vec2<f32>(get_drop_shadow_dx(filter_texel2), get_drop_shadow_dy(filter_texel2));
             } else {
