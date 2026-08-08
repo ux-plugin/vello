@@ -908,6 +908,35 @@ impl<'a, B> GlyphRunBuilder<'a, B> {
 }
 
 impl<'a> GlyphRun<'a> {
+    /// The run's font.
+    pub fn font(&self) -> &FontData {
+        &self.font
+    }
+    /// Font size in pixels per em.
+    pub fn font_size(&self) -> f32 {
+        self.font_size
+    }
+    /// The global run transform.
+    pub fn transform(&self) -> Affine {
+        self.transform
+    }
+    /// The per-glyph transform (e.g. a synthetic-italic skew), if any.
+    pub fn glyph_transform(&self) -> Option<Affine> {
+        self.glyph_transform
+    }
+    /// The paint transform for the glyph run in scene space.
+    pub fn scene_paint_transform(&self) -> Affine {
+        self.scene_paint_transform
+    }
+    /// Normalized variation coordinates for a variable-font instance.
+    pub fn normalized_coords(&self) -> &'a [skrifa::instance::NormalizedCoord] {
+        self.normalized_coords
+    }
+    /// Whether font hinting is enabled.
+    pub fn hint(&self) -> bool {
+        self.hint
+    }
+
     // Note: Not sure if we should just remove that method and let each backend
     // call `prepare_glyph_run` manually, it might allow us to reduce the number of
     // generics we need to use. But for now, it seems nice to be able to abstract away
