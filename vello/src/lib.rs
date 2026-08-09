@@ -514,6 +514,58 @@ impl Renderer {
         Ok(())
     }
 
+    /// Return resources retired by [`Self::render_to_texture_into`] to the pool.
+    ///
+    /// **Call only after submitting** the encoder those recordings went into. Until then their
+    /// buffers are still referenced by unsubmitted commands, and recycling one would let a later
+    /// recording overwrite live data.
+    pub fn release_pending(&mut self) {
+        self.engine.release_pending();
+    }
+
+    /// [`Self::render_to_texture`], recording into a **caller-owned** encoder instead of submitting.
+    ///
+    /// A caller that renders many scenes per frame — one per tile, per effect surface — otherwise pays
+    /// a `queue.submit` per scene, and each submission is a driver round-trip and a GPU sync point.
+    /// Recording them all into one encoder and submitting once collapses that to a single submission;
+    /// the caller is then responsible for `queue.submit`ing the encoder.
+    ///
+    /// Commands recorded into one encoder still execute in order, and a read-after-write between them
+    /// is ordered, so a later scene observing an earlier one is unaffected.
+    pub fn render_to_texture_into(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        texture: &TextureView,
+        params: &RenderParams,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        let (recording, target) = render::render_full(
+            scene,
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+        );
+        let external_resources = [ExternalResource::Image(
+            *target.as_image().unwrap(),
+            texture,
+        )];
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "render_to_texture_into",
+        )?;
+        Ok(())
+    }
+
     /// Overwrite `image` with `texture`.
     ///
     /// Most users should prefer [`register_texture`](Self::register_texture), which

@@ -41,6 +41,11 @@ pub(crate) struct WgpuEngine {
     /// The `Texture` should have the same size as the `Image`.
     pub(crate) image_overrides: HashMap<u64, wgpu::TexelCopyTextureInfoBase<Texture>>,
     pipeline_cache: Option<PipelineCache>,
+    /// Resources retired by a [`WgpuEngine::run_recording_into`] whose commands the caller has not
+    /// submitted yet. Returned to the pool at the start of the next recording — see that method for
+    /// why recycling them immediately would be unsound.
+    pending_free_bufs: HashSet<ResourceId>,
+    pending_free_images: HashSet<ResourceId>,
 }
 
 enum PipelineState {
@@ -377,6 +382,44 @@ impl WgpuEngine {
         ShaderId(id)
     }
 
+    /// Record `recording` into a **caller-owned** encoder, without submitting.
+    ///
+    /// Same work as [`Self::run_recording`], minus the encoder creation and the `queue.submit` — so a
+    /// caller that runs several recordings per frame can put them all in one encoder and submit once,
+    /// rather than paying a driver round-trip and a GPU sync point per recording (the `TODO` on
+    /// `run_recording`'s submit is exactly this).
+    ///
+    /// The freed buffers/images are **deferred** rather than returned to the pool here. That ordering
+    /// is load-bearing: `run_recording` recycles only *after* its submit, so the commands referencing
+    /// a buffer are already queued when it becomes reusable. With the submit moved out to the caller,
+    /// recycling now would hand a buffer back while unsubmitted commands still reference it. They are
+    /// released at the start of the next recording instead, by which point the caller has submitted.
+    pub fn run_recording_into(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        recording: &Recording,
+        external_resources: &[ExternalResource<'_>],
+        encoder: &mut CommandEncoder,
+        #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
+        #[cfg(feature = "wgpu-profiler")] label: &'static str,
+    ) -> Result<()> {
+        let (free_bufs, free_images) = self.record(
+            device,
+            queue,
+            recording,
+            external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            label,
+        )?;
+        self.pending_free_bufs.extend(free_bufs);
+        self.pending_free_images.extend(free_images);
+        Ok(())
+    }
+
     pub fn run_recording(
         &mut self,
         device: &Device,
@@ -386,14 +429,73 @@ impl WgpuEngine {
         label: &'static str,
         #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
     ) -> Result<()> {
+        let mut encoder =
+            device.create_command_encoder(&CommandEncoderDescriptor { label: Some(label) });
+        let (free_bufs, free_images) = self.record(
+            device,
+            queue,
+            recording,
+            external_resources,
+            &mut encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            label,
+        )?;
+        queue.submit(Some(encoder.finish()));
+        self.release(free_bufs, free_images);
+        self.release_pending();
+        Ok(())
+    }
+
+    /// Return deferred resources to the pool.
+    ///
+    /// **Only safe once the caller has submitted** the encoder those resources were recorded into.
+    /// Draining earlier — e.g. at the start of the next recording — hands a buffer back while commands
+    /// referencing it are still unsubmitted, so the next recording reuses it and overwrites live data.
+    pub fn release_pending(&mut self) {
+        let bufs = std::mem::take(&mut self.pending_free_bufs);
+        let images = std::mem::take(&mut self.pending_free_images);
+        self.release(bufs, images);
+    }
+
+    fn release(&mut self, free_bufs: HashSet<ResourceId>, free_images: HashSet<ResourceId>) {
+        for id in free_bufs {
+            if let Some(buf) = self.bind_map.buf_map.remove(&id)
+                && let MaterializedBuffer::Gpu(gpu_buf) = buf.buffer
+            {
+                let props = BufferProperties {
+                    size: gpu_buf.size(),
+                    usages: gpu_buf.usage(),
+                    name: buf.label,
+                };
+                self.pool.bufs.entry(props).or_default().push(gpu_buf);
+            }
+        }
+        for id in free_images {
+            if let Some((_texture, _view)) = self.bind_map.image_map.remove(&id) {
+                // TODO: have a pool to avoid needless re-allocation
+            }
+        }
+    }
+
+    /// Record every command of `recording` into `encoder`, returning the resources it retired.
+    #[expect(clippy::too_many_arguments, reason = "profiler args are cfg-gated")]
+    fn record(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        recording: &Recording,
+        external_resources: &[ExternalResource<'_>],
+        encoder: &mut CommandEncoder,
+        #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
+        #[cfg(feature = "wgpu-profiler")] label: &'static str,
+    ) -> Result<(HashSet<ResourceId>, HashSet<ResourceId>)> {
         let mut free_bufs: HashSet<ResourceId> = HashSet::default();
         let mut free_images: HashSet<ResourceId> = HashSet::default();
         let mut transient_map = TransientBindMap::new(external_resources);
-
-        let mut encoder =
-            device.create_command_encoder(&CommandEncoderDescriptor { label: Some(label) });
         #[cfg(feature = "wgpu-profiler")]
-        let query = profiler.begin_query(label, &mut encoder);
+        let query = profiler.begin_query(label, encoder);
         for command in &recording.commands {
             match command {
                 Command::Upload(buf_proxy, bytes) => {
@@ -561,7 +663,7 @@ impl WgpuEngine {
                                 &mut self.pool,
                                 device,
                                 queue,
-                                &mut encoder,
+                                encoder,
                                 &wgpu_shader.bind_group_layout,
                                 bindings,
                             );
@@ -612,7 +714,7 @@ impl WgpuEngine {
                                 &mut self.pool,
                                 device,
                                 queue,
-                                &mut encoder,
+                                encoder,
                                 &wgpu_shader.bind_group_layout,
                                 bindings,
                             );
@@ -663,7 +765,7 @@ impl WgpuEngine {
                         &mut self.pool,
                         device,
                         queue,
-                        &mut encoder,
+                        encoder,
                         &shader.bind_group_layout,
                         &draw_params.resources,
                     );
@@ -750,29 +852,10 @@ impl WgpuEngine {
             }
         }
         #[cfg(feature = "wgpu-profiler")]
-        profiler.end_query(&mut encoder, query);
-        // TODO: This only actually needs to happen once per frame, but run_recording happens two or three times
+        profiler.end_query(encoder, query);
         #[cfg(feature = "wgpu-profiler")]
-        profiler.resolve_queries(&mut encoder);
-        queue.submit(Some(encoder.finish()));
-        for id in free_bufs {
-            if let Some(buf) = self.bind_map.buf_map.remove(&id)
-                && let MaterializedBuffer::Gpu(gpu_buf) = buf.buffer
-            {
-                let props = BufferProperties {
-                    size: gpu_buf.size(),
-                    usages: gpu_buf.usage(),
-                    name: buf.label,
-                };
-                self.pool.bufs.entry(props).or_default().push(gpu_buf);
-            }
-        }
-        for id in free_images {
-            if let Some((_texture, _view)) = self.bind_map.image_map.remove(&id) {
-                // TODO: have a pool to avoid needless re-allocation
-            }
-        }
-        Ok(())
+        profiler.resolve_queries(encoder);
+        Ok((free_bufs, free_images))
     }
 
     pub fn get_download(&self, buf: BufferProxy) -> Option<&Buffer> {
