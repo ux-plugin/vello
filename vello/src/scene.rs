@@ -308,6 +308,24 @@ impl Scene {
         }
     }
 
+    /// Emit a backdrop-effect boundary over `shape`. The frontend records `effect_id` + `params` +
+    /// `shape`'s coverage into the z-ordered stream; the effect itself runs as a post-fine dispatch over
+    /// the materialized backdrop, so this works for built-in and custom effects alike.
+    pub fn draw_effect(
+        &mut self,
+        transform: Affine,
+        shape: &impl Shape,
+        effect_id: u32,
+        params: [f32; 4],
+    ) {
+        let t = Transform::from_kurbo(&transform);
+        self.encoding.encode_transform(t);
+        self.encoding.encode_fill_style(Fill::NonZero);
+        if self.encoding.encode_shape(shape, true) {
+            self.encoding.encode_effect(effect_id, params);
+        }
+    }
+
     /// Fills a shape using the specified style and brush.
     #[expect(
         single_use_lifetimes,

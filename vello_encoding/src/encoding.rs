@@ -4,7 +4,7 @@
 use crate::DrawBeginClip;
 
 use super::{
-    DrawBlurRoundedRect, DrawColor, DrawImage, DrawLinearGradient, DrawRadialGradient,
+    DrawBlurRoundedRect, DrawColor, DrawEffect, DrawImage, DrawLinearGradient, DrawRadialGradient,
     DrawSweepGradient, DrawTag, Glyph, GlyphRun, NormalizedCoord, Patch, PathEncoder, PathTag,
     Style, Transform,
 };
@@ -480,6 +480,18 @@ impl Encoding {
                     std_dev,
                 },
             )));
+    }
+
+    /// Encodes a backdrop-effect boundary marker into the z-ordered draw stream. The associated shape's
+    /// coverage masks the effect; the post-fine dispatch reads `effect_id` + `params` to run it over the
+    /// materialized backdrop.
+    pub fn encode_effect(&mut self, effect_id: u32, params: [f32; 4]) {
+        self.draw_tags.push(DrawTag::EFFECT);
+        self.draw_data
+            .extend_from_slice(bytemuck::cast_slice(bytemuck::bytes_of(&DrawEffect {
+                effect_id,
+                params,
+            })));
     }
 
     /// Encodes a begin clip command.

@@ -37,6 +37,9 @@ pub struct FullShaders {
     pub path_tiling_setup: ShaderId,
     pub path_tiling: ShaderId,
     pub fine_area: Option<ShaderId>,
+    /// `fine_area` with `load_base`: composites over a `base_in` texture (the previous phase's output)
+    /// instead of clearing — the whole-viewport gather phasing.
+    pub fine_area_load: Option<ShaderId>,
     pub fine_msaa8: Option<ShaderId>,
     pub fine_msaa16: Option<ShaderId>,
     // 2-level dispatch works for CPU pathtag scan even for large
@@ -216,12 +219,34 @@ pub(crate) fn full_shaders(
         // Mask LUT buffer, used only when MSAA is enabled.
         BufReadOnly,
     ];
+    // `fine_area_load`: the area bindings (no mask LUT) plus `base_in` at binding 8 — the previous
+    // phase's output that this fine phase composites over (whole-viewport gather phasing).
+    let fine_resources_load = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+    ];
 
     let aa_support = &options.antialiasing_support;
     let fine_area = if aa_support.area {
         Some(add_shader!(
             fine_area,
             fine_resources[..fine_resources.len() - 1],
+            CpuShaderType::Missing
+        ))
+    } else {
+        None
+    };
+    let fine_area_load = if aa_support.area {
+        Some(add_shader!(
+            fine_area_load,
+            fine_resources_load,
             CpuShaderType::Missing
         ))
     } else {
@@ -267,6 +292,7 @@ pub(crate) fn full_shaders(
         path_tiling_setup,
         path_tiling,
         fine_area,
+        fine_area_load,
         fine_msaa8,
         fine_msaa16,
         pathtag_is_cpu: options.use_cpu,

@@ -110,6 +110,16 @@ fn main(
             x1 = i32(ceil(bbox.z * SX));
             y1 = i32(ceil(bbox.w * SY));
         }
+        // Whole-viewport phased render: a draw outside this phase's [draw_start, draw_end) range is
+        // kept out of every bin (empty coverage) so it emits no PTCL commands this phase, while its
+        // `intersected_bbox` above is still written correctly for tile_alloc. Defaults span the whole
+        // range, so an ordinary render bins every draw.
+        if element_ix < config.draw_start || element_ix >= config.draw_end {
+            x0 = 0;
+            y0 = 0;
+            x1 = 0;
+            y1 = 0;
+        }
     }
     let width_in_bins = i32((config.width_in_tiles + N_TILE_X - 1u) / N_TILE_X);
     let height_in_bins = i32((config.height_in_tiles + N_TILE_Y - 1u) / N_TILE_Y);

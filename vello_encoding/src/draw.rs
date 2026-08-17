@@ -36,6 +36,11 @@ impl DrawTag {
     /// Blurred rounded rectangle.
     pub const BLUR_RECT: Self = Self(0x2d4); // info: 11, scene: 5 (DrawBlurRoundedRect)
 
+    /// Backdrop effect (gather) boundary marker. The frontend emits this into the z-ordered command
+    /// stream; the effect itself runs as a post-fine dispatch over the materialized backdrop (so it
+    /// works for custom shaders too). info: 1 (flags), scene: 5 (DrawEffect: effect_id + 4 params).
+    pub const EFFECT: Self = Self(0x454);
+
     /// Begin layer/clip.
     pub const BEGIN_CLIP: Self = Self(0x49);
 
@@ -183,6 +188,17 @@ pub struct DrawBlurRoundedRect {
     pub radius: f32,
     /// Standard deviation of gaussian filter.
     pub std_dev: f32,
+}
+
+/// Draw data for a backdrop effect (gather) boundary. `effect_id` selects which effect the post-fine
+/// dispatch runs; `params` are 4 inline parameters (effects needing more will index a params buffer).
+#[derive(Clone, Copy, Debug, Default, Zeroable, Pod)]
+#[repr(C)]
+pub struct DrawEffect {
+    /// Which effect to dispatch (interpreted by the scheduler / effect registry).
+    pub effect_id: u32,
+    /// Inline parameters (effect-specific), carried scene → ptcl so the scheduler reads them.
+    pub params: [f32; 4],
 }
 
 /// Draw data for a clip or layer.

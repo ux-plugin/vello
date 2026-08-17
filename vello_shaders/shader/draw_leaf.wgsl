@@ -110,7 +110,8 @@ fn main(
         let di = m.info_offset;
         if tag_word == DRAWTAG_FILL_COLOR || tag_word == DRAWTAG_FILL_LIN_GRADIENT ||
             tag_word == DRAWTAG_FILL_RAD_GRADIENT || tag_word == DRAWTAG_FILL_SWEEP_GRADIENT ||
-            tag_word == DRAWTAG_FILL_IMAGE || tag_word == DRAWTAG_BEGIN_CLIP || tag_word == DRAWTAG_BLURRED_ROUNDED_RECT
+            tag_word == DRAWTAG_FILL_IMAGE || tag_word == DRAWTAG_BEGIN_CLIP || tag_word == DRAWTAG_BLURRED_ROUNDED_RECT ||
+            tag_word == DRAWTAG_EFFECT
         {
             let bbox = path_bbox[m.path_ix];
             // TODO: bbox is mostly yagni here, sort that out. Maybe clips?
@@ -129,6 +130,11 @@ fn main(
             }
             switch tag_word {
                 case DRAWTAG_FILL_COLOR: {
+                    info[di] = draw_flags;
+                }
+                case DRAWTAG_EFFECT: {
+                    // Sharp gather masked by the shape's own coverage — only the fill-rule flags are
+                    // needed; the effect reads no geometry from info (the accumulator is its input).
                     info[di] = draw_flags;
                 }
                 case DRAWTAG_BEGIN_CLIP: {

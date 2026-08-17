@@ -49,6 +49,14 @@ var gradients: texture_2d<f32>;
 @group(0) @binding(7)
 var image_atlas: texture_2d<f32>;
 
+// Whole-viewport gather phasing: phase > 0 composites over the previous phase's output, loaded here
+// as its base instead of `config.base_color`. (A separate input texture — not the write target — so
+// there is no read/write hazard; the caller ping-pongs the two across phases.)
+#ifdef load_base
+@group(0) @binding(8)
+var base_in: texture_2d<f32>;
+#endif
+
 // MSAA-only bindings and utilities
 #ifdef msaa
 
@@ -1076,22 +1084,62 @@ fn main(
     let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
+#ifdef load_base
+    // Phase > 0: start from the previous phase's output (its un-premultiplied pixels), re-premultiplied
+    // so the source-over accumulation below is unchanged. This is what lets a later fine phase draw
+    // *over* the earlier one within one render, instead of clearing.
+    let base_xy = vec2<i32>(i32(global_id.x * PIXELS_PER_THREAD), i32(global_id.y));
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        // Load the previous phase's output (stored premultiplied, see the store below) straight into
+        // the premultiplied accumulator — no conversion, since the base is already in the same space
+        // the source-over blend works in.
+        let b = textureLoad(base_in, base_xy + vec2(i32(i), 0), 0);
+        rgba[i] = b;
+    }
+#else
     let base_color = unpack4x8unorm(config.base_color);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = base_color;
     }
+#endif
     var blend_stack: array<array<u32, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;
     var clip_depth = 0u;
     var area: array<f32, PIXELS_PER_THREAD>;
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
     cmd_ix += 1u;
+    // Running segment index for whole-viewport segmented fine. Segments are the command ranges
+    // between CMD_EFFECT markers; this advances at each marker. With SEG_ALL it is unused.
+    var seg_current = 0u;
     // main interpretation loop
     while true {
         let tag = ptcl[cmd_ix];
         if tag == CMD_END {
             break;
         }
+        // Segment boundary. Handled here (like CMD_END), NOT in the switch: a `break` inside a WGSL
+        // `switch` case exits only the switch, not this loop, which would spin on the same marker. The
+        // effect itself runs as a post-fine dispatch over the materialized backdrop (custom shaders
+        // included), never inline here.
+        //   - Segmented dispatch (seg_target != SEG_ALL): fine renders exactly one segment, so once we
+        //     reach the boundary that ends our target segment we stop — later segments are painted by
+        //     their own dispatches.
+        //   - SEG_ALL (default): advance the running index and step over the 6-word marker, walking
+        //     every segment in one pass — byte-for-byte the non-segmented render.
+        // cmd_ix must move by exactly 6 so the PTCL walk stays synced with what coarse wrote; landing
+        // mid-command would read a param as the next tag and desync the whole tile.
+        if tag == CMD_EFFECT {
+            if config.seg_target != SEG_ALL && seg_current == config.seg_target {
+                break;
+            }
+            seg_current += 1u;
+            cmd_ix += 6u;
+            continue;
+        }
+        // Segmented fine paints a command only when it belongs to the segment this dispatch targets;
+        // cmd_ix still advances for every command so the PTCL walk stays synced. With SEG_ALL (the
+        // default) `seg_active` is always true, so the walk is byte-for-byte the non-segmented render.
+        let seg_active = config.seg_target == SEG_ALL || seg_current == config.seg_target;
         switch tag {
             case CMD_FILL: {
                 let fill = read_fill(cmd_ix);
@@ -1109,15 +1157,18 @@ fn main(
                 cmd_ix += 1u;
             }
             case CMD_COLOR: {
-                let color = read_color(cmd_ix);
-                let fg = unpack4x8unorm(color.rgba_color);
-                for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                    let fg_i = fg * area[i];
-                    rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
+                if seg_active {
+                    let color = read_color(cmd_ix);
+                    let fg = unpack4x8unorm(color.rgba_color);
+                    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                        let fg_i = fg * area[i];
+                        rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
+                    }
                 }
                 cmd_ix += 2u;
             }
             case CMD_BEGIN_CLIP: {
+                if seg_active {
                 if clip_depth < BLEND_STACK_SPLIT {
                     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                         blend_stack[clip_depth][i] = pack4x8unorm(rgba[i]);
@@ -1133,9 +1184,11 @@ fn main(
                     }
                 }
                 clip_depth += 1u;
+                }
                 cmd_ix += 1u;
             }
             case CMD_END_CLIP: {
+                if seg_active {
                 let end_clip = read_end_clip(cmd_ix);
                 clip_depth -= 1u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
@@ -1165,12 +1218,14 @@ fn main(
                         rgba[i] = blend_mix_compose(bg, fg, end_clip.blend);
                     }
                 }
+                }
                 cmd_ix += 3u;
             }
             case CMD_JUMP: {
                 cmd_ix = ptcl[cmd_ix + 1u];
             }
             case CMD_BLUR_RECT: {
+                if seg_active {
                 /// Approximation for the convolution of a gaussian filter with a rounded rectangle.
                 ///
                 /// See https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
@@ -1220,9 +1275,11 @@ fn main(
                     let fg_i = fg_rgba * area[i];
                     rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                 }
+                }
                 cmd_ix += 3u;
             }
             case CMD_LIN_GRAD: {
+                if seg_active {
                 let lin = read_lin_grad(cmd_ix);
                 let d = lin.line_x * xy.x + lin.line_y * xy.y + lin.line_c;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
@@ -1232,9 +1289,11 @@ fn main(
                     let fg_i = fg_rgba * area[i];
                     rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                 }
+                }
                 cmd_ix += 3u;
             }
             case CMD_RAD_GRAD: {
+                if seg_active {
                 let rad = read_rad_grad(cmd_ix);
                 let focal_x = rad.focal_x;
                 let radius = rad.radius;
@@ -1277,9 +1336,11 @@ fn main(
                         rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                     }
                 }
+                }
                 cmd_ix += 3u;
             }
             case CMD_SWEEP_GRAD: {
+                if seg_active {
                 let sweep = read_sweep_grad(cmd_ix);
                 let scale = 1.0 / (sweep.t1 - sweep.t0);
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
@@ -1310,9 +1371,11 @@ fn main(
                     let fg_i = fg_rgba * area[i];
                     rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
                 }
+                }
                 cmd_ix += 3u;
             }
             case CMD_IMAGE: {
+                if seg_active {
                 let image = read_image(cmd_ix);
                 let atlas_max = image.atlas_offset + image.extents - vec2(1.0);
                 switch image.quality {
@@ -1378,6 +1441,7 @@ fn main(
                         }
                     }
                 }
+                }
                 cmd_ix += 2u;
             }
             default: {}
@@ -1388,11 +1452,16 @@ fn main(
         let coords = xy_uint + vec2(i, 0u);
         if coords.x < config.target_width && coords.y < config.target_height {
             let fg = rgba[i];
-            // let fg = base_color * (1.0 - foreground.a) + foreground;
-            // Max with a small epsilon to avoid NaNs
-            let a_inv = 1.0 / max(fg.a, 1e-6);
-            let rgba_sep = vec4(fg.rgb * a_inv, fg.a);
-            textureStore(output, vec2<i32>(coords), rgba_sep);
+            // Store the accumulator PREMULTIPLIED (as it is blended). Everything that consumes a fine
+            // output — the compositor blit/present and every effect pass (`premul_srgb_to_lin`, glass,
+            // blur) and the phased base reload — treats the texel as premultiplied and either uses it
+            // directly in a `One / OneMinusSrcAlpha` blend or unpremultiplies it itself. The previous
+            // store un-premultiplied here (`fg.rgb / fg.a, fg.a`), which disagreed with all of them: a
+            // low-coverage edge pixel became `(colour, a≈0)`, drawn too bright by present and dropped to
+            // black by the phased reload's `rgb*a` — the ~1px per-shape phased seam. Storing
+            // premultiplied removes the mismatch (edges get correct area-AA) and makes a phased render
+            // pixel-identical to the single render.
+            textureStore(output, vec2<i32>(coords), fg);
         }
     } 
 }

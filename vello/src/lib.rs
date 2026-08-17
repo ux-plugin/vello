@@ -128,6 +128,9 @@ pub mod low_level {
         ResourceProxy, ShaderId,
     };
     pub use crate::render::Render;
+    /// A persistent phased render, driven one phase at a time so the caller can interleave its own
+    /// GPU work (a gather effect) between phases while sharing one setup. See [`Renderer::phased_begin_into`][crate::Renderer::phased_begin_into].
+    pub use crate::render::PhasedSession;
     pub use crate::shaders::FullShaders;
     /// Temporary export, used in `with_winit` for stats
     pub use vello_encoding::BumpAllocators;
@@ -562,6 +565,215 @@ impl Renderer {
             &mut self.profiler,
             #[cfg(feature = "wgpu-profiler")]
             "render_to_texture_into",
+        )?;
+        Ok(())
+    }
+
+    /// Whole-viewport **phased** render into a caller-owned encoder: the whole scene's front-end runs
+    /// once, then one coarse+fine phase per `(draw_start, draw_end)` range in `phases`, all sharing the
+    /// one setup and landing in one recording. Phase 0 clears to `params.base_color`; each later phase
+    /// composites over the previous phase's output. The final phase writes `texture`.
+    ///
+    /// This is the single-`render_full` collapse of a gather frame: instead of one full pipeline setup
+    /// per gather z-phase, the geometry is set up once and each phase is a restricted coarse+fine pass.
+    /// The caller submits the encoder (as with [`Self::render_to_texture_into`]).
+    ///
+    /// `targets` supplies one texture per phase (same order as `phases`). Every phase output must be a
+    /// caller-owned texture — vello only allocates internal images as sampled textures, but a phase's
+    /// output is a fine storage-write target AND the next phase's `base_in` sampled input, so each needs
+    /// `STORAGE_BINDING | TEXTURE_BINDING`. The frame result is `targets[phases.len() - 1]`.
+    pub fn render_phased_into(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        targets: &[&TextureView],
+        params: &RenderParams,
+        phases: &[(u32, u32)],
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        assert_eq!(targets.len(), phases.len(), "render_phased_into needs one target per phase");
+        let (recording, out_images) = render::render_encoding_phased(
+            scene.encoding(),
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+            phases,
+        );
+        let external_resources: Vec<ExternalResource<'_>> = out_images
+            .iter()
+            .zip(targets.iter())
+            .map(|(img, view)| ExternalResource::Image(*img, view))
+            .collect();
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "render_phased_into",
+        )?;
+        Ok(())
+    }
+
+    /// Begin a **persistent** phased render (see [`PhasedSession`]). Resolves the scene, allocates
+    /// every shared buffer, and records the draw-range-independent geometry front-end into `encoder`.
+    /// Follow with one [`Self::phased_phase_into`] per phase — the caller may record its own GPU work
+    /// (a gather's blur) into the same encoder between phases — then [`Self::phased_finish_into`].
+    ///
+    /// Unlike [`Self::render_phased_into`], which records every phase up front (so nothing can run
+    /// between them), this drives the phases one at a time, sharing the one setup via vello's engine
+    /// keeping the buffer proxies live across the calls. Area AA only. The caller submits `encoder`.
+    pub fn phased_begin_into(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        scene: &Scene,
+        params: &RenderParams,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<render::PhasedSession> {
+        let (session, recording) = render::begin_phased(
+            scene.encoding(),
+            &mut self.resolver,
+            &self.shaders,
+            &mut self.image_atlas,
+            params,
+        );
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &[],
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_begin_into",
+        )?;
+        Ok(session)
+    }
+
+    /// Record and run ONE phase (draw range `[draw_start, draw_end)`) into `encoder`. `base` — the
+    /// previous phase's output, possibly after the caller's own effect passes — is loaded and
+    /// composited over; `None` clears to the base color (phase 0). The phase writes `out`. Both `base`
+    /// and `out` are caller-owned textures needing `STORAGE_BINDING | TEXTURE_BINDING`.
+    pub fn phased_phase_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        draw_start: u32,
+        draw_end: u32,
+        base: Option<&TextureView>,
+        out: &TextureView,
+    ) -> Result<()> {
+        let out_image = session.new_out_image();
+        let base_image = base.map(|_| session.new_out_image());
+        let recording = render::record_phase(session, &self.shaders, draw_start, draw_end, base_image, out_image);
+        let mut external_resources = vec![ExternalResource::Image(out_image, out)];
+        if let (Some(img), Some(view)) = (base_image, base) {
+            external_resources.push(ExternalResource::Image(img, view));
+        }
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_phase_into",
+        )?;
+        Ok(())
+    }
+
+    /// Record the whole scene's front-end + tiling + coarse ONCE (front-end-once), building the shared
+    /// PTCL that [`Self::phased_fine_segment_into`] then walks per segment. Call once, after
+    /// [`Self::phased_begin_into`] and before the first segment. Records into `encoder` (no submit).
+    pub fn phased_frontend_full_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        let recording = render::record_frontend_full(session, &self.shaders);
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &[],
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_frontend_full_into",
+        )?;
+        Ok(())
+    }
+
+    /// Dispatch `fine` for ONE segment (`seg_target`) of the shared PTCL into `encoder`, writing `out`.
+    /// `base` (`Some`) is the previous segment's output — after the caller's effect passes — loaded and
+    /// composited over; `None` clears to the base color (segment 0). Both `base` and `out` are
+    /// caller-owned `STORAGE_BINDING | TEXTURE_BINDING` textures. Valid between a
+    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`] pair, after [`Self::phased_frontend_full_into`].
+    pub fn phased_fine_segment_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        seg_target: u32,
+        base: Option<&TextureView>,
+        out: &TextureView,
+    ) -> Result<()> {
+        let out_image = session.new_out_image();
+        let base_image = base.map(|_| session.new_out_image());
+        let recording = render::record_fine_segment(session, &self.shaders, seg_target, base_image, out_image);
+        let mut external_resources = vec![ExternalResource::Image(out_image, out)];
+        if let (Some(img), Some(view)) = (base_image, base) {
+            external_resources.push(ExternalResource::Image(img, view));
+        }
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_fine_segment_into",
+        )?;
+        Ok(())
+    }
+
+    /// Free the phased render's shared buffers into `encoder` (deferred until after submit). Ends the
+    /// session; the `session` is consumed.
+    pub fn phased_finish_into(
+        &mut self,
+        session: render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+    ) -> Result<()> {
+        let recording = render::record_phased_frees(&session);
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &[],
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_finish_into",
         )?;
         Ok(())
     }

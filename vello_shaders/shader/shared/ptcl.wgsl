@@ -23,6 +23,9 @@ const CMD_BEGIN_CLIP = 10u;
 const CMD_END_CLIP = 11u;
 const CMD_JUMP = 12u;
 const CMD_BLUR_RECT = 13u;
+// Backdrop-effect boundary marker. Layout: [CMD_EFFECT, effect_id, p0, p1, p2, p3] (6 words). Fine
+// steps over it (the effect runs as a post-fine dispatch); the scheduler reads effect_id + params.
+const CMD_EFFECT = 14u;
 
 // The individual PTCL structs are written here, but read/write is by
 // hand in the relevant shaders

@@ -153,6 +153,17 @@ fn write_blurred_rounded_rect(color: CmdColor, info_offset: u32) {
     cmd_offset += 3u;
 }
 
+fn write_effect(effect_id: u32, p0: u32, p1: u32, p2: u32, p3: u32) {
+    alloc_cmd(6u);
+    ptcl[cmd_offset] = CMD_EFFECT;
+    ptcl[cmd_offset + 1u] = effect_id;
+    ptcl[cmd_offset + 2u] = p0;
+    ptcl[cmd_offset + 3u] = p1;
+    ptcl[cmd_offset + 4u] = p2;
+    ptcl[cmd_offset + 5u] = p3;
+    cmd_offset += 6u;
+}
+
 @compute @workgroup_size(256)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
@@ -388,6 +399,17 @@ fn main(
                         let rgba_color = scene[dd];
                         let info_offset = di + 1u;
                         write_blurred_rounded_rect(CmdColor(rgba_color), info_offset);
+                    }
+                    case DRAWTAG_EFFECT: {
+                        // Record the effect boundary in the tile's command stream: ONLY the 6-word marker
+                        // carrying effect_id + params, no coverage. The marker is a z-boundary for
+                        // segmented fine, not a paint, so `write_path` is deliberately skipped — the
+                        // effect's draw is emitted with a full-viewport bbox (see `draw_effect_marker`) so
+                        // it bins into EVERY tile, giving all tiles the same global boundary; the actual
+                        // effect composites separately over its extent. Fine steps over the marker (today)
+                        // or breaks on it (segmented fine); no `CmdFill` precedes it.
+                        let effect_id = scene[dd];
+                        write_effect(effect_id, scene[dd + 1u], scene[dd + 2u], scene[dd + 3u], scene[dd + 4u]);
                     }
                     case DRAWTAG_FILL_LIN_GRADIENT: {
                         write_path(tile, tile_ix, draw_flags);

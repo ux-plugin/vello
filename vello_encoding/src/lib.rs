@@ -50,11 +50,12 @@ pub use binning::BinHeader;
 pub use clip::{Clip, ClipBbox, ClipBic, ClipElement};
 pub use config::{
     BufferSize, BufferSizes, BumpAllocatorMemory, BumpAllocators, ConfigUniform, IndirectCount,
-    RenderConfig, WorkgroupCounts, WorkgroupSize,
+    RenderConfig, SEG_ALL, WorkgroupCounts, WorkgroupSize,
 };
 pub use draw::{
     DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip, DrawBlurRoundedRect, DrawColor,
-    DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient, DrawTag,
+    DrawEffect, DrawImage, DrawLinearGradient, DrawMonoid, DrawRadialGradient, DrawSweepGradient,
+    DrawTag,
 };
 pub use encoding::{Encoding, Resources, StreamOffsets};
 pub use glyph::{FontEmbolden, Glyph, GlyphRun};

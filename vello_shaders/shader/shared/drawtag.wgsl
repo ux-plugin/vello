@@ -23,6 +23,8 @@ const DRAWTAG_FILL_RAD_GRADIENT = 0x29cu;
 const DRAWTAG_FILL_SWEEP_GRADIENT = 0x254u;
 const DRAWTAG_FILL_IMAGE = 0x28Cu;
 const DRAWTAG_BLURRED_ROUNDED_RECT = 0x2d4u;
+// Backdrop effect (gather) boundary marker. info: 1 (flags), scene: 5 (effect_id + 4 inline params).
+const DRAWTAG_EFFECT = 0x454u;
 const DRAWTAG_BEGIN_CLIP = 0x49u;
 const DRAWTAG_END_CLIP = 0x21u;
 

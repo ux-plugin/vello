@@ -12,6 +12,10 @@ use bytemuck::{Pod, Zeroable};
 const TILE_WIDTH: u32 = 16;
 const TILE_HEIGHT: u32 = 16;
 
+/// Sentinel [`ConfigUniform::seg_target`] value meaning "render all segments in one pass" — the
+/// normal, non-segmented render. Matches `SEG_ALL` in `shaders/shared/config.wgsl`.
+pub const SEG_ALL: u32 = 0xffff_ffff;
+
 // TODO: Obtain these from the vello_shaders crate
 pub(crate) const PATH_REDUCE_WG: u32 = 256;
 const PATH_BBOX_WG: u32 = 256;
@@ -151,6 +155,20 @@ pub struct ConfigUniform {
     pub blend_size: u32,
     /// Size of per-tile command list buffer allocation (in `u32`s).
     pub ptcl_size: u32,
+    /// First draw-object index (inclusive) this render phase includes. Draws with index `< draw_start`
+    /// are excluded from binning — and so from every PTCL — this phase. Defaults to `0` (all draws), so
+    /// a single-phase render is unchanged. Set by the whole-viewport phased path to slice one shared
+    /// front-end into several coarse/fine phases sharing one setup.
+    pub draw_start: u32,
+    /// One-past-the-last draw-object index (exclusive) this render phase includes. Defaults to
+    /// `n_draw_objects` (all draws). See [`Self::draw_start`].
+    pub draw_end: u32,
+    /// Whole-viewport segmented fine: the segment index the `fine` dispatch should render, where a
+    /// segment is the command range between `CMD_EFFECT` markers in one shared PTCL. Defaults to
+    /// [`SEG_ALL`] (render every segment in one pass), leaving a normal render unchanged; the phased
+    /// whole-viewport driver overrides it per segment. `_pad_seg` keeps the uniform 16-byte aligned.
+    pub seg_target: u32,
+    pub _pad_seg: [u32; 3],
 }
 
 /// CPU side setup and configuration.
@@ -188,6 +206,14 @@ impl RenderConfig {
                 segments_size: buffer_sizes.segments.len(),
                 blend_size: buffer_sizes.blend_spill.len(),
                 ptcl_size: buffer_sizes.ptcl.len(),
+                // Default: the whole draw range, so a single-phase render is unchanged. The phased
+                // whole-viewport path overrides these per phase after this constructor.
+                draw_start: 0,
+                draw_end: layout.n_draw_objects,
+                // Default: render every segment in one pass (non-segmented). The segmented-fine driver
+                // overrides this per dispatch.
+                seg_target: SEG_ALL,
+                _pad_seg: [0; 3],
                 layout: *layout,
             },
             workgroup_counts,
