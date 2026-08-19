@@ -99,6 +99,9 @@ pub enum BindType {
     Image(ImageFormat),
     /// A storage image with read only access.
     ImageRead(ImageFormat),
+    /// A storage image with read-write access — requires the device to support it for the format
+    /// (`rgba8unorm` needs adapter-specific format features / the browser's `texture-formats-tier2`).
+    ImageReadWrite(ImageFormat),
     // TODO: Uniform, Sampler, maybe others
 }
 

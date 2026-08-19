@@ -40,8 +40,17 @@ var<storage> info: array<u32>;
 @group(0) @binding(4)
 var<storage, read_write> blend_spill: array<u32>;
 
+// The whole-viewport single-accumulator permutation (`rw_accum`) binds the output READ-WRITE and
+// updates it in place: a tile whose window holds no work returns before touching a pixel, so the
+// pass cost scales with the tiles that change, not the viewport. Requires rgba8unorm read-write
+// storage (adapter-specific format features / the browser's `texture-formats-tier2`).
+#ifdef rw_accum
+@group(0) @binding(5)
+var output: texture_storage_2d<rgba8unorm, read_write>;
+#else
 @group(0) @binding(5)
 var output: texture_storage_2d<rgba8unorm, write>;
+#endif
 
 @group(0) @binding(6)
 var gradients: texture_2d<f32>;
@@ -1084,6 +1093,70 @@ fn main(
     let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
+#ifdef rw_accum
+    // Early-out: walk this tile's tags once, and when no command falls inside this dispatch's
+    // window, return without touching a pixel — the accumulator already holds the right bytes.
+    // The walk must mirror the interpreter's tag sizes below EXACTLY; a desync would read a param
+    // as a tag and corrupt the decision (the real walk below is unaffected either way).
+    // Coverage-only commands (`CMD_FILL`, `CMD_SOLID`) don't count as work: without a following
+    // paint command in the window they change nothing.
+    {
+        var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 1u;
+        var scan_seg = 0u;
+        var has_work = false;
+        while true {
+            let t = ptcl[scan_ix];
+            if t == CMD_END {
+                break;
+            }
+            if t == CMD_EFFECT {
+                let round = ptcl[scan_ix + 3u];
+                if config.seg_target != SEG_ALL && round >= config.seg_target {
+                    break;
+                }
+                scan_seg = round;
+                scan_ix += 6u;
+                continue;
+            }
+            if t == CMD_JUMP {
+                scan_ix = ptcl[scan_ix + 1u];
+                continue;
+            }
+            let in_window = scan_seg >= config.seg_lo
+                && (config.seg_target == SEG_ALL || scan_seg < config.seg_target);
+            if in_window && t != CMD_FILL && t != CMD_SOLID {
+                has_work = true;
+                break;
+            }
+            switch t {
+                case CMD_FILL: {
+                    scan_ix += 4u;
+                }
+                case CMD_SOLID, CMD_BEGIN_CLIP: {
+                    scan_ix += 1u;
+                }
+                case CMD_COLOR, CMD_IMAGE: {
+                    scan_ix += 2u;
+                }
+                case CMD_END_CLIP, CMD_BLUR_RECT, CMD_LIN_GRAD, CMD_RAD_GRAD, CMD_SWEEP_GRAD: {
+                    scan_ix += 3u;
+                }
+                default: {
+                    scan_ix += 1u;
+                }
+            }
+        }
+        if !has_work {
+            return;
+        }
+    }
+    // In place: start from the accumulator's current pixels (stored premultiplied, see the store
+    // below) — the single-texture equivalent of the `load_base` reload.
+    let base_xy = vec2<i32>(i32(global_id.x * PIXELS_PER_THREAD), i32(global_id.y));
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0));
+    }
+#else
 #ifdef load_base
     // Phase > 0: start from the previous phase's output (its un-premultiplied pixels), re-premultiplied
     // so the source-over accumulation below is unchanged. This is what lets a later fine phase draw
@@ -1102,14 +1175,13 @@ fn main(
         rgba[i] = base_color;
     }
 #endif
+#endif
     var blend_stack: array<array<u32, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;
     var clip_depth = 0u;
     var area: array<f32, PIXELS_PER_THREAD>;
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
     cmd_ix += 1u;
-    // Running segment index for whole-viewport segmented fine. Segments are the command ranges
-    // between CMD_EFFECT markers; this advances at each marker. With SEG_ALL it is unused.
     var seg_current = 0u;
     // main interpretation loop
     while true {
@@ -1117,36 +1189,48 @@ fn main(
         if tag == CMD_END {
             break;
         }
-        // Segment boundary. Handled here (like CMD_END), NOT in the switch: a `break` inside a WGSL
-        // `switch` case exits only the switch, not this loop, which would spin on the same marker. The
-        // effect itself runs as a post-fine dispatch over the materialized backdrop (custom shaders
-        // included), never inline here.
-        //   - Segmented dispatch (seg_target != SEG_ALL): fine renders exactly one segment, so once we
-        //     reach the boundary that ends our target segment we stop — later segments are painted by
-        //     their own dispatches.
-        //   - SEG_ALL (default): advance the running index and step over the 6-word marker, walking
-        //     every segment in one pass — byte-for-byte the non-segmented render.
+        // Effect boundary marker. Handled here (like CMD_END), NOT in the switch: a `break` inside a
+        // WGSL `switch` case exits only the switch, not this loop, which would spin on the same
+        // marker. The effect itself runs as a post-fine dispatch over the materialized backdrop
+        // (custom shaders included), never inline here.
+        //
+        // The marker carries the effect's ROUND (p1, word +3): the driver groups reach-disjoint
+        // effects into rounds, and every command's pass is decided PER TILE — a command is drawn in
+        // the pass whose window covers the round of the last marker before it on THIS tile. Tiles
+        // untouched by an effect never see its marker, so content elsewhere renders in the earliest
+        // window; total passes scale with the max effect stack DEPTH, not the effect count.
+        //   - Windowed dispatch (seg_target != SEG_ALL): draw commands whose tile round is in
+        //     [seg_lo, seg_target). Marker rounds are strictly increasing along one tile's PTCL (a
+        //     later effect on the same tile always conflicts with the earlier one), so a marker at or
+        //     past the window's end proves nothing below the window follows — stop.
+        //   - SEG_ALL with seg_lo = 0 (default): step over every marker and draw everything —
+        //     byte-for-byte the non-segmented render. SEG_ALL with seg_lo > 0 is the final window:
+        //     no upper bound, draw every tile round >= seg_lo.
         // cmd_ix must move by exactly 6 so the PTCL walk stays synced with what coarse wrote; landing
         // mid-command would read a param as the next tag and desync the whole tile.
         if tag == CMD_EFFECT {
-            if config.seg_target != SEG_ALL && seg_current == config.seg_target {
+            let round = ptcl[cmd_ix + 3u];
+            if config.seg_target != SEG_ALL && round >= config.seg_target {
                 break;
             }
-            seg_current += 1u;
+            seg_current = round;
             cmd_ix += 6u;
             continue;
         }
-        // Segmented fine paints a command only when it belongs to the segment this dispatch targets;
-        // cmd_ix still advances for every command so the PTCL walk stays synced. With SEG_ALL (the
-        // default) `seg_active` is always true, so the walk is byte-for-byte the non-segmented render.
-        let seg_active = config.seg_target == SEG_ALL || seg_current == config.seg_target;
+        // Windowed fine paints a command only when its tile round falls inside this dispatch's
+        // window; cmd_ix still advances for every command so the PTCL walk stays synced. With the
+        // default (seg_lo = 0, SEG_ALL) `seg_active` is always true.
+        let seg_active = seg_current >= config.seg_lo
+            && (config.seg_target == SEG_ALL || seg_current < config.seg_target);
         switch tag {
             case CMD_FILL: {
                 let fill = read_fill(cmd_ix);
 #ifdef msaa
                 fill_path_ms(fill, local_id.xy, &area);
 #else
-                fill_path(fill, local_xy, &area);
+                if seg_active {
+                    fill_path(fill, local_xy, &area);
+                }
 #endif
                 cmd_ix += 4u;
             }

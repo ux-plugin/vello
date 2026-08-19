@@ -40,6 +40,10 @@ pub struct FullShaders {
     /// `fine_area` with `load_base`: composites over a `base_in` texture (the previous phase's output)
     /// instead of clearing — the whole-viewport gather phasing.
     pub fine_area_load: Option<ShaderId>,
+    /// `fine_area` with `rw_accum`: the output is bound READ-WRITE and updated in place — one
+    /// accumulator, no ping-pong; a tile with no work in the dispatch window returns untouched.
+    /// Only valid on devices with rgba8unorm read-write storage.
+    pub fine_area_rw: Option<ShaderId>,
     pub fine_msaa8: Option<ShaderId>,
     pub fine_msaa16: Option<ShaderId>,
     // 2-level dispatch works for CPU pathtag scan even for large
@@ -252,6 +256,35 @@ pub(crate) fn full_shaders(
     } else {
         None
     };
+    // `fine_area_rw`: the area bindings with the output image bound read-write (no `base_in`, no
+    // mask LUT) — the single-accumulator whole-viewport path.
+    let fine_resources_rw = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    // Building the pipeline eagerly creates its bind group layout, and a ReadWrite rgba8unorm
+    // storage entry is a validation error on a device without adapter-specific format features —
+    // so the permutation only exists when the device creator requested them (which implies the
+    // adapter supports rgba8unorm read-write on every platform this renderer targets).
+    let fine_area_rw = if aa_support.area
+        && device
+            .features()
+            .contains(wgpu::Features::TEXTURE_ADAPTER_SPECIFIC_FORMAT_FEATURES)
+    {
+        Some(add_shader!(
+            fine_area_rw,
+            fine_resources_rw,
+            CpuShaderType::Missing
+        ))
+    } else {
+        None
+    };
     let fine_msaa8 = if aa_support.msaa8 {
         Some(add_shader!(
             fine_msaa8,
@@ -293,6 +326,7 @@ pub(crate) fn full_shaders(
         path_tiling,
         fine_area,
         fine_area_load,
+        fine_area_rw,
         fine_msaa8,
         fine_msaa16,
         pathtag_is_cpu: options.use_cpu,

@@ -131,6 +131,7 @@ pub mod low_level {
     /// A persistent phased render, driven one phase at a time so the caller can interleave its own
     /// GPU work (a gather effect) between phases while sharing one setup. See [`Renderer::phased_begin_into`][crate::Renderer::phased_begin_into].
     pub use crate::render::PhasedSession;
+
     pub use crate::shaders::FullShaders;
     /// Temporary export, used in `with_winit` for stats
     pub use vello_encoding::BumpAllocators;
@@ -729,13 +730,14 @@ impl Renderer {
         device: &Device,
         queue: &Queue,
         encoder: &mut wgpu::CommandEncoder,
+        seg_lo: u32,
         seg_target: u32,
         base: Option<&TextureView>,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let base_image = base.map(|_| session.new_out_image());
-        let recording = render::record_fine_segment(session, &self.shaders, seg_target, base_image, out_image);
+        let recording = render::record_fine_segment(session, &self.shaders, seg_lo, seg_target, base_image, out_image);
         let mut external_resources = vec![ExternalResource::Image(out_image, out)];
         if let (Some(img), Some(view)) = (base_image, base) {
             external_resources.push(ExternalResource::Image(img, view));
@@ -752,6 +754,62 @@ impl Renderer {
             "phased_fine_segment_into",
         )?;
         Ok(())
+    }
+
+    /// Dispatch the READ-WRITE fine permutation for one tile-round window `[seg_lo, seg_target)`:
+    /// the accumulator `target` is updated IN PLACE through one rgba8unorm read-write storage
+    /// binding — no base texture, no ping-pong — and a tile with no work in the window returns
+    /// before touching a pixel. The caller clears `target` before the first window (this mode never
+    /// clears) and must run only on a device with rgba8unorm read-write storage. `target` needs
+    /// `STORAGE_BINDING`; the same texture can carry `RENDER_ATTACHMENT | TEXTURE_BINDING` for the
+    /// effect stamps and crops between windows. Valid between
+    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`], after [`Self::phased_frontend_full_into`].
+    pub fn phased_fine_segment_rw_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        seg_lo: u32,
+        seg_target: u32,
+        target: &TextureView,
+    ) -> Result<()> {
+        let out_image = session.new_out_image();
+        let recording = render::record_fine_segment_rw(session, &self.shaders, seg_lo, seg_target, out_image);
+        let external_resources = [ExternalResource::Image(out_image, target)];
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_fine_segment_rw_into",
+        )?;
+        Ok(())
+    }
+
+    /// DEBUG: raw engine buffer read by resource id (diagnostics only).
+    pub fn engine_debug_read(
+        &self,
+        device: &Device,
+        queue: &Queue,
+        id: crate::recording::ResourceId,
+        n: usize,
+    ) -> Option<Vec<u32>> {
+        self.engine.debug_read_buffer_u32s(device, queue, id, n)
+    }
+
+    /// DEBUG: read the phased session's bump allocators (failed flag + watermarks) after a frame.
+    pub fn phased_debug_bump(
+        &self,
+        session: &render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+    ) -> Option<Vec<u32>> {
+        self.engine.debug_read_buffer_u32s(device, queue, session.debug_bump_proxy_id(), 8)
     }
 
     /// Free the phased render's shared buffers into `encoder` (deferred until after submit). Ends the

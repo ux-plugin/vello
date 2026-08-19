@@ -47,16 +47,17 @@ struct Config {
     draw_start: u32,
     draw_end: u32,
 
-    // Whole-viewport segmented fine: the segment index this fine dispatch renders. Segments are the
-    // command ranges between CMD_EFFECT boundaries in one shared PTCL. fine paints only the commands
-    // whose running segment index equals `seg_target`, and stops once it is past that segment.
-    // `SEG_ALL` (the default) renders every segment in a single pass — the normal, non-segmented
-    // behavior. `_pad_seg*` keep the uniform a multiple of 16 bytes (a WebGPU requirement). Must be
-    // kept in sync with `ConfigUniform` in `vello_encoding/src/config.rs`.
+    // Whole-viewport windowed fine: the tile-round window `[seg_lo, seg_target)` this dispatch
+    // renders. Each CMD_EFFECT marker carries its effect's ROUND (reach-disjoint effects share a
+    // round); a command's round is that of the last marker before it on ITS tile, so untouched
+    // tiles render early and total passes scale with effect stack depth, not effect count.
+    // `seg_target == SEG_ALL` removes the upper bound; with `seg_lo == 0` (the defaults) that is
+    // the normal, non-windowed render. `_pad_seg*` keep the uniform a multiple of 16 bytes (a
+    // WebGPU requirement). Must be kept in sync with `ConfigUniform` in `vello_encoding/src/config.rs`.
     seg_target: u32,
+    seg_lo: u32,
     _pad_seg0: u32,
     _pad_seg1: u32,
-    _pad_seg2: u32,
 }
 
 // Sentinel `seg_target` value meaning "render all segments in one pass" (the non-segmented default).

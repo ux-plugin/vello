@@ -146,6 +146,35 @@ enum TransientBuf<'a> {
 }
 
 impl WgpuEngine {
+    /// DEBUG: synchronously read the first `n` u32s of the buffer bound to `proxy_id`. Blocks on the
+    /// GPU; diagnostics only (the bump/failed counters after a frame).
+    pub fn debug_read_buffer_u32s(
+        &self,
+        device: &wgpu::Device,
+        queue: &wgpu::Queue,
+        proxy_id: crate::recording::ResourceId,
+        n: usize,
+    ) -> Option<Vec<u32>> {
+        let MaterializedBuffer::Gpu(buf) = &self.bind_map.buf_map.get(&proxy_id)?.buffer else {
+            return None;
+        };
+        let size = (n * 4) as u64;
+        let staging = device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("debug bump readback"),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        });
+        let mut enc = device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        enc.copy_buffer_to_buffer(buf, 0, &staging, 0, size);
+        queue.submit([enc.finish()]);
+        let slice = staging.slice(..);
+        slice.map_async(wgpu::MapMode::Read, |_| {});
+        let _ = device.poll(wgpu::PollType::wait_indefinitely());
+        let data = slice.get_mapped_range();
+        Some(bytemuck::cast_slice(&data).to_vec())
+    }
+
     pub fn new(use_cpu: bool, pipeline_cache: Option<PipelineCache>) -> Self {
         Self {
             use_cpu,
@@ -894,7 +923,7 @@ impl WgpuEngine {
                     },
                     count: None,
                 },
-                BindType::Image(format) | BindType::ImageRead(format) => {
+                BindType::Image(format) | BindType::ImageRead(format) | BindType::ImageReadWrite(format) => {
                     wgpu::BindGroupLayoutEntry {
                         binding: i as u32,
                         visibility,
@@ -906,7 +935,11 @@ impl WgpuEngine {
                             }
                         } else {
                             wgpu::BindingType::StorageTexture {
-                                access: wgpu::StorageTextureAccess::WriteOnly,
+                                access: if bind_type == BindType::ImageReadWrite(format) {
+                                    wgpu::StorageTextureAccess::ReadWrite
+                                } else {
+                                    wgpu::StorageTextureAccess::WriteOnly
+                                },
                                 format: format.to_wgpu(),
                                 view_dimension: TextureViewDimension::D2,
                             }

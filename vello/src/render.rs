@@ -164,6 +164,10 @@ pub(crate) fn render_encoding_phased(
     let cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
     let buffer_sizes = &cpu_config.buffer_sizes;
     let wg_counts = &cpu_config.workgroup_counts;
+    if std::env::var("VELLO_DBG_CFG").is_ok() {
+        eprintln!("WG: {wg_counts:#?}");
+        eprintln!("LAYOUT: n_paths {} n_clips {} n_draws {} bin_data_start {}", layout.n_paths, layout.n_clips, layout.n_draw_objects, layout.bin_data_start);
+    }
 
     if packed.is_empty() {
         packed.resize(size_of::<u32>(), u8::MAX);
@@ -420,6 +424,11 @@ impl PhasedSession {
     /// A fresh `Rgba8` output-image proxy sized to the frame, for a phase's external target.
     pub(crate) fn new_out_image(&self) -> ImageProxy {
         ImageProxy::new(self.width, self.height, ImageFormat::Rgba8)
+    }
+
+    /// DEBUG: the bump buffer's resource id, for the post-frame diagnostics readback.
+    pub fn debug_bump_proxy_id(&self) -> crate::recording::ResourceId {
+        self.bump_buf.as_buf().unwrap().id
     }
 }
 
@@ -772,16 +781,18 @@ pub(crate) fn record_frontend_full(session: &mut PhasedSession, shaders: &FullSh
     recording
 }
 
-/// Dispatch `fine` for ONE segment of the shared PTCL built by [`record_frontend_full`]. `seg_target`
-/// selects which command range (between `CMD_EFFECT` markers) this pass paints; `fine` steps over all
-/// commands but composites only those whose running segment index equals `seg_target`. `base` — the
-/// previous segment's output after the caller's effect passes — is loaded and composited over
-/// (`fine_area_load`); `None` clears to the config base color (segment 0, `fine_area`). Writes
-/// `out_image`. The heavy front-end is NOT redone — only this fine dispatch is recorded.
+/// Dispatch `fine` for ONE tile-round window `[seg_lo, seg_target)` of the shared PTCL built by
+/// [`record_frontend_full`]. `fine` steps over all commands but composites only those whose per-tile
+/// round (set by the `CMD_EFFECT` markers on that tile) falls inside the window; `seg_target ==
+/// SEG_ALL` removes the upper bound (the final window). `base` — the previous window's output after
+/// the caller's effect passes — is loaded and composited over (`fine_area_load`); `None` clears to
+/// the config base color (the first window, `fine_area`). Writes `out_image`. The heavy front-end
+/// is NOT redone — only this fine dispatch is recorded.
 #[cfg(feature = "wgpu")]
 pub(crate) fn record_fine_segment(
     session: &mut PhasedSession,
     shaders: &FullShaders,
+    seg_lo: u32,
     seg_target: u32,
     base: Option<ImageProxy>,
     out_image: ImageProxy,
@@ -796,6 +807,7 @@ pub(crate) fn record_fine_segment(
     // Per-segment config: the full config with `seg_target` set. Only `fine` reads seg_target; every
     // other field (dims, base_color, buffer sizes) matches the full config the front-end used.
     let mut seg_cfg = session.cpu_config.gpu;
+    seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
@@ -816,6 +828,40 @@ pub(crate) fn record_fine_segment(
             );
         }
     }
+    recording.free_resource(config_buf);
+    recording
+}
+
+/// Dispatch the READ-WRITE fine permutation for one tile-round window `[seg_lo, seg_target)` of the
+/// shared PTCL: the accumulator is updated in place through one `rgba8unorm` read-write storage
+/// binding — no base texture, no ping-pong — and a tile with no work in the window returns before
+/// touching a pixel. The caller must have cleared the accumulator before the first window (fine
+/// never clears in this mode) and the device must support rgba8unorm read-write storage.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_rw(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    out_image: ImageProxy,
+) -> Recording {
+    let fine_area_rw = shaders
+        .fine_area_rw
+        .expect("single-accumulator render needs the fine_area_rw shader");
+    let wg_counts = &session.cpu_config.workgroup_counts;
+    let mut recording = Recording::default();
+
+    let mut seg_cfg = session.cpu_config.gpu;
+    seg_cfg.seg_lo = seg_lo;
+    seg_cfg.seg_target = seg_target;
+    let config_buf =
+        ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
+
+    recording.dispatch(
+        fine_area_rw,
+        wg_counts.fine,
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas],
+    );
     recording.free_resource(config_buf);
     recording
 }
@@ -900,7 +946,7 @@ impl Render {
         persistent_image_atlas: &mut Option<ImageProxy>,
         params: &RenderParams,
         robust: bool,
-    ) -> Recording {
+        ) -> Recording {
         use vello_encoding::RenderConfig;
         let mut recording = Recording::default();
         let mut packed = vec![];
@@ -987,7 +1033,7 @@ impl Render {
             packed.resize(size_of::<u32>(), u8::MAX);
         }
         let scene_buf = ResourceProxy::Buffer(recording.upload("vello.scene", packed));
-        let config_buf = ResourceProxy::Buffer(
+            let config_buf = ResourceProxy::Buffer(
             recording.upload_uniform("vello.config", bytemuck::bytes_of(&cpu_config.gpu)),
         );
         let info_bin_data_buf = ResourceProxy::new_buf(

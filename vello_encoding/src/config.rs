@@ -163,12 +163,20 @@ pub struct ConfigUniform {
     /// One-past-the-last draw-object index (exclusive) this render phase includes. Defaults to
     /// `n_draw_objects` (all draws). See [`Self::draw_start`].
     pub draw_end: u32,
-    /// Whole-viewport segmented fine: the segment index the `fine` dispatch should render, where a
-    /// segment is the command range between `CMD_EFFECT` markers in one shared PTCL. Defaults to
-    /// [`SEG_ALL`] (render every segment in one pass), leaving a normal render unchanged; the phased
-    /// whole-viewport driver overrides it per segment. `_pad_seg` keeps the uniform 16-byte aligned.
+    /// Whole-viewport windowed fine: one-past-the-highest tile round this `fine` dispatch renders —
+    /// with [`Self::seg_lo`] it forms the window `[seg_lo, seg_target)` over per-tile rounds. Each
+    /// `CMD_EFFECT` marker carries its effect's round (the driver groups reach-disjoint effects into
+    /// one round); a command's round is that of the last marker before it on ITS tile. Defaults to
+    /// [`SEG_ALL`], which removes the upper bound (and with `seg_lo == 0` leaves a normal render
+    /// unchanged); the whole-viewport driver overrides it per pass. `_pad_seg` keeps the uniform
+    /// 16-byte aligned.
     pub seg_target: u32,
-    pub _pad_seg: [u32; 3],
+    /// Lowest tile round (inclusive) this fine dispatch renders — see [`Self::seg_target`]. Tiles
+    /// only carry markers for effects whose reach covers them, so a tile's round trails the global
+    /// round wherever effects don't touch; the window guarantees exactly one dispatch renders each
+    /// command, in an order pixel-equivalent to the full split. Default 0.
+    pub seg_lo: u32,
+    pub _pad_seg: [u32; 2],
 }
 
 /// CPU side setup and configuration.
@@ -213,7 +221,8 @@ impl RenderConfig {
                 // Default: render every segment in one pass (non-segmented). The segmented-fine driver
                 // overrides this per dispatch.
                 seg_target: SEG_ALL,
-                _pad_seg: [0; 3],
+                seg_lo: 0,
+                _pad_seg: [0; 2],
                 layout: *layout,
             },
             workgroup_counts,
@@ -431,7 +440,8 @@ impl BufferSizes {
         let segments = BufferSize::new(1 << 21);
         // 16 * 16 (1 << 8) is one blend spill, so this allows for 4096 spills.
         let blend_spill = BufferSize::new(1 << 20);
-        let ptcl = BufferSize::new(1 << 23);
+        let n_tiles = workgroups.fine.0.saturating_mul(workgroups.fine.1);
+        let ptcl = BufferSize::new((1u32 << 23).max(n_tiles.saturating_mul(384)));
         Self {
             path_reduced,
             path_reduced2,
