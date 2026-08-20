@@ -696,12 +696,16 @@ impl WgpuEngine {
                                 &wgpu_shader.bind_group_layout,
                                 bindings,
                             );
-                            let mut cpass =
-                                encoder.begin_compute_pass(&ComputePassDescriptor::default());
                             #[cfg(feature = "wgpu-profiler")]
-                            let query = profiler
-                                .begin_query(shader.label, &mut cpass)
+                            let pass_query = profiler
+                                .begin_pass_query(shader.label, encoder)
                                 .with_parent(Some(&query));
+                            let mut desc = ComputePassDescriptor::default();
+                            #[cfg(feature = "wgpu-profiler")]
+                            {
+                                desc.timestamp_writes = pass_query.compute_pass_timestamp_writes();
+                            }
+                            let mut cpass = encoder.begin_compute_pass(&desc);
                             #[cfg_attr(
                                 not(feature = "debug_layers"),
                                 expect(
@@ -715,8 +719,9 @@ impl WgpuEngine {
                             cpass.set_pipeline(pipeline);
                             cpass.set_bind_group(0, &bind_group, &[]);
                             cpass.dispatch_workgroups(x, y, z);
+                            drop(cpass);
                             #[cfg(feature = "wgpu-profiler")]
-                            profiler.end_query(&mut cpass, query);
+                            profiler.end_query(encoder, pass_query);
                         }
                     }
                 }
@@ -754,12 +759,16 @@ impl WgpuEngine {
                                 queue,
                                 proxy,
                             );
-                            let mut cpass =
-                                encoder.begin_compute_pass(&ComputePassDescriptor::default());
                             #[cfg(feature = "wgpu-profiler")]
-                            let query = profiler
-                                .begin_query(shader.label, &mut cpass)
+                            let pass_query = profiler
+                                .begin_pass_query(shader.label, encoder)
                                 .with_parent(Some(&query));
+                            let mut desc = ComputePassDescriptor::default();
+                            #[cfg(feature = "wgpu-profiler")]
+                            {
+                                desc.timestamp_writes = pass_query.compute_pass_timestamp_writes();
+                            }
+                            let mut cpass = encoder.begin_compute_pass(&desc);
                             #[cfg_attr(
                                 not(feature = "debug_layers"),
                                 expect(
@@ -776,8 +785,9 @@ impl WgpuEngine {
                                 Error::UnavailableBufferUsed(proxy.name, "indirect dispatch"),
                             )?;
                             cpass.dispatch_workgroups_indirect(buf, *offset);
+                            drop(cpass);
                             #[cfg(feature = "wgpu-profiler")]
-                            profiler.end_query(&mut cpass, query);
+                            profiler.end_query(encoder, pass_query);
                         }
                     }
                 }
