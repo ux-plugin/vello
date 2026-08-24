@@ -1455,6 +1455,12 @@ fn main(
                 }
                 let shade = (bits & 8u) != 0u;
                 let maskmix = (bits & 16u) != 0u;
+                // A SPREAD composite (bit 128): the value is a blurred SILHOUETTE coverage (its source
+                // was the shape's own silhouette, not the backdrop), and it lays down as the shadow
+                // colour source-OVER the accumulator — a layer under the body — rather than the masked
+                // mix a backdrop effect uses. The straight colour is u[3]; `value.a` is the blurred
+                // coverage. Only the drop/inner shadow spread sets it. (Dormant until the driver emits.)
+                let spread = (bits & 128u) != 0u;
                 // A WARP head (bit 32) samples the MATERIALIZED backdrop at a field-computed
                 // displacement — a gather that only a reload round can serve, since `base_in` is the
                 // finished prior surface (reading the in-place `rw_accum` at a displaced, cross-tile
@@ -1524,7 +1530,13 @@ fn main(
                     // Masked by the shape's coverage, which the inline effect's `CmdFill` (emitted by
                     // coarse just before this marker) left in `area[i]` — so the effect is confined to
                     // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
-                    rgba[i] = mix(rgba[i], eff, cov);
+                    if spread {
+                        // Blurred silhouette → shadow colour, premultiplied, source-OVER the layer.
+                        let a = u[3].a * value.a;
+                        rgba[i] = vec4<f32>(u[3].xyz * a, a) + rgba[i] * (1.0 - a);
+                    } else {
+                        rgba[i] = mix(rgba[i], eff, cov);
+                    }
                 }
             }
             if config.seg_target != SEG_ALL && round >= config.seg_target {
