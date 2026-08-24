@@ -44,6 +44,11 @@ pub struct FullShaders {
     /// separable blur's V pass samples the H pass's unmasked result here while `base_in` holds the
     /// original backdrop, so the silhouette mask applies exactly once.
     pub fine_area_load_draft: Option<ShaderId>,
+    /// `fine_area_load` with `have_input`: a second sampled input `input_in` at binding 10 (sharing the
+    /// slot with `draft_in`, since the two are never bound together) — a chained gather (frosted glass:
+    /// warp → blur → scatter → shade) routes the previous link's materialised surface here while
+    /// `base_in` holds the original backdrop.
+    pub fine_area_load_input: Option<ShaderId>,
     /// `fine_area` with `rw_accum`: the output is bound READ-WRITE and updated in place — one
     /// accumulator, no ping-pong; a tile with no work in the dispatch window returns untouched.
     /// Only valid on devices with rgba8unorm read-write storage.
@@ -289,6 +294,17 @@ pub(crate) fn full_shaders(
     } else {
         None
     };
+    // `fine_area_load_input`: same bindings as `fine_area_load_draft` (base_in at 9, a second sampled
+    // input at 10) — the shader interprets binding 10 as `input_in` under the `have_input` define.
+    let fine_area_load_input = if aa_support.area {
+        Some(add_shader!(
+            fine_area_load_input,
+            fine_resources_load_draft,
+            CpuShaderType::Missing
+        ))
+    } else {
+        None
+    };
     // `fine_area_rw`: the area bindings with the output image bound read-write (no `base_in`, no
     // mask LUT) — the single-accumulator whole-viewport path.
     let fine_resources_rw = [
@@ -362,6 +378,7 @@ pub(crate) fn full_shaders(
         fine_area,
         fine_area_load,
         fine_area_load_draft,
+        fine_area_load_input,
         fine_area_rw,
         fine_msaa8,
         fine_msaa16,

@@ -98,6 +98,30 @@ fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
 var draft_in: texture_2d<f32>;
 #endif
 
+// A CHAINED gather (frosted glass: warp → blur → scatter → shade) materialises intermediate surfaces
+// the way the batched lens stages do. `input_in` is the marker's PRIMARY input surface — the previous
+// link's output — routed here by the scheduler (the warped surface for the blur H, the blurred surface
+// for the scatter, the scattered surface for the shade). It shares binding 10 with `draft_in`: a marker
+// reads AT MOST one second surface (a frosted blur-V reads the draft; warp/blur-H/scatter/tail read the
+// input), so `have_draft` and `have_input` are never set together. `base_in` still holds the ORIGINAL
+// backdrop (warp displacement + maskmix orig). Present only in the `have_input` permutation.
+#ifdef have_input
+@group(0) @binding(10)
+var input_in: texture_2d<f32>;
+
+// Bilinear sample of the primary input surface at a continuous pixel position (see `fx_bilin`).
+fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
+    let fl = floor(pos);
+    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
+    let f = pos - fl;
+    let s00 = textureLoad(input_in, i0, 0);
+    let s10 = textureLoad(input_in, i0 + vec2<i32>(1, 0), 0);
+    let s01 = textureLoad(input_in, i0 + vec2<i32>(0, 1), 0);
+    let s11 = textureLoad(input_in, i0 + vec2<i32>(1, 1), 0);
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+}
+#endif
+
 // MSAA-only bindings and utilities
 #ifdef msaa
 
@@ -1200,6 +1224,13 @@ fn fx_specular(t: f32, bezel: f32, lightAngle: f32, dir: vec2<f32>, scale: f32) 
     return band * f;
 }
 fn fx_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123); }
+// The frost SCATTER noise — a byte-for-byte port of the batched lens `HASH_PRELUDE` (units.rs). The
+// multiplier and the hash2 offsets must match the oracle EXACTLY (the arm above uses a different
+// constant), or the 12 scatter taps land elsewhere and the frost differs.
+fn fx_scatter_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
+fn fx_scatter_hash2(p: vec2<f32>) -> vec2<f32> {
+    return vec2<f32>(fx_scatter_hash(p), fx_scatter_hash(p + vec2<f32>(73.7, 157.3))) * 2.0 - 1.0;
+}
 fn fx_vnoise(p: vec2<f32>, seed: f32) -> f32 {
     let i = floor(p);
     let f = fract(p);
@@ -1545,13 +1576,24 @@ fn main(
                             let w = exp(-f32(tt * tt) * inv2s2);
                             let sp = ipx + axis * tt;
 #ifdef have_draft
+                            // V pass: taps the H-pass result in the draft (a frosted lens's draft holds
+                            // its H-blurred WARP, a background blur's holds its H-blurred backdrop).
                             let dims = vec2<i32>(textureDimensions(draft_in));
                             let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
                             let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(draft_in, sp, 0)), inb);
 #else
+#ifdef have_input
+                            // Frosted lens H pass: taps the WARPED surface (the previous link's output),
+                            // routed to `input_in`, not the raw backdrop.
+                            let dims = vec2<i32>(textureDimensions(input_in));
+                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
+                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(input_in, sp, 0)), inb);
+#else
+                            // Background blur H pass: taps the backdrop.
                             let dims = vec2<i32>(textureDimensions(base_in));
                             let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
                             let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
+#endif
 #endif
                             acc = acc + w * tap;
                             wsum = wsum + w;
@@ -1566,6 +1608,47 @@ fn main(
 #endif
                     }
 #endif
+#ifdef have_input
+                    // FROST SCATTER (bit 256): a 12-tap noise blur of the PRIMARY input surface (the
+                    // blurred-warp link of a frosted lens chain), a byte-for-byte port of the batched
+                    // Scatter unit (units.rs head==2). `fc` is the pixel CENTRE (matches the oracle's
+                    // fragment coord). Writes UNMASKED to its scratch `out` (cov = 1) so the next link
+                    // reads the full field; the tail shade/maskmix marker applies the silhouette.
+                    let scatter = (bits & 256u) != 0u;
+                    if scatter {
+                        let frost = u[4].z;
+                        let scl = u[4].x;
+                        let fc = px + vec2<f32>(0.5, 0.5);
+                        if (frost > 0.01) {
+                            var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                            for (var t = 0u; t < 12u; t = t + 1u) {
+                                let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
+                                let off = n * frost * 6.0 * scl;
+                                sacc = sacc + fx_bilin_input(px + off);
+                            }
+                            value = sacc / 12.0;
+                        } else {
+                            value = fx_bilin_input(px);
+                        }
+                        cov = 1.0;
+                    }
+                    // Frosted lens TAIL (shade+maskmix, no warp/blur/scatter): its `value` is the
+                    // finished scattered surface routed to `input_in`; `orig` is the ORIGINAL backdrop
+                    // (`base_in`) the maskmix confines the lens over. Composites masked (cov = area).
+                    if ((bits & (32u | 64u | 256u)) == 0u) {
+                        value = fx_bilin_input(px);
+                        orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+                    }
+#endif
+                    // MATERIALIZE (bit 512): an INTERMEDIATE link of a chained gather (a frosted lens's
+                    // warp / blur-V / scatter) writes its result UNMASKED to a scratch `out`, so the next
+                    // link reads the full field; only the FINAL link (shade+maskmix, or a background
+                    // blur's V) composites masked into the accumulator. Background blur's H already forces
+                    // cov = 1 via `#ifndef have_draft`; this bit covers the links that ride the have_draft
+                    // permutation (a frosted blur-V) where that guard does not fire.
+                    if ((bits & 512u) != 0u) {
+                        cov = 1.0;
+                    }
                     let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);
                     // Masked by the shape's coverage, which the inline effect's `CmdFill` (emitted by
                     // coarse just before this marker) left in `area[i]` — so the effect is confined to
