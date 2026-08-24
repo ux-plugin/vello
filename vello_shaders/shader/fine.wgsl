@@ -1451,10 +1451,15 @@ fn main(
                 // offset would race). Its self-clip coverage is the field's SDF mask (`fld.a`), not the
                 // shape silhouette in `area[i]` that a pointwise backdrop effect uses.
                 let warp = (bits & 32u) != 0u;
-                // A blur arm (BLUR 64): sample base_in over a Gaussian kernel of sigma u[0].z. When
-                // u[0].xy is an axis it is one separable pass (2·⌈3σ⌉+1 taps; two markers H then V give
-                // the O(r) blur); when u[0].xy is (0,0) it is a single-pass 2D kernel (O(r²), one
-                // marker — the small-blur-inline case). Either way the blur is a fine arm, no pipeline.
+                // A blur arm (BLUR 64): one 2D Gaussian gather of sigma u[0].z over `base_in`, the
+                // finished prior surface. It is deliberately a SINGLE marker, not a separable H+V pair:
+                // a separable blur would have to store its first-pass (unmasked) result somewhere the
+                // second pass can read, and the only shared surface here is the accumulator — which
+                // holds every other shape too, so writing an unmasked intermediate there clips to the
+                // silhouette (its coverage) and the second pass reads holes. Reading `base_in` directly
+                // and compositing masked ONCE (below) is correct for ANY silhouette; full-frame is just
+                // the case where the mask is the whole viewport. Separable is a later perf layer and
+                // needs a private scratch, not a special case here. O(r²), no pipeline.
                 let blur = (bits & 64u) != 0u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                     let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
@@ -1470,26 +1475,27 @@ fn main(
                         cov = fld.a;
                     }
                     if blur {
-                        // Separable 1D pass along the axis the DESCRIPTOR carries (u[0].xy) — the
-                        // planner set it (H marker (1,0), V marker (0,1)); the shader assumes nothing.
                         let dims = vec2<i32>(textureDimensions(base_in));
                         let sigma = max(u[0].z, 0.5);
                         let radius = i32(ceil(3.0 * sigma));
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
-                        let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
+                        let inv2s2 = 1.0 / (2.0 * sigma * sigma);
                         // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
                         // tap is the background colour, and the blur FADES toward it at the true edge
                         // (matching tiled, which blurs an isolated crop cleared to the page).
                         let bg = fx_premul_srgb_to_lin(unpack4x8unorm(config.base_color));
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
-                        for (var tt = -radius; tt <= radius; tt = tt + 1) {
-                            let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
-                            let sp = ipx + axis * tt;
-                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
-                            acc = acc + w * tap;
-                            wsum = wsum + w;
+                        for (var ty = -radius; ty <= radius; ty = ty + 1) {
+                            let wy = exp(-f32(ty * ty) * inv2s2);
+                            for (var tx = -radius; tx <= radius; tx = tx + 1) {
+                                let w = wy * exp(-f32(tx * tx) * inv2s2);
+                                let sp = ipx + vec2<i32>(tx, ty);
+                                let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
+                                let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
+                                acc = acc + w * tap;
+                                wsum = wsum + w;
+                            }
                         }
                         value = fx_premul_lin_to_srgb(acc / wsum);
                     }
@@ -1519,9 +1525,13 @@ fn main(
 #ifdef msaa
                 fill_path_ms(fill, local_id.xy, &area);
 #else
-                if seg_active {
-                    fill_path(fill, local_xy, &area);
-                }
+                // Coverage is STATE, not paint: a later command in a different window reads `area[i]`
+                // (a base-reading inline effect — WARP/BLUR — applies in its RELOAD segment, one past
+                // the segment its silhouette fill was tagged to). Gating the fill on `seg_active` would
+                // leave that effect reading a stale `area` — the previous fill's winding, i.e. the
+                // backdrop — and clip the blur to the backdrop's shape. So always recompute; only the
+                // paint (CMD_COLOR/CMD_EFFECT) is windowed. Matches CMD_SOLID, which sets area ungated.
+                fill_path(fill, local_xy, &area);
 #endif
                 cmd_ix += 4u;
             }
