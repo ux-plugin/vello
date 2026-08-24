@@ -70,6 +70,22 @@ var<storage> effect_params: array<f32>;
 #ifdef load_base
 @group(0) @binding(9)
 var base_in: texture_2d<f32>;
+
+// Bilinear sample of the materialised backdrop at a continuous pixel position — the manual equivalent
+// of the batched lens oracle's linear `unitSample`. `pos = px + disp`; the sampler's −0.5 texel-centre
+// convention cancels the fragment-centre +0.5, so no half-texel bias is added. Interpolates the stored
+// premul-sRGB texels directly (the hardware sampler the oracle uses interpolates raw unorm, not linear
+// light), so no colour-space conversion here.
+fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
+    let fl = floor(pos);
+    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
+    let f = pos - fl;
+    let s00 = textureLoad(base_in, i0, 0);
+    let s10 = textureLoad(base_in, i0 + vec2<i32>(1, 0), 0);
+    let s01 = textureLoad(base_in, i0 + vec2<i32>(0, 1), 0);
+    let s11 = textureLoad(base_in, i0 + vec2<i32>(1, 1), 0);
+    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+}
 #endif
 
 // A separable blur's SECOND pass reads its first pass's UNMASKED result from here — a "draft" the
@@ -1478,16 +1494,40 @@ fn main(
                 let blur = (bits & 64u) != 0u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                     let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
-                    let fld = fx_computeField(program, u, px);
+                    // The field is evaluated at the pixel CENTRE (`px + 0.5`) to match the batched
+                    // oracle, whose fragment shader measures the field at `fragCoord` = pixel centre. `px`
+                    // here is the pixel-index corner; sampling the field half a pixel off shifts the
+                    // whole displacement/specular/mask field and rings every lens rim by ~1px.
+                    let fld = fx_computeField(program, u, px + vec2<f32>(0.5, 0.5));
                     var value = rgba[i];
                     var orig = rgba[i];
                     var cov = area[i];
 #ifdef load_base
                     if warp {
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
-                        value = textureLoad(base_in, vec2<i32>(i32(px.x + fld.x), i32(px.y + fld.y)), 0);
+                        // Refracted backdrop sample at `px + disp`, bilinear (matches the oracle's linear
+                        // `unitSample`; a nearest textureLoad seams at the lens centre where the
+                        // displacement changes sign and rings the rim where it is steepest).
+                        let bp = px + fld.xy;
+                        // CHROMATIC ABERRATION: R and B are sampled shifted along the displacement
+                        // direction, the shift growing with |disp| (so it peaks at the rim). This is the
+                        // batched lens head's `caShift`; on a high-contrast backdrop its absence is a
+                        // bright colour fringe on every lens edge. `u[4].y` = CA amount, `u[4].x` = scale.
+                        let dlen = length(fld.xy);
+                        let castr = smoothstep(0.0, 5.0 * u[4].x, dlen);
+                        var cadir = vec2<f32>(0.0, 0.0);
+                        if (dlen > 0.01 * u[4].x) { cadir = fld.xy / dlen; }
+                        let cashift = cadir * u[4].y * castr;
+                        let cr = fx_bilin(bp - cashift);
+                        let cg = fx_bilin(bp);
+                        let cb = fx_bilin(bp + cashift);
+                        value = vec4<f32>(cr.r, cg.g, cb.b, cg.a);
                         orig = textureLoad(base_in, ipx, 0);
-                        cov = fld.a;
+                        // The refraction mask (`fld.a`, analytic SDF coverage) is applied ONCE by the
+                        // MASKMIX unit in `fx_applyPointwise`; the OUTER composite keeps `area[i]` — the
+                        // RASTERISED silhouette AA the CmdFill left — matching the oracle's
+                        // maskmix(analytic) + stamp(silhouette). `cov = fld.a` here would apply the mask
+                        // twice (m²) and ring the rim; leave `cov` alone.
                     }
                     if blur {
                         let sigma = max(u[0].z, 0.5);
