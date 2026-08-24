@@ -58,18 +58,24 @@ var gradients: texture_2d<f32>;
 @group(0) @binding(7)
 var image_atlas: texture_2d<f32>;
 
+// Effects-in-fine (Phase B): per-effect chain descriptors — each a header + the 24-float (6-vec4)
+// unit uniform — packed back-to-back, indexed by the CMD_EFFECT marker. Populated by the driver;
+// a 1-element dummy when no effect rides fine. Present in every permutation, so always binding 8.
+@group(0) @binding(8)
+var<storage> effect_params: array<f32>;
+
 // Whole-viewport gather phasing: phase > 0 composites over the previous phase's output, loaded here
 // as its base instead of `config.base_color`. (A separate input texture — not the write target — so
 // there is no read/write hazard; the caller ping-pongs the two across phases.)
 #ifdef load_base
-@group(0) @binding(8)
+@group(0) @binding(9)
 var base_in: texture_2d<f32>;
 #endif
 
 // MSAA-only bindings and utilities
 #ifdef msaa
 
-const MASK_LUT_INDEX: u32 = 8;
+const MASK_LUT_INDEX: u32 = 9;
 
 #ifdef msaa8
 const MASK_WIDTH = 32u;
@@ -1077,6 +1083,183 @@ fn fill_path(fill: CmdFill, xy: vec2<f32>, result: ptr<function, array<f32, PIXE
 
 #endif
 
+// Effect ids at or above this run their pointwise chain INLINE in fine (effects-in-fine); ids below
+// are barrier/post-fine markers fine only steps over. The driver assigns inline ids from this base.
+const EFFECT_INLINE_BASE: u32 = 100u;
+
+// ============================================================================================
+// Effects-in-fine (Phase B): the built-in field programs and pointwise unit bodies, baked as PURE
+// functions of a 6-vec4 uniform block `u` (the same 24-float layout `units_uniform`/`field_prelude`
+// emit in the batch path, where `u[k]` == `fieldU(gi, k)`). The CMD_EFFECT interpreter loads an
+// effect's `u` from the params buffer and calls these over the tile's accumulator `rgba[i]`. Kept
+// pure (no global reads) so the logic lands independent of the buffer/binding plumbing.
+// Generated from `field_prelude(lens_field_program())` / `field_prelude(texture_field_program())`
+// and `units_body(...)`; regenerate via the `dump_field_wgsl_for_fine` test if the builders change.
+// --- shared field operators (no uniform reads) ---
+fn fx_sdfRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, r: f32) -> f32 {
+    let d = abs(p) - halfSize + vec2<f32>(r);
+    return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0))) - r;
+}
+fn fx_ramp(d: f32, edge: f32) -> f32 { return clamp(-d / edge, 0.0, 1.0); }
+fn fx_profile(x: f32, kind: i32) -> f32 {
+    let t = 1.0 - x;
+    if (kind == 0) { return sqrt(max(0.0, 1.0 - t * t)); }
+    let t4 = t * t * t * t;
+    if (kind == 1) { return pow(max(0.0, 1.0 - t4), 0.25); }
+    if (kind == 2) { return 1.0 - pow(max(0.0, 1.0 - t4), 0.25); }
+    let c = pow(max(0.0, 1.0 - t4), 0.25);
+    let sx = clamp(x, 0.0, 1.0);
+    let ss = sx * sx * sx * (sx * (sx * 6.0 - 15.0) + 10.0);
+    return mix(c, 1.0 - c, ss);
+}
+fn fx_profileSlope(x: f32, kind: i32) -> f32 {
+    let delta = 0.001;
+    return (fx_profile(min(1.0, x + delta), kind) - fx_profile(max(0.0, x - delta), kind)) / (2.0 * delta);
+}
+fn fx_coverage(d: f32, softness: f32) -> f32 { return smoothstep(0.0, softness, -d); }
+fn fx_radialDirection(localPos: vec2<f32>, halfSize: vec2<f32>, splay: f32, tilt: f32) -> vec2<f32> {
+    let radialDir = normalize(localPos / max(vec2<f32>(1.0), halfSize));
+    let flatDir = vec2<f32>(cos(tilt), sin(tilt));
+    let blended = mix(flatDir, radialDir, splay);
+    let l = length(blended);
+    if (l > 0.001) { return blended / l; }
+    return vec2<f32>(0.0);
+}
+fn fx_snell(theta1: f32, n1: f32, n2: f32) -> f32 {
+    let s = (n1 / n2) * sin(theta1);
+    if (abs(s) > 1.0) { return -1.0; }
+    return asin(s);
+}
+fn fx_refract(t: f32, thick: f32, n2: f32, kind: i32) -> f32 {
+    if (t <= 0.0 || t >= 1.0) { return 0.0; }
+    let h = fx_profile(t, kind) * thick;
+    let dh = fx_profileSlope(t, kind) * thick;
+    let sA = atan(dh);
+    let tI = abs(sA);
+    let tR = fx_snell(tI, 1.0, n2);
+    if (tR < 0.0) { return 0.0; }
+    return (h * tan(tR) - h * tan(tI)) * sign(dh);
+}
+fn fx_band(x: f32, centre: f32, width: f32) -> f32 {
+    return exp(-0.5 * pow((x - centre) / max(width, 1e-4), 2.0));
+}
+fn fx_specular(t: f32, bezel: f32, lightAngle: f32, dir: vec2<f32>, scale: f32) -> f32 {
+    if (t <= 0.0 || t >= 1.0) { return 0.0; }
+    let band = fx_band(t * bezel, 2.0 * scale, scale);
+    let ld = vec2<f32>(cos(lightAngle), sin(lightAngle));
+    var f = abs(dot(dir, ld));
+    f = pow(f, 2.0);
+    return band * f;
+}
+fn fx_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123); }
+fn fx_vnoise(p: vec2<f32>, seed: f32) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let s = vec2<f32>(seed, 0.0);
+    let a = fx_hash(i + vec2<f32>(0.0, 0.0) + s);
+    let b = fx_hash(i + vec2<f32>(1.0, 0.0) + s);
+    let c = fx_hash(i + vec2<f32>(0.0, 1.0) + s);
+    let d = fx_hash(i + vec2<f32>(1.0, 1.0) + s);
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+fn fx_fbm(p: vec2<f32>, seed: f32) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var freq = 1.0;
+    for (var o = 0; o < 4; o = o + 1) {
+        v = v + amp * fx_vnoise(p * freq, seed);
+        freq = freq * 2.0;
+        amp = amp * 0.5;
+    }
+    return v;
+}
+fn fx_fractalNoise(p: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(fx_fbm(p, 0.0), fx_fbm(p, 37.0), fx_fbm(p, 71.0), fx_fbm(p, 113.0));
+}
+// --- baked field programs (return (displacement.x, displacement.y, specular, mask)) ---
+fn fx_fieldDistance_lens(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
+    return fx_sdfRoundedBox(p, u[1].xy, min(u[1].z, min(u[1].x, u[1].y)));
+}
+fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+    let scale = u[4].x;
+    let localPos = fc - u[0].zw;
+    let n0 = fx_fieldDistance_lens(u, localPos);
+    if (n0 > 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+    let n1 = fx_ramp(n0, min(u[2].x, min(u[1].x, u[1].y)));
+    let n2 = fx_radialDirection(localPos, u[1].xy, u[3].x, u[3].y);
+    let n3 = fx_refract(n1, u[2].y, u[2].z, i32(u[1].w));
+    let n4 = fx_coverage(n0, 1.5 * u[4].x);
+    let edgeT = n1;
+    let dir = n2;
+    let refracted = n3;
+    let mask = n4;
+    let bezel = min(u[2].x, min(u[1].x, u[1].y));
+    var disp = refracted * scale;
+    let edgeFade = pow(1.0 - edgeT, 1.5);
+    disp = disp * (1.0 + u[3].z * edgeFade);
+    var dpx = dir * disp;
+    let zoomFactor = 1.0 / max(u[3].w, 0.1) - 1.0;
+    dpx = dpx + localPos * zoomFactor;
+    let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
+    return vec4<f32>(dpx.x, dpx.y, specular, mask);
+}
+fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+    let n0 = fx_fractalNoise(fc / max(u[0].w, 1.0));
+    let n1 = ((n0.rg - vec2<f32>(0.5, 0.5)) * u[0].z);
+    return vec4<f32>(n1.x, n1.y, 0.0, 1.0);
+}
+// A radial ramp field: mask (and specular) fall linearly from 1 at the centre to 0 at `radius`. Its
+// only job is to exercise the inline field VM with a per-pixel-varying, hand-computable value —
+// `mix(backdrop, tinted, mask)` becomes a radial tint gradient. Centre = u[0].zw, radius = u[1].x.
+fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+    let d = length(fc - u[0].zw);
+    let m = clamp(1.0 - d / max(u[1].x, 1.0), 0.0, 1.0);
+    return vec4<f32>(0.0, 0.0, m, m);
+}
+// Dispatch a baked field program by id. Barrier heads (warp/frost) are NOT pointwise and never reach
+// here; this serves the field-measuring pointwise units (shade/maskmix) that read a field per pixel.
+fn fx_computeField(program: u32, u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+    if (program == 1u) { return fx_computeField_lens(u, fc); }
+    if (program == 2u) { return fx_computeField_texture(u, fc); }
+    if (program == 3u) { return fx_computeField_radial(u, fc); }
+    return vec4<f32>(0.0, 0.0, 0.0, 1.0);
+}
+// --- pointwise unit bodies over the accumulator pixel ---
+// `bits`: TINT=4, CLIP=1, ERASE=2 (mirrors batch `pointwise`); `shade`/`maskmix` are separate flags.
+// `value` = this pixel; `orig` = the pre-effect backdrop snapshot (for erase/maskmix); `field` =
+// fx_computeField for this pixel (only read when shade/maskmix set); `u` = the effect uniform.
+fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, orig: vec4<f32>, field: vec4<f32>, u: array<vec4<f32>, 6>) -> vec4<f32> {
+    var value = value0;
+    if (shade) {
+        let specular = field.b;
+        let specularOpacity = u[4].w;
+        let specularSaturation = u[5].x;
+        let specLuma = dot(value.rgb, vec3<f32>(0.299, 0.587, 0.114));
+        var saturated = mix(vec3<f32>(specLuma), value.rgb, 1.0 + specularSaturation);
+        saturated = max(saturated, vec3<f32>(0.0));
+        let highlightColor = mix(vec3<f32>(1.0, 0.98, 0.95), saturated, min(specularSaturation / 9.0, 1.0));
+        value = vec4<f32>(value.rgb + specular * specularOpacity * highlightColor * value.a, value.a);
+    }
+    if ((bits & 1u) != 0u) {
+        let srcCoverage = value.a;
+        value = mix(value, value * srcCoverage, u[5].y);
+    }
+    if ((bits & 4u) != 0u) {
+        let tintColor = u[3];
+        let tinted = vec4<f32>(tintColor.rgb * tintColor.a, tintColor.a) * value.a;
+        value = mix(value, tinted, select(0.0, 1.0, tintColor.a >= 0.0));
+    }
+    if ((bits & 2u) != 0u) {
+        value = value * (1.0 - orig.a * u[3].w);
+    }
+    if (maskmix) {
+        let mask = field.a;
+        value = vec4<f32>(mix(orig.rgb, value.rgb, mask), mix(orig.a, value.a, mask));
+    }
+    return value;
+}
+
 // The X size should be 16 / PIXELS_PER_THREAD
 @compute @workgroup_size(4, 16)
 fn main(
@@ -1210,6 +1393,35 @@ fn main(
         // mid-command would read a param as the next tag and desync the whole tile.
         if tag == CMD_EFFECT {
             let round = ptcl[cmd_ix + 3u];
+            let effect_id = ptcl[cmd_ix + 1u];
+            // Effects-in-fine (Phase B): an effect flagged inline (effect_id >= EFFECT_INLINE_BASE)
+            // runs its pointwise chain over the tile accumulator here. `p2` (word +4) is the float
+            // offset into `effect_params` of this effect's descriptor: [bits, program, then the
+            // 24-float (6-vec4) unit uniform]. The driver flip enables this by emitting the sentinel
+            // id + descriptor; until then no marker sets it, so this branch never runs and fine
+            // steps over the marker exactly as before.
+            if effect_id >= EFFECT_INLINE_BASE && seg_current >= config.seg_lo
+                && (config.seg_target == SEG_ALL || seg_current < config.seg_target) {
+                let base = ptcl[cmd_ix + 4u];
+                let bits = u32(effect_params[base]);
+                let program = u32(effect_params[base + 1u]);
+                var u: array<vec4<f32>, 6>;
+                for (var k = 0u; k < 6u; k = k + 1u) {
+                    let o = base + 2u + k * 4u;
+                    u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
+                }
+                let shade = (bits & 8u) != 0u;
+                let maskmix = (bits & 16u) != 0u;
+                for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                    let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
+                    let fld = fx_computeField(program, u, px);
+                    let eff = fx_applyPointwise(bits, shade, maskmix, rgba[i], rgba[i], fld, u);
+                    // Masked by the shape's coverage, which the inline effect's `CmdFill` (emitted by
+                    // coarse just before this marker) left in `area[i]` — so the effect is confined to
+                    // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
+                    rgba[i] = mix(rgba[i], eff, area[i]);
+                }
+            }
             if config.seg_target != SEG_ALL && round >= config.seg_target {
                 break;
             }

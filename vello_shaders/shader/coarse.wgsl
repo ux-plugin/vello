@@ -401,14 +401,15 @@ fn main(
                         write_blurred_rounded_rect(CmdColor(rgba_color), info_offset);
                     }
                     case DRAWTAG_EFFECT: {
-                        // Record the effect boundary in the tile's command stream: ONLY the 6-word marker
-                        // carrying effect_id + params, no coverage. The marker is a z-boundary for
-                        // segmented fine, not a paint, so `write_path` is deliberately skipped — the
-                        // effect's draw is emitted with a full-viewport bbox (see `draw_effect_marker`) so
-                        // it bins into EVERY tile, giving all tiles the same global boundary; the actual
-                        // effect composites separately over its extent. Fine steps over the marker (today)
-                        // or breaks on it (segmented fine); no `CmdFill` precedes it.
+                        // A barrier effect (id < 100) records ONLY the 6-word marker: a z-boundary for
+                        // segmented fine, not a paint, so `write_path` is skipped and the effect
+                        // composites separately post-fine. An INLINE effect (id >= 100, effects-in-fine)
+                        // ALSO emits its shape's coverage as a `CmdFill` first, so fine's `area[i]` holds
+                        // the silhouette when it applies the effect to the accumulator (masked by it).
                         let effect_id = scene[dd];
+                        if effect_id >= 100u {
+                            write_path(tile, tile_ix, draw_flags);
+                        }
                         write_effect(effect_id, scene[dd + 1u], scene[dd + 2u], scene[dd + 3u], scene[dd + 4u]);
                     }
                     case DRAWTAG_FILL_LIN_GRADIENT: {

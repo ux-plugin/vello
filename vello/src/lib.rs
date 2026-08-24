@@ -635,6 +635,7 @@ impl Renderer {
         queue: &Queue,
         scene: &Scene,
         params: &RenderParams,
+        effect_params: &[u8],
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<render::PhasedSession> {
         let (session, recording) = render::begin_phased(
@@ -643,6 +644,7 @@ impl Renderer {
             &self.shaders,
             &mut self.image_atlas,
             params,
+            effect_params,
         );
         self.engine.run_recording_into(
             device,

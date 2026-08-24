@@ -51,6 +51,7 @@ struct FineResources {
     info_bin_data_buf: ResourceProxy,
     image_atlas: ResourceProxy,
     blend_spill_buf: ResourceProxy,
+    effect_params_buf: ResourceProxy,
 
     out_image: ImageProxy,
 }
@@ -212,6 +213,7 @@ pub(crate) fn render_encoding_phased(
         ResourceProxy::new_buf(buffer_sizes.seg_counts.size_in_bytes().into(), "vello.seg_counts_buf");
     let blend_spill_buf =
         ResourceProxy::Buffer(BufferProxy::new(buffer_sizes.blend_spill.size_in_bytes().into(), "vello.blend_spill"));
+    let effect_params_buf = ResourceProxy::Buffer(BufferProxy::new(256, "vello.effect_params"));
 
     // === shared front-end (once) === pathtag reduce/scan → draw reduce/leaf → clip reduce/leaf.
     let reduced_buf =
@@ -332,14 +334,14 @@ pub(crate) fn render_encoding_phased(
                 recording.dispatch(
                     fine_area,
                     wg_counts.fine,
-                    [config_buf, segments_buf, ptcl_buf, info_bin_data_buf, blend_spill_buf, ResourceProxy::Image(out_image), gradient_image, image_atlas],
+                    [config_buf, segments_buf, ptcl_buf, info_bin_data_buf, blend_spill_buf, ResourceProxy::Image(out_image), gradient_image, image_atlas, effect_params_buf],
                 );
             }
             Some(base) => {
                 recording.dispatch(
                     fine_area_load,
                     wg_counts.fine,
-                    [config_buf, segments_buf, ptcl_buf, info_bin_data_buf, blend_spill_buf, ResourceProxy::Image(out_image), gradient_image, image_atlas, ResourceProxy::Image(base)],
+                    [config_buf, segments_buf, ptcl_buf, info_bin_data_buf, blend_spill_buf, ResourceProxy::Image(out_image), gradient_image, image_atlas, effect_params_buf, ResourceProxy::Image(base)],
                 );
             }
         }
@@ -369,6 +371,7 @@ pub(crate) fn render_encoding_phased(
     recording.free_resource(path_buf);
     recording.free_resource(seg_counts_buf);
     recording.free_resource(blend_spill_buf);
+    recording.free_resource(effect_params_buf);
     recording.free_resource(gradient_image);
 
     (recording, out_images)
@@ -412,6 +415,7 @@ pub struct PhasedSession {
     path_buf: ResourceProxy,
     seg_counts_buf: ResourceProxy,
     blend_spill_buf: ResourceProxy,
+    effect_params_buf: ResourceProxy,
     width: u32,
     height: u32,
     /// `draw_reduce`/`draw_leaf`/clip read `path_bbox` (produced by the per-phase `flatten`), so they
@@ -443,6 +447,7 @@ pub(crate) fn begin_phased(
     shaders: &FullShaders,
     persistent_image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
+    effect_params: &[u8],
 ) -> (PhasedSession, Recording) {
     use vello_encoding::RenderConfig;
     assert!(
@@ -526,6 +531,10 @@ pub(crate) fn begin_phased(
         ResourceProxy::new_buf(buffer_sizes.seg_counts.size_in_bytes().into(), "vello.seg_counts_buf");
     let blend_spill_buf =
         ResourceProxy::Buffer(BufferProxy::new(buffer_sizes.blend_spill.size_in_bytes().into(), "vello.blend_spill"));
+    // Effects-in-fine: upload this frame's per-effect chain descriptors (empty → a zeroed dummy so the
+    // binding is always valid). fine reads them at each inline CMD_EFFECT marker via its `p2` offset.
+    let ep_bytes: Vec<u8> = if effect_params.is_empty() { vec![0u8; 256] } else { effect_params.to_vec() };
+    let effect_params_buf: ResourceProxy = recording.upload("vello.effect_params", ep_bytes).into();
 
     // Shared front-end (once): pathtag reduce/scan. draw/clip are deferred into the first phase
     // (they read `path_bbox`, produced by that phase's flatten).
@@ -578,6 +587,7 @@ pub(crate) fn begin_phased(
         path_buf,
         seg_counts_buf,
         blend_spill_buf,
+        effect_params_buf,
         width: params.width,
         height: params.height,
         did_draw_frontend: false,
@@ -687,14 +697,14 @@ pub(crate) fn record_phase(
             recording.dispatch(
                 fine_area,
                 wg_counts.fine,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf],
             );
         }
         Some(base) => {
             recording.dispatch(
                 fine_area_load,
                 wg_counts.fine,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, ResourceProxy::Image(base)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
             );
         }
     }
@@ -817,14 +827,14 @@ pub(crate) fn record_fine_segment(
             recording.dispatch(
                 fine_area,
                 wg_counts.fine,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf],
             );
         }
         Some(base) => {
             recording.dispatch(
                 fine_area_load,
                 wg_counts.fine,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, ResourceProxy::Image(base)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
             );
         }
     }
@@ -893,6 +903,7 @@ pub(crate) fn record_phased_frees(session: &PhasedSession) -> Recording {
     recording.free_resource(session.path_buf);
     recording.free_resource(session.seg_counts_buf);
     recording.free_resource(session.blend_spill_buf);
+    recording.free_resource(session.effect_params_buf);
     recording.free_resource(session.gradient_image);
     recording
 }
@@ -1328,6 +1339,7 @@ impl Render {
             gradient_image,
             info_bin_data_buf,
             blend_spill_buf: ResourceProxy::Buffer(blend_spill_buf),
+            effect_params_buf: ResourceProxy::Buffer(BufferProxy::new(256, "vello.effect_params")),
             image_atlas: ResourceProxy::Image(image_atlas),
             out_image,
         });
@@ -1382,6 +1394,7 @@ impl Render {
                         ResourceProxy::Image(fine.out_image),
                         fine.gradient_image,
                         fine.image_atlas,
+                        fine.effect_params_buf,
                     ],
                 );
             }
@@ -1416,6 +1429,7 @@ impl Render {
                         ResourceProxy::Image(fine.out_image),
                         fine.gradient_image,
                         fine.image_atlas,
+                        fine.effect_params_buf,
                         self.mask_buf.unwrap(),
                     ],
                 );
@@ -1428,6 +1442,7 @@ impl Render {
         recording.free_resource(fine.gradient_image);
         recording.free_resource(fine.info_bin_data_buf);
         recording.free_resource(fine.blend_spill_buf);
+        recording.free_resource(fine.effect_params_buf);
         // TODO: make mask buf persistent
         if let Some(mask_buf) = self.mask_buf.take() {
             recording.free_resource(mask_buf);

@@ -220,6 +220,8 @@ pub(crate) fn full_shaders(
         Image(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
+        // Effects-in-fine chain descriptors (binding 8, every permutation).
+        BufReadOnly,
         // Mask LUT buffer, used only when MSAA is enabled.
         BufReadOnly,
     ];
@@ -234,6 +236,8 @@ pub(crate) fn full_shaders(
         Image(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
+        // Effects-in-fine chain descriptors (binding 8); base_in follows at binding 9.
+        BufReadOnly,
         ImageRead(ImageFormat::Rgba8),
     ];
 
@@ -267,6 +271,8 @@ pub(crate) fn full_shaders(
         ImageReadWrite(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
+        // Effects-in-fine chain descriptors (binding 8).
+        BufReadOnly,
     ];
     // Building the pipeline eagerly creates its bind group layout, and a ReadWrite rgba8unorm
     // storage entry is a validation error on a device without adapter-specific format features —
