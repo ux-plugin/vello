@@ -1400,8 +1400,15 @@ fn main(
             // 24-float (6-vec4) unit uniform]. The driver flip enables this by emitting the sentinel
             // id + descriptor; until then no marker sets it, so this branch never runs and fine
             // steps over the marker exactly as before.
-            if effect_id >= EFFECT_INLINE_BASE && seg_current >= config.seg_lo
-                && (config.seg_target == SEG_ALL || seg_current < config.seg_target) {
+            // A pointwise inline effect runs over the FORWARD accumulator — it belongs to the segment
+            // it closes (`seg_current`). A WARP samples the MATERIALIZED backdrop, so it must run in
+            // the RELOAD window after that backdrop is a finished `base_in` — it keys on the marker's
+            // own `round`, one segment later. `effect_params[base]` (bits) carries the WARP flag.
+            let inline_base = ptcl[cmd_ix + 4u];
+            let inline_warp = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 32u) != 0u;
+            let inline_key = select(seg_current, round, inline_warp);
+            if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
+                && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
                 let base = ptcl[cmd_ix + 4u];
                 let bits = u32(effect_params[base]);
                 let program = u32(effect_params[base + 1u]);
@@ -1412,14 +1419,31 @@ fn main(
                 }
                 let shade = (bits & 8u) != 0u;
                 let maskmix = (bits & 16u) != 0u;
+                // A WARP head (bit 32) samples the MATERIALIZED backdrop at a field-computed
+                // displacement — a gather that only a reload round can serve, since `base_in` is the
+                // finished prior surface (reading the in-place `rw_accum` at a displaced, cross-tile
+                // offset would race). Its self-clip coverage is the field's SDF mask (`fld.a`), not the
+                // shape silhouette in `area[i]` that a pointwise backdrop effect uses.
+                let warp = (bits & 32u) != 0u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                     let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
                     let fld = fx_computeField(program, u, px);
-                    let eff = fx_applyPointwise(bits, shade, maskmix, rgba[i], rgba[i], fld, u);
+                    var value = rgba[i];
+                    var orig = rgba[i];
+                    var cov = area[i];
+#ifdef load_base
+                    if warp {
+                        let ipx = vec2<i32>(i32(px.x), i32(px.y));
+                        value = textureLoad(base_in, vec2<i32>(i32(px.x + fld.x), i32(px.y + fld.y)), 0);
+                        orig = textureLoad(base_in, ipx, 0);
+                        cov = fld.a;
+                    }
+#endif
+                    let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);
                     // Masked by the shape's coverage, which the inline effect's `CmdFill` (emitted by
                     // coarse just before this marker) left in `area[i]` — so the effect is confined to
                     // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
-                    rgba[i] = mix(rgba[i], eff, area[i]);
+                    rgba[i] = mix(rgba[i], eff, cov);
                 }
             }
             if config.seg_target != SEG_ALL && round >= config.seg_target {
