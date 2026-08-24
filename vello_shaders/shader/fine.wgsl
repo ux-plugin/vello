@@ -1407,6 +1407,8 @@ fn main(
             let inline_base = ptcl[cmd_ix + 4u];
             // A head that samples base_in (WARP 32, BLUR 64) must run in the reload window where
             // base_in is bound → key on the marker's own round. Pointwise keys on the segment it closes.
+            // A separable blur is TWO markers (H then V), each at its own round — the executor runs each
+            // dumbly and never knows it is "pass 2"; the planner ordered them.
             let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 96u) != 0u;
             let inline_key = select(seg_current, round, inline_reads_base);
             if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
@@ -1446,30 +1448,20 @@ fn main(
                         cov = fld.a;
                     }
                     if blur {
+                        // Separable 1D pass along the axis the DESCRIPTOR carries (u[0].xy) — the
+                        // planner set it (H marker (1,0), V marker (0,1)); the shader assumes nothing.
                         let dims = vec2<i32>(textureDimensions(base_in));
                         let sigma = max(u[0].z, 0.5);
                         let radius = i32(ceil(3.0 * sigma));
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
-                        let separable = (abs(u[0].x) + abs(u[0].y)) > 0.5;
+                        let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
-                        if separable {
-                            for (var tt = -radius; tt <= radius; tt = tt + 1) {
-                                let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
-                                let off = vec2<i32>(i32(u[0].x * f32(tt)), i32(u[0].y * f32(tt)));
-                                let sp = clamp(ipx + off, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-                                acc = acc + w * textureLoad(base_in, sp, 0);
-                                wsum = wsum + w;
-                            }
-                        } else {
-                            for (var ty = -radius; ty <= radius; ty = ty + 1) {
-                                for (var tx = -radius; tx <= radius; tx = tx + 1) {
-                                    let w = exp(-0.5 * f32(tx * tx + ty * ty) / (sigma * sigma));
-                                    let sp = clamp(ipx + vec2<i32>(tx, ty), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-                                    acc = acc + w * textureLoad(base_in, sp, 0);
-                                    wsum = wsum + w;
-                                }
-                            }
+                        for (var tt = -radius; tt <= radius; tt = tt + 1) {
+                            let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
+                            let sp = clamp(ipx + axis * tt, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+                            acc = acc + w * textureLoad(base_in, sp, 0);
+                            wsum = wsum + w;
                         }
                         value = acc / wsum;
                     }
