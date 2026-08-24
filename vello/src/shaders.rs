@@ -40,6 +40,10 @@ pub struct FullShaders {
     /// `fine_area` with `load_base`: composites over a `base_in` texture (the previous phase's output)
     /// instead of clearing — the whole-viewport gather phasing.
     pub fine_area_load: Option<ShaderId>,
+    /// `fine_area_load` with `have_draft`: a second sampled input `draft_in` at binding 10 — a
+    /// separable blur's V pass samples the H pass's unmasked result here while `base_in` holds the
+    /// original backdrop, so the silhouette mask applies exactly once.
+    pub fine_area_load_draft: Option<ShaderId>,
     /// `fine_area` with `rw_accum`: the output is bound READ-WRITE and updated in place — one
     /// accumulator, no ping-pong; a tile with no work in the dispatch window returns untouched.
     /// Only valid on devices with rgba8unorm read-write storage.
@@ -240,6 +244,22 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::Rgba8),
     ];
+    // `fine_area_load_draft`: `fine_area_load` plus a second sampled input `draft_in` at binding 10 —
+    // a separable blur's V pass reads its H pass's UNMASKED result from here while `base_in` still
+    // holds the original backdrop, so the silhouette mask applies exactly once.
+    let fine_resources_load_draft = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+    ];
 
     let aa_support = &options.antialiasing_support;
     let fine_area = if aa_support.area {
@@ -255,6 +275,15 @@ pub(crate) fn full_shaders(
         Some(add_shader!(
             fine_area_load,
             fine_resources_load,
+            CpuShaderType::Missing
+        ))
+    } else {
+        None
+    };
+    let fine_area_load_draft = if aa_support.area {
+        Some(add_shader!(
+            fine_area_load_draft,
+            fine_resources_load_draft,
             CpuShaderType::Missing
         ))
     } else {
@@ -332,6 +361,7 @@ pub(crate) fn full_shaders(
         path_tiling,
         fine_area,
         fine_area_load,
+        fine_area_load_draft,
         fine_area_rw,
         fine_msaa8,
         fine_msaa16,

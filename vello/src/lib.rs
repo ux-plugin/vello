@@ -758,6 +758,46 @@ impl Renderer {
         Ok(())
     }
 
+    /// Dispatch the `fine_area_load_draft` permutation for one window `[seg_lo, seg_target)`: like
+    /// [`Self::phased_fine_segment_into`] with a base, plus a second sampled input `draft` at binding
+    /// 10 — a separable blur's V pass, which reads its blur taps from `draft` (its H pass's unmasked
+    /// result) and its margin from `base` (the original backdrop).
+    pub fn phased_fine_segment_draft_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        seg_lo: u32,
+        seg_target: u32,
+        base: &TextureView,
+        draft: &TextureView,
+        out: &TextureView,
+    ) -> Result<()> {
+        let out_image = session.new_out_image();
+        let base_image = session.new_out_image();
+        let draft_image = session.new_out_image();
+        let recording =
+            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, out_image);
+        let external_resources = [
+            ExternalResource::Image(out_image, out),
+            ExternalResource::Image(base_image, base),
+            ExternalResource::Image(draft_image, draft),
+        ];
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_fine_segment_draft_into",
+        )?;
+        Ok(())
+    }
+
     /// Dispatch the READ-WRITE fine permutation for one tile-round window `[seg_lo, seg_target)`:
     /// the accumulator `target` is updated IN PLACE through one rgba8unorm read-write storage
     /// binding — no base texture, no ping-pong — and a tile with no work in the window returns

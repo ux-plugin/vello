@@ -72,6 +72,16 @@ var<storage> effect_params: array<f32>;
 var base_in: texture_2d<f32>;
 #endif
 
+// A separable blur's SECOND pass reads its first pass's UNMASKED result from here — a "draft" the
+// planner had the first pass write to (out = draft) while `base_in` still holds the original backdrop.
+// Two sampled inputs let the V pass take its blur taps from the H result (the draft) and its
+// margin/pass-through pixels from the original (base_in), so the silhouette mask is applied exactly
+// once, at composite. Present only in the `have_draft` permutation (the V dispatch).
+#ifdef have_draft
+@group(0) @binding(10)
+var draft_in: texture_2d<f32>;
+#endif
+
 // MSAA-only bindings and utilities
 #ifdef msaa
 
@@ -1451,15 +1461,14 @@ fn main(
                 // offset would race). Its self-clip coverage is the field's SDF mask (`fld.a`), not the
                 // shape silhouette in `area[i]` that a pointwise backdrop effect uses.
                 let warp = (bits & 32u) != 0u;
-                // A blur arm (BLUR 64): one 2D Gaussian gather of sigma u[0].z over `base_in`, the
-                // finished prior surface. It is deliberately a SINGLE marker, not a separable H+V pair:
-                // a separable blur would have to store its first-pass (unmasked) result somewhere the
-                // second pass can read, and the only shared surface here is the accumulator — which
-                // holds every other shape too, so writing an unmasked intermediate there clips to the
-                // silhouette (its coverage) and the second pass reads holes. Reading `base_in` directly
-                // and compositing masked ONCE (below) is correct for ANY silhouette; full-frame is just
-                // the case where the mask is the whole viewport. Separable is a later perf layer and
-                // needs a private scratch, not a special case here. O(r²), no pipeline.
+                // A blur arm (BLUR 64) is SEPARABLE — two markers, each one 1D Gaussian pass of sigma
+                // u[0].z along the axis the descriptor carries (u[0].xy: H = (1,0), V = (0,1)). The H
+                // pass reads the backdrop (`base_in`) and writes its result UNMASKED to a draft (the
+                // planner points its `out` at the draft, cov = 1 below); the V pass reads that draft
+                // (`draft_in`) and composites masked ONCE. Splitting the mask off the first pass is the
+                // whole point: an in-place separable blur would clip its intermediate to the silhouette
+                // and the second pass would read holes. O(r), not O(r²). The V pass is the `have_draft`
+                // permutation; the H pass is plain `load_base`.
                 let blur = (bits & 64u) != 0u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                     let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
@@ -1475,10 +1484,10 @@ fn main(
                         cov = fld.a;
                     }
                     if blur {
-                        let dims = vec2<i32>(textureDimensions(base_in));
                         let sigma = max(u[0].z, 0.5);
                         let radius = i32(ceil(3.0 * sigma));
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
+                        let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
                         let inv2s2 = 1.0 / (2.0 * sigma * sigma);
                         // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
                         // tap is the background colour, and the blur FADES toward it at the true edge
@@ -1486,18 +1495,29 @@ fn main(
                         let bg = fx_premul_srgb_to_lin(unpack4x8unorm(config.base_color));
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
-                        for (var ty = -radius; ty <= radius; ty = ty + 1) {
-                            let wy = exp(-f32(ty * ty) * inv2s2);
-                            for (var tx = -radius; tx <= radius; tx = tx + 1) {
-                                let w = wy * exp(-f32(tx * tx) * inv2s2);
-                                let sp = ipx + vec2<i32>(tx, ty);
-                                let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                                let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
-                                acc = acc + w * tap;
-                                wsum = wsum + w;
-                            }
+                        for (var tt = -radius; tt <= radius; tt = tt + 1) {
+                            let w = exp(-f32(tt * tt) * inv2s2);
+                            let sp = ipx + axis * tt;
+#ifdef have_draft
+                            let dims = vec2<i32>(textureDimensions(draft_in));
+                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
+                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(draft_in, sp, 0)), inb);
+#else
+                            let dims = vec2<i32>(textureDimensions(base_in));
+                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
+                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
+#endif
+                            acc = acc + w * tap;
+                            wsum = wsum + w;
                         }
+                        // Both passes store sRGB — the H pass's 8-bit draft then matches the per-shape
+                        // oracle's own sRGB separable intermediate (full-frame is 0 px against it).
                         value = fx_premul_lin_to_srgb(acc / wsum);
+                        // The H pass writes the draft UNMASKED (its `out` is the draft, not the frame),
+                        // so the V pass has the full blurred field to sample; only the V pass masks.
+#ifndef have_draft
+                        cov = 1.0;
+#endif
                     }
 #endif
                     let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);

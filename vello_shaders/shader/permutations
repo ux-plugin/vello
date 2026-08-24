@@ -4,6 +4,7 @@ pathtag_scan
 fine
 + fine_area
 + fine_area_load: load_base
++ fine_area_load_draft: load_base have_draft
 + fine_area_rw: rw_accum
 + fine_msaa8: msaa msaa8
 + fine_msaa16: msaa msaa16

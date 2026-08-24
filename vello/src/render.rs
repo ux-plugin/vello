@@ -842,6 +842,41 @@ pub(crate) fn record_fine_segment(
     recording
 }
 
+/// Dispatch the `fine_area_load_draft` permutation for one window `[seg_lo, seg_target)`: like
+/// [`record_fine_segment`] with a base, plus a second sampled input `draft` at binding 10. A separable
+/// blur's V pass reads its blur taps from `draft` (its H pass's unmasked result) and its
+/// margin/pass-through pixels from `base` (the original backdrop), so the mask applies once.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_draft(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    base: ImageProxy,
+    draft: ImageProxy,
+    out_image: ImageProxy,
+) -> Recording {
+    let fine_area_load_draft = shaders
+        .fine_area_load_draft
+        .expect("separable blur needs the fine_area_load_draft shader");
+    let wg_counts = &session.cpu_config.workgroup_counts;
+    let mut recording = Recording::default();
+
+    let mut seg_cfg = session.cpu_config.gpu;
+    seg_cfg.seg_lo = seg_lo;
+    seg_cfg.seg_target = seg_target;
+    let config_buf =
+        ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
+
+    recording.dispatch(
+        fine_area_load_draft,
+        wg_counts.fine,
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(draft)],
+    );
+    recording.free_resource(config_buf);
+    recording
+}
+
 /// Dispatch the READ-WRITE fine permutation for one tile-round window `[seg_lo, seg_target)` of the
 /// shared PTCL: the accumulator is updated in place through one `rgba8unorm` read-write storage
 /// binding — no base texture, no ping-pong — and a tile with no work in the window returns before
