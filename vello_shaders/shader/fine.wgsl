@@ -1477,12 +1477,18 @@ fn main(
                         let radius = i32(ceil(3.0 * sigma));
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
                         let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
+                        // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
+                        // tap is the background colour, and the blur FADES toward it at the true edge
+                        // (matching tiled, which blurs an isolated crop cleared to the page).
+                        let bg = fx_premul_srgb_to_lin(unpack4x8unorm(config.base_color));
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
                         for (var tt = -radius; tt <= radius; tt = tt + 1) {
                             let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
-                            let sp = clamp(ipx + axis * tt, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-                            acc = acc + w * fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0));
+                            let sp = ipx + axis * tt;
+                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
+                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
+                            acc = acc + w * tap;
                             wsum = wsum + w;
                         }
                         value = fx_premul_lin_to_srgb(acc / wsum);
