@@ -1405,8 +1405,10 @@ fn main(
             // the RELOAD window after that backdrop is a finished `base_in` — it keys on the marker's
             // own `round`, one segment later. `effect_params[base]` (bits) carries the WARP flag.
             let inline_base = ptcl[cmd_ix + 4u];
-            let inline_warp = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 32u) != 0u;
-            let inline_key = select(seg_current, round, inline_warp);
+            // A head that samples base_in (WARP 32, BLUR 64) must run in the reload window where
+            // base_in is bound → key on the marker's own round. Pointwise keys on the segment it closes.
+            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 96u) != 0u;
+            let inline_key = select(seg_current, round, inline_reads_base);
             if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
                 && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
                 let base = ptcl[cmd_ix + 4u];
@@ -1425,6 +1427,11 @@ fn main(
                 // offset would race). Its self-clip coverage is the field's SDF mask (`fld.a`), not the
                 // shape silhouette in `area[i]` that a pointwise backdrop effect uses.
                 let warp = (bits & 32u) != 0u;
+                // A blur arm (BLUR 64): sample base_in over a Gaussian kernel of sigma u[0].z. When
+                // u[0].xy is an axis it is one separable pass (2·⌈3σ⌉+1 taps; two markers H then V give
+                // the O(r) blur); when u[0].xy is (0,0) it is a single-pass 2D kernel (O(r²), one
+                // marker — the small-blur-inline case). Either way the blur is a fine arm, no pipeline.
+                let blur = (bits & 64u) != 0u;
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                     let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
                     let fld = fx_computeField(program, u, px);
@@ -1437,6 +1444,34 @@ fn main(
                         value = textureLoad(base_in, vec2<i32>(i32(px.x + fld.x), i32(px.y + fld.y)), 0);
                         orig = textureLoad(base_in, ipx, 0);
                         cov = fld.a;
+                    }
+                    if blur {
+                        let dims = vec2<i32>(textureDimensions(base_in));
+                        let sigma = max(u[0].z, 0.5);
+                        let radius = i32(ceil(3.0 * sigma));
+                        let ipx = vec2<i32>(i32(px.x), i32(px.y));
+                        let separable = (abs(u[0].x) + abs(u[0].y)) > 0.5;
+                        var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+                        var wsum = 0.0;
+                        if separable {
+                            for (var tt = -radius; tt <= radius; tt = tt + 1) {
+                                let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
+                                let off = vec2<i32>(i32(u[0].x * f32(tt)), i32(u[0].y * f32(tt)));
+                                let sp = clamp(ipx + off, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+                                acc = acc + w * textureLoad(base_in, sp, 0);
+                                wsum = wsum + w;
+                            }
+                        } else {
+                            for (var ty = -radius; ty <= radius; ty = ty + 1) {
+                                for (var tx = -radius; tx <= radius; tx = tx + 1) {
+                                    let w = exp(-0.5 * f32(tx * tx + ty * ty) / (sigma * sigma));
+                                    let sp = clamp(ipx + vec2<i32>(tx, ty), vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
+                                    acc = acc + w * textureLoad(base_in, sp, 0);
+                                    wsum = wsum + w;
+                                }
+                            }
+                        }
+                        value = acc / wsum;
                     }
 #endif
                     let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);
