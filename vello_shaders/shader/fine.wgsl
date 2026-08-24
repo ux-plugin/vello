@@ -1488,7 +1488,14 @@ fn main(
             // base_in is bound → key on the marker's own round. Pointwise keys on the segment it closes.
             // A separable blur is TWO markers (H then V), each at its own round — the executor runs each
             // dumbly and never knows it is "pass 2"; the planner ordered them.
+#ifdef have_input
+            // Every link that rides the have_input permutation (a frosted lens's blur-H, scatter, and
+            // tail shade+maskmix) reads a MATERIALISED surface — the previous link's output — so like a
+            // WARP/BLUR head it keys on its own RELOAD round, not the segment it closes.
+            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE;
+#else
             let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 96u) != 0u;
+#endif
             let inline_key = select(seg_current, round, inline_reads_base);
             if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
                 && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
@@ -1566,10 +1573,15 @@ fn main(
                         let ipx = vec2<i32>(i32(px.x), i32(px.y));
                         let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
                         let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+                        // A background blur mixes in LINEAR light (`EffectPass::Blur { linear: true }`);
+                        // a frosted LENS blur mixes in sRGB (`linear: false`), matching its batched oracle.
+                        // Bit 1024 selects sRGB: taps are summed raw, no decode/encode around the kernel.
+                        let srgb_blur = (bits & 1024u) != 0u;
                         // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
                         // tap is the background colour, and the blur FADES toward it at the true edge
                         // (matching tiled, which blurs an isolated crop cleared to the page).
-                        let bg = fx_premul_srgb_to_lin(unpack4x8unorm(config.base_color));
+                        let bgraw = unpack4x8unorm(config.base_color);
+                        let bg = select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur);
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
                         for (var tt = -radius; tt <= radius; tt = tt + 1) {
@@ -1579,28 +1591,29 @@ fn main(
                             // V pass: taps the H-pass result in the draft (a frosted lens's draft holds
                             // its H-blurred WARP, a background blur's holds its H-blurred backdrop).
                             let dims = vec2<i32>(textureDimensions(draft_in));
-                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(draft_in, sp, 0)), inb);
+                            let rawtap = textureLoad(draft_in, sp, 0);
 #else
 #ifdef have_input
                             // Frosted lens H pass: taps the WARPED surface (the previous link's output),
                             // routed to `input_in`, not the raw backdrop.
                             let dims = vec2<i32>(textureDimensions(input_in));
-                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(input_in, sp, 0)), inb);
+                            let rawtap = textureLoad(input_in, sp, 0);
 #else
                             // Background blur H pass: taps the backdrop.
                             let dims = vec2<i32>(textureDimensions(base_in));
+                            let rawtap = textureLoad(base_in, sp, 0);
+#endif
+#endif
                             let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                            let tap = select(bg, fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0)), inb);
-#endif
-#endif
+                            let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
+                            let tap = select(bg, tapc, inb);
                             acc = acc + w * tap;
                             wsum = wsum + w;
                         }
-                        // Both passes store sRGB — the H pass's 8-bit draft then matches the per-shape
-                        // oracle's own sRGB separable intermediate (full-frame is 0 px against it).
-                        value = fx_premul_lin_to_srgb(acc / wsum);
+                        // Store sRGB either way: a linear-mixed blur re-encodes here; an sRGB-mixed blur
+                        // (frosted lens) already summed sRGB taps. The H pass's 8-bit draft then matches
+                        // the per-shape oracle's own separable intermediate.
+                        value = select(fx_premul_lin_to_srgb(acc / wsum), acc / wsum, srgb_blur);
                         // The H pass writes the draft UNMASKED (its `out` is the draft, not the frame),
                         // so the V pass has the full blurred field to sample; only the V pass masks.
 #ifndef have_draft
