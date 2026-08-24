@@ -1087,6 +1087,28 @@ fn fill_path(fill: CmdFill, xy: vec2<f32>, result: ptr<function, array<f32, PIXE
 // are barrier/post-fine markers fine only steps over. The driver assigns inline ids from this base.
 const EFFECT_INLINE_BASE: u32 = 100u;
 
+// sRGB<->linear for premultiplied colours — the background blur composites in LINEAR light (matching
+// batch.rs `premul_srgb_to_lin`/`premul_lin_to_srgb`), so a fine BLUR arm must too or its high-contrast
+// edges drift from the batched blur.
+fn fx_srgb_to_lin(c: f32) -> f32 {
+    if (c <= 0.04045) { return c / 12.92; }
+    return pow((c + 0.055) / 1.055, 2.4);
+}
+fn fx_lin_to_srgb(c: f32) -> f32 {
+    if (c <= 0.0031308) { return c * 12.92; }
+    return 1.055 * pow(c, 1.0 / 2.4) - 0.055;
+}
+fn fx_premul_srgb_to_lin(s: vec4<f32>) -> vec4<f32> {
+    let a = max(s.a, 1e-5);
+    let st = s.rgb / a;
+    return vec4<f32>(vec3<f32>(fx_srgb_to_lin(st.r), fx_srgb_to_lin(st.g), fx_srgb_to_lin(st.b)) * a, s.a);
+}
+fn fx_premul_lin_to_srgb(s: vec4<f32>) -> vec4<f32> {
+    let a = max(s.a, 1e-5);
+    let st = s.rgb / a;
+    return vec4<f32>(vec3<f32>(fx_lin_to_srgb(st.r), fx_lin_to_srgb(st.g), fx_lin_to_srgb(st.b)) * a, s.a);
+}
+
 // ============================================================================================
 // Effects-in-fine (Phase B): the built-in field programs and pointwise unit bodies, baked as PURE
 // functions of a 6-vec4 uniform block `u` (the same 24-float layout `units_uniform`/`field_prelude`
@@ -1460,10 +1482,10 @@ fn main(
                         for (var tt = -radius; tt <= radius; tt = tt + 1) {
                             let w = exp(-0.5 * f32(tt * tt) / (sigma * sigma));
                             let sp = clamp(ipx + axis * tt, vec2<i32>(0, 0), dims - vec2<i32>(1, 1));
-                            acc = acc + w * textureLoad(base_in, sp, 0);
+                            acc = acc + w * fx_premul_srgb_to_lin(textureLoad(base_in, sp, 0));
                             wsum = wsum + w;
                         }
-                        value = acc / wsum;
+                        value = fx_premul_lin_to_srgb(acc / wsum);
                     }
 #endif
                     let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);
