@@ -1631,10 +1631,18 @@ fn main(
                         // Bit 1024 selects sRGB: taps are summed raw, no decode/encode around the kernel.
                         let srgb_blur = (bits & 1024u) != 0u;
                         // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
-                        // tap is the background colour, and the blur FADES toward it at the true edge
-                        // (matching tiled, which blurs an isolated crop cleared to the page).
+                        // tap is the background colour, and a BACKDROP blur FADES toward it at the true edge
+                        // (matching tiled, which blurs an isolated crop cleared to the page). A SHADOW blur
+                        // (bit 2048) instead blurs a SILHOUETTE over transparency — beyond the viewport
+                        // there is no shadow, so its OOB tap is transparent 0, not the opaque page (else the
+                        // silhouette blur reads the page's alpha=1 as coverage and haloes the viewport edge).
+                        let shadow_edge = (bits & 2048u) != 0u;
                         let bgraw = unpack4x8unorm(config.base_color);
-                        let bg = select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur);
+                        let bg = select(
+                            select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur),
+                            vec4<f32>(0.0, 0.0, 0.0, 0.0),
+                            shadow_edge,
+                        );
                         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
                         var wsum = 0.0;
                         for (var tt = -radius; tt <= radius; tt = tt + 1) {
