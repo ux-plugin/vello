@@ -1283,6 +1283,53 @@ fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
     let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
     return vec4<f32>(dpx.x, dpx.y, specular, mask);
 }
+#ifdef have_input
+// The SHAPE-FOLLOWING lens distance: instead of the analytic rounded box, read a baked signed-distance
+// field of the real outline from `input_in` — the SDF scratch the scheduler binds for this marker. The
+// scratch is VIEWPORT-sized and each sampled lens's field is baked at its own DEVICE pixels (disjoint
+// lenses pack into one texture, exactly like the frost chain's scratch), so the field is sampled at the
+// device coordinate `fc` directly — no per-shape uv. The texel stores `0.5 + d / decode` (see
+// `vello::sdf`), so `d` decodes as `(texel − 0.5) · decode`; `decode` = `u[1].z` (the slot the analytic
+// path uses for the corner).
+fn fx_fieldDistance_lens_sampled(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> f32 {
+    let decode = u[1].z;
+    let fp = fc - vec2<f32>(0.5, 0.5);
+    let fl = floor(fp);
+    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
+    let f = fp - fl;
+    let s00 = textureLoad(input_in, i0, 0).r;
+    let s10 = textureLoad(input_in, i0 + vec2<i32>(1, 0), 0).r;
+    let s01 = textureLoad(input_in, i0 + vec2<i32>(0, 1), 0).r;
+    let s11 = textureLoad(input_in, i0 + vec2<i32>(1, 1), 0).r;
+    let texel = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+    return (texel - 0.5) * decode;
+}
+// Identical to `fx_computeField_lens` except the distance `n0` comes from the baked field, so the whole
+// refraction/ramp/coverage assembly follows the arbitrary outline rather than a box.
+fn fx_computeField_lens_sampled(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+    let scale = u[4].x;
+    let localPos = fc - u[0].zw;
+    let n0 = fx_fieldDistance_lens_sampled(u, fc);
+    if (n0 > 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
+    let n1 = fx_ramp(n0, min(u[2].x, min(u[1].x, u[1].y)));
+    let n2 = fx_radialDirection(localPos, u[1].xy, u[3].x, u[3].y);
+    let n3 = fx_refract(n1, u[2].y, u[2].z, i32(u[1].w));
+    let n4 = fx_coverage(n0, 1.5 * u[4].x);
+    let edgeT = n1;
+    let dir = n2;
+    let refracted = n3;
+    let mask = n4;
+    let bezel = min(u[2].x, min(u[1].x, u[1].y));
+    var disp = refracted * scale;
+    let edgeFade = pow(1.0 - edgeT, 1.5);
+    disp = disp * (1.0 + u[3].z * edgeFade);
+    var dpx = dir * disp;
+    let zoomFactor = 1.0 / max(u[3].w, 0.1) - 1.0;
+    dpx = dpx + localPos * zoomFactor;
+    let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
+    return vec4<f32>(dpx.x, dpx.y, specular, mask);
+}
+#endif
 fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
     let n0 = fx_fractalNoise(fc / max(u[0].w, 1.0));
     let n1 = ((n0.rg - vec2<f32>(0.5, 0.5)) * u[0].z);
@@ -1300,6 +1347,9 @@ fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
 // here; this serves the field-measuring pointwise units (shade/maskmix) that read a field per pixel.
 fn fx_computeField(program: u32, u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
     if (program == 1u) { return fx_computeField_lens(u, fc); }
+#ifdef have_input
+    if (program == 4u) { return fx_computeField_lens_sampled(u, fc); }
+#endif
     if (program == 2u) { return fx_computeField_texture(u, fc); }
     if (program == 3u) { return fx_computeField_radial(u, fc); }
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
