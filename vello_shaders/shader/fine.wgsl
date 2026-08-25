@@ -1535,7 +1535,10 @@ fn main(
             // own `round`, one segment later. `effect_params[base]` (bits) carries the WARP flag.
             let inline_base = ptcl[cmd_ix + 4u];
             // A head that samples base_in (WARP 32, BLUR 64) must run in the reload window where
-            // base_in is bound → key on the marker's own round. Pointwise keys on the segment it closes.
+            // base_in is bound → key on the marker's own round. A SPREAD (128) does not read base_in,
+            // but it is SCHEDULED on a round too: a drop shadow's marker composites one round BEFORE the
+            // stack's imperative body so the body lands over it, so it must key on its descriptor round,
+            // not the z-segment it closes. Plain backdrop pointwise (tint/field) keys on the segment.
             // A separable blur is TWO markers (H then V), each at its own round — the executor runs each
             // dumbly and never knows it is "pass 2"; the planner ordered them.
 #ifdef have_input
@@ -1544,7 +1547,7 @@ fn main(
             // WARP/BLUR head it keys on its own RELOAD round, not the segment it closes.
             let inline_reads_base = effect_id >= EFFECT_INLINE_BASE;
 #else
-            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & 96u) != 0u;
+            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & (96u | 128u)) != 0u;
 #endif
             let inline_key = select(seg_current, round, inline_reads_base);
             if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
@@ -1717,8 +1720,14 @@ fn main(
                     // coarse just before this marker) left in `area[i]` — so the effect is confined to
                     // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
                     if spread {
-                        // Blurred silhouette → shadow colour, premultiplied, source-OVER the layer.
-                        let a = u[3].a * value.a;
+                        // Shadow colour laid down over its coverage, premultiplied, source-OVER the
+                        // accumulator — a layer under the body. The coverage differs by whether a blur
+                        // ran: a BLURRED drop's coverage is the blurred silhouette alpha in `value.a`
+                        // (its `area[i]` is the dilated reach so it does not clip the blur), while a
+                        // SHARP drop (no blur pass) takes the rasterised offset silhouette in `area[i]`
+                        // (`cov`) directly. `u[3]` is the straight shadow colour.
+                        let scov = select(cov, value.a, blur);
+                        let a = u[3].a * scov;
                         rgba[i] = vec4<f32>(u[3].xyz * a, a) + rgba[i] * (1.0 - a);
                     } else {
                         rgba[i] = mix(rgba[i], eff, cov);
