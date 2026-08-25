@@ -1721,12 +1721,17 @@ fn main(
                     // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
                     if spread {
                         // Shadow colour laid down over its coverage, premultiplied, source-OVER the
-                        // accumulator — a layer under the body. The coverage differs by whether a blur
-                        // ran: a BLURRED drop's coverage is the blurred silhouette alpha in `value.a`
-                        // (its `area[i]` is the dilated reach so it does not clip the blur), while a
-                        // SHARP drop (no blur pass) takes the rasterised offset silhouette in `area[i]`
-                        // (`cov`) directly. `u[3]` is the straight shadow colour.
-                        let scov = select(cov, value.a, blur);
+                        // accumulator. The coverage depends on the shadow kind (all `u[3]` = colour):
+                        //  - SHARP drop (no blur): the rasterised offset silhouette in `area[i]` (`cov`).
+                        //  - BLURRED drop: the blurred silhouette alpha `value.a` (its `area[i]` is the
+                        //    dilated reach, so it does not clip the blur).
+                        //  - INNER shadow band (ERASE bit 2): the flood is the shape's own coverage
+                        //    (`area[i]`, the unoffset outline) with the offset+blurred punch (`value.a`)
+                        //    ERASED out — `cov * (1 - value.a)` — a band hugging the inside edge, OVER the
+                        //    body (this marker runs after it).
+                        let erase = (bits & 2u) != 0u;
+                        var scov = select(cov, value.a, blur);
+                        if erase { scov = cov * (1.0 - value.a); }
                         let a = u[3].a * scov;
                         rgba[i] = vec4<f32>(u[3].xyz * a, a) + rgba[i] * (1.0 - a);
                     } else {
