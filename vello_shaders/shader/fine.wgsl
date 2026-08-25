@@ -1681,6 +1681,19 @@ fn main(
                         cov = 1.0;
 #endif
                     }
+                    // TEXT INNER FLOOD (bit 4096): recover the shape's FLOOD (unoffset glyph coverage) by
+                    // sampling the OFFSET silhouette in `base_in` shifted BACK by the shadow offset (`u[1].xy`,
+                    // device px) — a Text has no glyph coverage in `area[i]` (its outline is the bounds rect).
+                    // `value.a` here is the V-blurred punch; fold the flood and the tinted erase into `value.a`
+                    // so the band composites ONE precomputed coverage (bit 8192) instead of `area[i]` * erase.
+                    // Runs in the inner's V pass (`have_draft` + `load_base`, `base_in` = the silhouette).
+                    if ((bits & 4096u) != 0u) {
+                        let fpx = vec2<i32>(i32(px.x + u[1].x), i32(px.y + u[1].y));
+                        let fdims = vec2<i32>(textureDimensions(base_in));
+                        let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
+                        let flood = select(0.0, textureLoad(base_in, fpx, 0).a, finb);
+                        value = vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * value.a));
+                    }
 #endif
 #ifdef have_input
                     // FROST SCATTER (bit 256): a 12-tap noise blur of the PRIMARY input surface (the
@@ -1741,8 +1754,13 @@ fn main(
                         //    into the erase term: `cov * (1 - alpha*value.a)`, over the body (this marker
                         //    runs after it).
                         let erase = (bits & 2u) != 0u;
+                        // A TEXT inner band reads a PRECOMPUTED coverage (bit 8192): its V pass already folded
+                        // flood*(1 - alpha*punch) into the punch scratch alpha, so `value.a` IS the band
+                        // coverage — no `area[i]` (the bounds rect for Text) and no separate erase term.
+                        let scratch_cov = (bits & 8192u) != 0u;
                         var scov = select(cov, value.a, blur);
-                        if erase { scov = cov * (1.0 - u[3].a * value.a); }
+                        if scratch_cov { scov = value.a; }
+                        else if erase { scov = cov * (1.0 - u[3].a * value.a); }
                         let a = u[3].a * scov;
                         rgba[i] = vec4<f32>(u[3].xyz * a, a) + rgba[i] * (1.0 - a);
                     } else {
