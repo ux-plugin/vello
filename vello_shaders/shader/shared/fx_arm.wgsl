@@ -58,10 +58,15 @@ fn sdfRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, r: f32) -> f32 {
 // corner radius). `u[5].w > 0.5` → the baked SDF texture (`u[1].z` is the decode scale; a sampled lens
 // has no corner, so the slot is reused). Everything that reads the distance is identical either way.
 fn fieldDistance(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
+// The unified two-source form is the runtime branch (one function, both sources). It is guarded by
+// `fx_sdf` only so a pipeline that binds no field texture (analytical glass, the initial A/B) compiles
+// without `fieldTex`; the shape-following-lens pipeline defines `fx_sdf` and gets the full unified form.
+#ifdef fx_sdf
     if (u[5].w > 0.5) {
         let uv = p / (2.0 * u[1].xy) + vec2<f32>(0.5, 0.5);
         return (textureSampleLevel(fieldTex, fieldSamp, clamp(uv, vec2<f32>(0.0), vec2<f32>(1.0)), 0.0).r - 0.5) * u[1].z;
     }
+#endif
     return sdfRoundedBox(p, u[1].xy, min(u[1].z, min(u[1].x, u[1].y)));
 }
 
