@@ -56,6 +56,14 @@ struct Config {
     // WebGPU requirement). Must be kept in sync with `ConfigUniform` in `vello_encoding/src/config.rs`.
     seg_target: u32,
     seg_lo: u32,
+    // Reach-crop offsets: device-pixel origin of this dispatch's OUTPUT scratch and INPUT scratch
+    // sub-rects. A producer writes `output` at `coords - scratch_out`; a consumer samples the
+    // draft/input at `coords - scratch_in`. Default (0,0) = full-viewport, byte-identical. Scalar u32s
+    // (not vec2) to match the tightly-packed `[u32; 2]` in ConfigUniform.
+    scratch_out_x: u32,
+    scratch_out_y: u32,
+    scratch_in_x: u32,
+    scratch_in_y: u32,
     _pad_seg0: u32,
     _pad_seg1: u32,
 }

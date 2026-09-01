@@ -430,6 +430,15 @@ impl PhasedSession {
         ImageProxy::new(self.width, self.height, ImageFormat::Rgba8)
     }
 
+    /// Set the reach-crop origins for the NEXT fine dispatch: `scratch_out` shifts where the producer
+    /// writes `output`, `scratch_in` where the consumer samples its scratch (`draft`/`input`). Each
+    /// `record_fine_segment*` consumes them into its per-dispatch config and resets to `[0, 0]`, so a
+    /// full-viewport call needs no set. `[0, 0]` for a slot means that slot is not cropped.
+    pub fn set_scratch_origins(&mut self, scratch_out: [u32; 2], scratch_in: [u32; 2]) {
+        self.cpu_config.gpu.scratch_out = scratch_out;
+        self.cpu_config.gpu.scratch_in = scratch_in;
+    }
+
     /// DEBUG: the bump buffer's resource id, for the post-frame diagnostics readback.
     pub fn debug_bump_proxy_id(&self) -> crate::recording::ResourceId {
         self.bump_buf.as_buf().unwrap().id
@@ -819,6 +828,10 @@ pub(crate) fn record_fine_segment(
     let mut seg_cfg = session.cpu_config.gpu;
     seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
+    // Consume the reach-crop origins: they apply to exactly THIS dispatch, then reset so any following
+    // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
+    session.cpu_config.gpu.scratch_out = [0; 2];
+    session.cpu_config.gpu.scratch_in = [0; 2];
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
@@ -865,6 +878,10 @@ pub(crate) fn record_fine_segment_draft(
     let mut seg_cfg = session.cpu_config.gpu;
     seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
+    // Consume the reach-crop origins: they apply to exactly THIS dispatch, then reset so any following
+    // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
+    session.cpu_config.gpu.scratch_out = [0; 2];
+    session.cpu_config.gpu.scratch_in = [0; 2];
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
@@ -901,6 +918,10 @@ pub(crate) fn record_fine_segment_input(
     let mut seg_cfg = session.cpu_config.gpu;
     seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
+    // Consume the reach-crop origins: they apply to exactly THIS dispatch, then reset so any following
+    // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
+    session.cpu_config.gpu.scratch_out = [0; 2];
+    session.cpu_config.gpu.scratch_in = [0; 2];
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
@@ -935,6 +956,10 @@ pub(crate) fn record_fine_segment_rw(
     let mut seg_cfg = session.cpu_config.gpu;
     seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
+    // Consume the reach-crop origins: they apply to exactly THIS dispatch, then reset so any following
+    // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
+    session.cpu_config.gpu.scratch_out = [0; 2];
+    session.cpu_config.gpu.scratch_in = [0; 2];
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 

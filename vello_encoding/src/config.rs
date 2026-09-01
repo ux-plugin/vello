@@ -176,6 +176,13 @@ pub struct ConfigUniform {
     /// round wherever effects don't touch; the window guarantees exactly one dispatch renders each
     /// command, in an order pixel-equivalent to the full split. Default 0.
     pub seg_lo: u32,
+    /// Device-pixel origin of this dispatch's OUTPUT scratch (`scratch_out`) and its INPUT scratch
+    /// (`scratch_in`) sub-rects — the reach-crop offsets. A producer writes `output` at
+    /// `coords - scratch_out`; a consumer samples `draft_in`/`input_in` at `coords - scratch_in`. Both
+    /// default `[0, 0]` — a full-viewport surface, so an un-cropped dispatch is byte-identical to before.
+    /// `base_in` (the backdrop) is never cropped, so it needs no origin. `_pad_seg` keeps 16-byte align.
+    pub scratch_out: [u32; 2],
+    pub scratch_in: [u32; 2],
     pub _pad_seg: [u32; 2],
 }
 
@@ -222,6 +229,8 @@ impl RenderConfig {
                 // overrides this per dispatch.
                 seg_target: SEG_ALL,
                 seg_lo: 0,
+                scratch_out: [0; 2],
+                scratch_in: [0; 2],
                 _pad_seg: [0; 2],
                 layout: *layout,
             },

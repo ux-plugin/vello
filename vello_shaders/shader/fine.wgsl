@@ -58,9 +58,9 @@ var gradients: texture_2d<f32>;
 @group(0) @binding(7)
 var image_atlas: texture_2d<f32>;
 
-// Effects-in-fine (Phase B): per-effect chain descriptors — each a header + the 24-float (6-vec4)
-// unit uniform — packed back-to-back, indexed by the CMD_EFFECT marker. Populated by the driver;
-// a 1-element dummy when no effect rides fine. Present in every permutation, so always binding 8.
+// Effects-in-fine: per-effect unit descriptors — each a header + the 24-float (6-vec4) unit
+// uniform — packed back-to-back, indexed by the CMD_EFFECT marker. Authored per DAG node by the
+// scheduler's emitter; a 1-element dummy when no effect rides fine. Always binding 8.
 @group(0) @binding(8)
 var<storage> effect_params: array<f32>;
 
@@ -86,6 +86,22 @@ fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
     let s11 = textureLoad(base_in, i0 + vec2<i32>(1, 1), 0);
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
+
+// Refracted backdrop sample for a WARP head: bilinear at `px + disp`, with CHROMATIC ABERRATION —
+// R and B sampled shifted along the displacement direction, the shift growing with |disp| so it
+// peaks at the lens rim. `ca_scale` = field scale (u[4].x), `ca_amount` = CA amount (u[4].y).
+fn fx_warp_sample(px: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32) -> vec4<f32> {
+    let bp = px + disp;
+    let dlen = length(disp);
+    let castr = smoothstep(0.0, 5.0 * ca_scale, dlen);
+    var cadir = vec2<f32>(0.0, 0.0);
+    if (dlen > 0.01 * ca_scale) { cadir = disp / dlen; }
+    let cashift = cadir * ca_amount * castr;
+    let cr = fx_bilin(bp - cashift);
+    let cg = fx_bilin(bp);
+    let cb = fx_bilin(bp + cashift);
+    return vec4<f32>(cr.r, cg.g, cb.b, cg.a);
+}
 #endif
 
 // A separable blur's SECOND pass reads its first pass's UNMASKED result from here — a "draft" the
@@ -110,10 +126,13 @@ var draft_in: texture_2d<f32>;
 var input_in: texture_2d<f32>;
 
 // Bilinear sample of the primary input surface at a continuous pixel position (see `fx_bilin`).
+// `input_in` is always a reach-cropped scratch, so the device position shifts by `scratch_in` to the
+// scratch's own frame (both zero → full-viewport, unchanged).
 fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
-    let fl = floor(pos);
+    let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
+    let fl = floor(p);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = pos - fl;
+    let f = p - fl;
     let s00 = textureLoad(input_in, i0, 0);
     let s10 = textureLoad(input_in, i0 + vec2<i32>(1, 0), 0);
     let s01 = textureLoad(input_in, i0 + vec2<i32>(0, 1), 0);
@@ -121,6 +140,13 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 #endif
+
+// Per-tile reach-crop origin of the OUTPUT scratch, in device pixels — set from a blur marker's spare
+// u[1] as fine walks this tile's PTCL. The tile-tail store shifts the write by it, so a tile whose
+// governing effect is cropped writes into its small draft while a tile with no cropped marker keeps
+// device coordinates (origin stays zero). This is what makes the crop PER-TILE, not per-dispatch:
+// reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
+var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
 
 // MSAA-only bindings and utilities
 #ifdef msaa
@@ -1160,14 +1186,9 @@ fn fx_premul_lin_to_srgb(s: vec4<f32>) -> vec4<f32> {
 }
 
 // ============================================================================================
-// Effects-in-fine (Phase B): the built-in field programs and pointwise unit bodies, baked as PURE
-// functions of a 6-vec4 uniform block `u` (the same 24-float layout `units_uniform`/`field_prelude`
-// emit in the batch path, where `u[k]` == `fieldU(gi, k)`). The CMD_EFFECT interpreter loads an
-// effect's `u` from the params buffer and calls these over the tile's accumulator `rgba[i]`. Kept
-// pure (no global reads) so the logic lands independent of the buffer/binding plumbing.
-// Generated from `field_prelude(lens_field_program())` / `field_prelude(texture_field_program())`
-// and `units_body(...)`; regenerate via the `dump_field_wgsl_for_fine` test if the builders change.
-// --- shared field operators (no uniform reads) ---
+// Effects-in-fine: field programs, unit bodies, and the CMD_EFFECT mark executors. One mark = one
+// descriptor = [bits, program, 6-vec4 unit uniform]; `main` loads the descriptor and calls ONE of
+// the executors below per pixel. Field/unit math mirrors the batched oracle byte-for-byte.
 fn fx_sdfRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, r: f32) -> f32 {
     let d = abs(p) - halfSize + vec2<f32>(r);
     return min(max(d.x, d.y), 0.0) + length(max(d, vec2<f32>(0.0))) - r;
@@ -1223,47 +1244,28 @@ fn fx_specular(t: f32, bezel: f32, lightAngle: f32, dir: vec2<f32>, scale: f32) 
     f = pow(f, 2.0);
     return band * f;
 }
-fn fx_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123); }
-// The frost SCATTER noise — a byte-for-byte port of the batched lens `HASH_PRELUDE` (units.rs). The
-// multiplier and the hash2 offsets must match the oracle EXACTLY (the arm above uses a different
-// constant), or the 12 scatter taps land elsewhere and the frost differs.
+// The frost SCATTER jitter — a byte-for-byte port of the batched lens `HASH_PRELUDE` (units.rs);
+// the multiplier and hash2 offsets must match it exactly or the 12 scatter taps land elsewhere.
 fn fx_scatter_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
 fn fx_scatter_hash2(p: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(fx_scatter_hash(p), fx_scatter_hash(p + vec2<f32>(73.7, 157.3))) * 2.0 - 1.0;
 }
-fn fx_vnoise(p: vec2<f32>, seed: f32) -> f32 {
-    let i = floor(p);
-    let f = fract(p);
-    let w = f * f * (3.0 - 2.0 * f);
-    let s = vec2<f32>(seed, 0.0);
-    let a = fx_hash(i + vec2<f32>(0.0, 0.0) + s);
-    let b = fx_hash(i + vec2<f32>(1.0, 0.0) + s);
-    let c = fx_hash(i + vec2<f32>(0.0, 1.0) + s);
-    let d = fx_hash(i + vec2<f32>(1.0, 1.0) + s);
-    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
-}
-fn fx_fbm(p: vec2<f32>, seed: f32) -> f32 {
-    var v = 0.0;
-    var amp = 0.5;
-    var freq = 1.0;
-    for (var o = 0; o < 4; o = o + 1) {
-        v = v + amp * fx_vnoise(p * freq, seed);
-        freq = freq * 2.0;
-        amp = amp * 0.5;
-    }
-    return v;
-}
-fn fx_fractalNoise(p: vec2<f32>) -> vec4<f32> {
-    return vec4<f32>(fx_fbm(p, 0.0), fx_fbm(p, 37.0), fx_fbm(p, 71.0), fx_fbm(p, 113.0));
-}
-// --- baked field programs (return (displacement.x, displacement.y, specular, mask)) ---
+// The analytic lens distance: a rounded box in lens-local coordinates (half-size u[1].xy, corner
+// radius u[1].z).
 fn fx_fieldDistance_lens(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
     return fx_sdfRoundedBox(p, u[1].xy, min(u[1].z, min(u[1].x, u[1].y)));
 }
-fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
+// The analytic lens field at a device pixel centre: (displacement.xy, specular, mask), assembled
+// from the ramp/refraction/coverage operators over the rounded-box distance.
+fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
     let scale = u[4].x;
-    let localPos = fc - u[0].zw;
-    let n0 = fx_fieldDistance_lens(u, localPos);
+    let localPos = fc - anchor;
+    var n0 = fx_fieldDistance_lens(u, localPos);
+#ifdef have_input
+    if (sampled) {
+        n0 = fx_fieldDistance_lens_sampled(fc, decode);
+    }
+#endif
     if (n0 > 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
     let n1 = fx_ramp(n0, min(u[2].x, min(u[1].x, u[1].y)));
     let n2 = fx_radialDirection(localPos, u[1].xy, u[3].x, u[3].y);
@@ -1284,15 +1286,9 @@ fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(dpx.x, dpx.y, specular, mask);
 }
 #ifdef have_input
-// The SHAPE-FOLLOWING lens distance: instead of the analytic rounded box, read a baked signed-distance
-// field of the real outline from `input_in` — the SDF scratch the scheduler binds for this marker. The
-// scratch is VIEWPORT-sized and each sampled lens's field is baked at its own DEVICE pixels (disjoint
-// lenses pack into one texture, exactly like the frost chain's scratch), so the field is sampled at the
-// device coordinate `fc` directly — no per-shape uv. The texel stores `0.5 + d / decode` (see
-// `vello::sdf`), so `d` decodes as `(texel − 0.5) · decode`; `decode` = `u[1].z` (the slot the analytic
-// path uses for the corner).
-fn fx_fieldDistance_lens_sampled(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> f32 {
-    let decode = u[1].z;
+// The shape-following lens distance: a baked signed-distance field of the real outline, read from
+// `input_in` at device pixels. The texel stores `0.5 + d / decode`; `decode` = u[1].z.
+fn fx_fieldDistance_lens_sampled(fc: vec2<f32>, decode: f32) -> f32 {
     let fp = fc - vec2<f32>(0.5, 0.5);
     let fl = floor(fp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
@@ -1304,60 +1300,66 @@ fn fx_fieldDistance_lens_sampled(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> f32 {
     let texel = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
     return (texel - 0.5) * decode;
 }
-// Identical to `fx_computeField_lens` except the distance `n0` comes from the baked field, so the whole
-// refraction/ramp/coverage assembly follows the arbitrary outline rather than a box.
-fn fx_computeField_lens_sampled(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
-    let scale = u[4].x;
-    let localPos = fc - u[0].zw;
-    let n0 = fx_fieldDistance_lens_sampled(u, fc);
-    if (n0 > 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
-    let n1 = fx_ramp(n0, min(u[2].x, min(u[1].x, u[1].y)));
-    let n2 = fx_radialDirection(localPos, u[1].xy, u[3].x, u[3].y);
-    let n3 = fx_refract(n1, u[2].y, u[2].z, i32(u[1].w));
-    let n4 = fx_coverage(n0, 1.5 * u[4].x);
-    let edgeT = n1;
-    let dir = n2;
-    let refracted = n3;
-    let mask = n4;
-    let bezel = min(u[2].x, min(u[1].x, u[1].y));
-    var disp = refracted * scale;
-    let edgeFade = pow(1.0 - edgeT, 1.5);
-    disp = disp * (1.0 + u[3].z * edgeFade);
-    var dpx = dir * disp;
-    let zoomFactor = 1.0 / max(u[3].w, 0.1) - 1.0;
-    dpx = dpx + localPos * zoomFactor;
-    let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
-    return vec4<f32>(dpx.x, dpx.y, specular, mask);
-}
 #endif
-fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
-    let n0 = fx_fractalNoise(fc / max(u[0].w, 1.0));
-    let n1 = ((n0.rg - vec2<f32>(0.5, 0.5)) * u[0].z);
-    return vec4<f32>(n1.x, n1.y, 0.0, 1.0);
-}
-// A radial ramp field: mask (and specular) fall linearly from 1 at the centre to 0 at `radius`. Its
-// only job is to exercise the inline field VM with a per-pixel-varying, hand-computable value —
-// `mix(backdrop, tinted, mask)` becomes a radial tint gradient. Centre = u[0].zw, radius = u[1].x.
-fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
-    let d = length(fc - u[0].zw);
+// The radial ramp field: mask and specular fall linearly from 1 at the centre (u[0].zw) to 0 at
+// radius u[1].x — the background-field tint's gradient.
+fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>) -> vec4<f32> {
+    let d = length(fc - anchor);
     let m = clamp(1.0 - d / max(u[1].x, 1.0), 0.0, 1.0);
     return vec4<f32>(0.0, 0.0, m, m);
 }
-// Dispatch a baked field program by id. Barrier heads (warp/frost) are NOT pointwise and never reach
-// here; this serves the field-measuring pointwise units (shade/maskmix) that read a field per pixel.
-fn fx_computeField(program: u32, u: array<vec4<f32>, 6>, fc: vec2<f32>) -> vec4<f32> {
-    if (program == 1u) { return fx_computeField_lens(u, fc); }
-#ifdef have_input
-    if (program == 4u) { return fx_computeField_lens_sampled(u, fc); }
-#endif
-    if (program == 2u) { return fx_computeField_texture(u, fc); }
-    if (program == 3u) { return fx_computeField_radial(u, fc); }
+// Fractal value noise — kept verbatim in sync with render-core's `field::FIELD_NOISE` (a host test
+// asserts the bytes match), so the grain fine warps by is the grain every other executor samples.
+fn _hash(p: vec2<f32>) -> f32 {
+    return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453123);
+}
+fn _vnoise(p: vec2<f32>, seed: f32) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let w = f * f * (3.0 - 2.0 * f);
+    let s = vec2<f32>(seed, 0.0);
+    let a = _hash(i + vec2<f32>(0.0, 0.0) + s);
+    let b = _hash(i + vec2<f32>(1.0, 0.0) + s);
+    let c = _hash(i + vec2<f32>(0.0, 1.0) + s);
+    let d = _hash(i + vec2<f32>(1.0, 1.0) + s);
+    return mix(mix(a, b, w.x), mix(c, d, w.x), w.y);
+}
+fn _fbm(p: vec2<f32>, seed: f32) -> f32 {
+    var v = 0.0;
+    var amp = 0.5;
+    var freq = 1.0;
+    for (var o = 0; o < 4; o = o + 1) {
+        v = v + amp * _vnoise(p * freq, seed);
+        freq = freq * 2.0;
+        amp = amp * 0.5;
+    }
+    return v;
+}
+fn fractalNoise(p: vec2<f32>) -> vec4<f32> {
+    return vec4<f32>(_fbm(p, 0.0), _fbm(p, 37.0), _fbm(p, 71.0), _fbm(p, 113.0));
+}
+// The fractal-noise displacement field, evaluated in the frame the field record anchors (the
+// grain rides the shape). Magnitude `u[0].z`, grain `u[0].w`.
+fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>) -> vec4<f32> {
+    let local = fc - anchor;
+    let n = fractalNoise(local / max(u[0].w, 1.0));
+    let d = (n.rg - vec2<f32>(0.5, 0.5)) * u[0].z;
+    return vec4<f32>(d, 0.0, 1.0);
+}
+// Field program dispatch over the math tag (slot 1): 1 = rounded-box, 2 = fractal-noise
+// displacement, 3 = radial ramp; anything else measures no field. The field's distance SOURCE and
+// coordinate anchor come from operand record 3, never from the program.
+fn fx_computeField(d: FxDesc, fc: vec2<f32>) -> vec4<f32> {
+    let anchor = d.rec[3].yz;
+    let sampled = d.rec[3].x == 2.0;
+    if (d.program == 1u) { return fx_computeField_lens(d.u, fc, anchor, sampled, d.rec[3].w); }
+    if (d.program == 2u) { return fx_computeField_texture(d.u, fc, anchor); }
+    if (d.program == 3u) { return fx_computeField_radial(d.u, fc, anchor); }
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
-// --- pointwise unit bodies over the accumulator pixel ---
-// `bits`: TINT=4, CLIP=1, ERASE=2 (mirrors batch `pointwise`); `shade`/`maskmix` are separate flags.
-// `value` = this pixel; `orig` = the pre-effect backdrop snapshot (for erase/maskmix); `field` =
-// fx_computeField for this pixel (only read when shade/maskmix set); `u` = the effect uniform.
+// The pointwise unit tail over one pixel: SHADE adds the field's specular, TINT lays a straight
+// colour at the value's alpha, MASKMIX mixes against the pre-effect backdrop by the field's mask.
+// (ERASE rides the spread composite's coverage term, never this function.)
 fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, orig: vec4<f32>, field: vec4<f32>, u: array<vec4<f32>, 6>) -> vec4<f32> {
     var value = value0;
     if (shade) {
@@ -1371,22 +1373,349 @@ fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, o
         value = vec4<f32>(value.rgb + specular * specularOpacity * highlightColor * value.a, value.a);
     }
     if ((bits & 1u) != 0u) {
-        let srcCoverage = value.a;
-        value = mix(value, value * srcCoverage, u[5].y);
+        value = mix(value, value * orig.a, u[5].y);
     }
     if ((bits & 4u) != 0u) {
         let tintColor = u[3];
         let tinted = vec4<f32>(tintColor.rgb * tintColor.a, tintColor.a) * value.a;
         value = mix(value, tinted, select(0.0, 1.0, tintColor.a >= 0.0));
     }
-    if ((bits & 2u) != 0u) {
-        value = value * (1.0 - orig.a * u[3].w);
-    }
     if (maskmix) {
         let mask = field.a;
         value = vec4<f32>(mix(orig.rgb, value.rgb, mask), mix(orig.a, value.a, mask));
     }
     return value;
+}
+
+
+// Execute one CMD_EFFECT mark over the tile, if it is inline and in this dispatch's window. THE
+// MARKER-WINDOW CONTRACT: a mark carries its scheduler ROUND (word +3); every command's pass is
+// decided per tile — a command draws in the window covering the round of the last marker before it
+// on THIS tile, so total passes scale with effect DEPTH, not count. A mark keying on its own round
+// (see `fx_keys_on_round`) runs where its materialised inputs are bound; a plain pointwise runs in
+// the segment it closes. An id below EFFECT_INLINE_BASE is a boundary-only marker (a post-fine
+// effect) and just splits the walk. A BLUR mark installs its output lease origin (u[1].xy) as the
+// tile's scratch-store shift. Coverage in `area` is STATE shared across windows (a fill is never
+// window-gated — see CMD_FILL in `main`), so an atomic boundary and a fused composite both mask by
+// the silhouette the last fill left.
+fn fx_run_mark(
+    cmd_ix: u32,
+    seg_current: u32,
+    xy: vec2<f32>,
+    rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>,
+    chain: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>,
+    area: ptr<function, array<f32, PIXELS_PER_THREAD>>,
+) {
+    let round = ptcl[cmd_ix + 3u];
+    let effect_id = ptcl[cmd_ix + 1u];
+    let inline_base = ptcl[cmd_ix + 4u];
+    let inline_key = select(seg_current, round, fx_keys_on_round(inline_base));
+    if effect_id < EFFECT_INLINE_BASE || inline_key < config.seg_lo
+        || (config.seg_target != SEG_ALL && inline_key >= config.seg_target) {
+        return;
+    }
+    let d = fx_load_desc(inline_base);
+    if (d.bits & 64u) != 0u {
+        active_scratch_out = vec2<i32>(i32(d.u[1].x), i32(d.u[1].y));
+    }
+    let atomic_ctl = ptcl[cmd_ix + 5u];
+    if (atomic_ctl & 1u) != 0u {
+        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+            let px = xy + vec2<f32>(f32(i), 0.0);
+            (*chain)[i] = fx_atomic_value(d, atomic_ctl, px, (*chain)[i]);
+            if (atomic_ctl & 2u) != 0u {
+                (*rgba)[i] = mix((*rgba)[i], (*chain)[i], (*area)[i]);
+            }
+        }
+    } else {
+        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+            let px = xy + vec2<f32>(f32(i), 0.0);
+            (*rgba)[i] = fx_fused_value(d, px, (*rgba)[i], (*area)[i]);
+        }
+    }
+}
+
+// A CMD_EFFECT mark's descriptor: the unit's bit word, its field program, and the 6-vec4 unit
+// uniform, read from `effect_params` at the mark's float offset.
+struct FxDesc {
+    bits: u32,
+    program: u32,
+    u: array<vec4<f32>, 6>,
+    rec: array<vec4<f32>, 4>,
+}
+fn fx_load_desc(base: u32) -> FxDesc {
+    var d: FxDesc;
+    d.bits = u32(effect_params[base]);
+    d.program = u32(effect_params[base + 1u]);
+    for (var k = 0u; k < 6u; k = k + 1u) {
+        let o = base + 2u + k * 4u;
+        d.u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
+    }
+    for (var k = 0u; k < 4u; k = k + 1u) {
+        let o = base + 26u + k * 4u;
+        d.rec[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
+    }
+    return d;
+}
+// Whether a mark runs in the window of its OWN scheduled round (a unit reading a materialised
+// surface: a WARP/BLUR head, a SPREAD composite, or anything on the input permutation) rather than
+// the z-segment it closes (a plain backdrop pointwise, which reads the running accumulator).
+fn fx_keys_on_round(base: u32) -> bool {
+#ifdef have_input
+    return true;
+#else
+    return (u32(effect_params[base]) & (96u | 128u)) != 0u;
+#endif
+}
+// One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
+// input scratch (a frost tail's shade over the scattered surface), a WARP head samples the displaced
+// backdrop, anything else transforms the running value pointwise. The boundary composite is main's.
+fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<f32> {
+    let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
+    var v = prev;
+#ifdef have_input
+    if (ctl & 4u) != 0u {
+        v = fx_bilin_input(px);
+    }
+#endif
+#ifdef load_base
+    if (d.bits & 32u) != 0u {
+        v = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
+    } else {
+        let orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+        v = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, v, orig, fld, d.u);
+    }
+#else
+    v = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, v, vec4<f32>(0.0), fld, d.u);
+#endif
+    return v;
+}
+#ifdef load_base
+// One separable-blur axis pass at one pixel: taps along u[0].xy with sigma u[0].z, from the draft
+// (V pass), the input scratch (a frost H over the warp), or the backdrop (a background H). A cropped
+// scratch shifts taps by its u[1].zw origin. An out-of-bounds tap is the page colour for a backdrop
+// blur and transparent for a silhouette blur (bit 2048); an sRGB blur (bit 1024) sums raw texels,
+// a linear one converts around the kernel. The result is stored sRGB either way.
+fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
+    let u = d.u;
+    let bits = d.bits;
+    let sigma = max(u[0].z, 0.5);
+    let radius = i32(ceil(3.0 * sigma));
+    let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
+    let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    let srgb_blur = u[2].z != 0.0;
+    let shadow_edge = u[2].w != 0.0;
+    let bgraw = unpack4x8unorm(config.base_color);
+    let bg = select(
+        select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur),
+        vec4<f32>(0.0, 0.0, 0.0, 0.0),
+        shadow_edge,
+    );
+    var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    var wsum = 0.0;
+    let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
+    for (var tt = -radius; tt <= radius; tt = tt + 1) {
+        let w = exp(-f32(tt * tt) * inv2s2);
+        let sp = ipx + axis * tt;
+#ifdef have_draft
+        let tc = sp - scratch_in_i;
+        let dims = vec2<i32>(textureDimensions(draft_in));
+        let rawtap = textureLoad(draft_in, tc, 0);
+#else
+#ifdef have_input
+        let tc = sp - scratch_in_i;
+        let dims = vec2<i32>(textureDimensions(input_in));
+        let rawtap = textureLoad(input_in, tc, 0);
+#else
+        let tc = sp;
+        let dims = vec2<i32>(textureDimensions(base_in));
+        let rawtap = textureLoad(base_in, tc, 0);
+#endif
+#endif
+        let inb = tc.x >= 0 && tc.y >= 0 && tc.x < dims.x && tc.y < dims.y;
+        let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
+        let tap = select(bg, tapc, inb);
+        acc = acc + w * tap;
+        wsum = wsum + w;
+    }
+    return select(fx_premul_lin_to_srgb(acc / wsum), acc / wsum, srgb_blur);
+}
+// The text-inner flood fold at one pixel (bit 4096, runs in the inner's V pass): recover the
+// unoffset glyph coverage by sampling the offset silhouette in `base_in` shifted by u[2].xy (u[1]
+// is the blur's scratch-origin slot), and fold the tinted erase by the blurred punch into one
+// coverage the band later reads as SCRATCH_COV.
+fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
+    let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
+    let fdims = vec2<i32>(textureDimensions(base_in));
+    let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
+    let flood = select(0.0, textureLoad(base_in, fpx, 0).a, finb);
+    return vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * punch_a));
+}
+#endif
+#ifdef have_input
+// The frost scatter at one pixel (bit 256): a 12-tap jittered read of the input scratch, jitter
+// radius frost (u[4].z) × scale (u[4].x); zero frost degenerates to one bilinear read.
+fn fx_scatter_value(u: array<vec4<f32>, 6>, px: vec2<f32>) -> vec4<f32> {
+    let frost = u[4].z;
+    let scl = u[4].x;
+    let fc = px + vec2<f32>(0.5, 0.5);
+    if (frost <= 0.01) {
+        return fx_bilin_input(px);
+    }
+    var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+    for (var t = 0u; t < 12u; t = t + 1u) {
+        let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
+        let off = n * frost * 6.0 * scl;
+        sacc = sacc + fx_bilin_input(px + off);
+    }
+    return sacc / 12.0;
+}
+#endif
+// The SPREAD composite (bit 128): lay the straight shadow colour u[3] source-over the accumulator.
+// Coverage is the blurred silhouette alpha for a soft drop (BLUR set), a precomputed scratch
+// coverage for a text band / sharp drop (SCRATCH_COV), the flood minus the punch for an inner band
+// (ERASE, folding the colour's alpha into the erase term), else the rasterised coverage.
+fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f32> {
+    var scov = cov;
+    if (d.rec[2].x == 2.0) {
+        scov = value_a;
+    } else if ((d.bits & 2u) != 0u) {
+        scov = cov * (1.0 - d.u[3].a * value_a);
+    }
+    let a = d.u[3].a * scov;
+    return vec4<f32>(d.u[3].xyz * a, a) + acc * (1.0 - a);
+}
+// One FUSED (ctl 0) mark over one pixel, returning the new accumulator value. The operand records
+// after the header carry each input's source: record 0 the value the arm transforms (source 2 =
+// the input register at its window, displaced by the field when a WARP is present; else the
+// backdrop), record 1 the reference (`orig`) binary pointwise units compare against, record 2 the
+// composite's coverage (source 2 = the value's own alpha), record 3 the field's distance (source 2
+// = a baked SDF; else generated at the record's anchor). Heads with their own read path override
+// the value (a BLUR taps its axis pass at record 0's window, a SCATTER jitters the input). Then
+// the text flood folds, the pointwise tail runs, and the result composites by mode: VALUE_OVER,
+// COLOUR_OVER, RAW (cov 1, the next link reads the full field), else the coverage-masked mix.
+fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> vec4<f32> {
+    let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
+    let src_value = d.rec[0].x;
+    let src_orig = d.rec[1].x;
+    let win_value = d.rec[0].yz;
+    var value = acc;
+    var orig = acc;
+    var cov = coverage;
+#ifdef load_base
+    if (d.bits & 32u) != 0u && src_value != 2.0 {
+        value = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
+        orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+    }
+    if (d.bits & 64u) != 0u {
+        value = fx_blur_value(d, vec2<i32>(i32(px.x), i32(px.y)));
+#ifndef have_draft
+        cov = 1.0;
+#endif
+    }
+    if (d.bits & 4096u) != 0u {
+        value = fx_flood_value(d.u, px, value.a);
+    }
+#endif
+#ifdef have_input
+    if (d.bits & 256u) != 0u {
+        value = fx_scatter_value(d.u, px);
+        cov = 1.0;
+    }
+    if src_value == 2.0 && (d.bits & (64u | 256u)) == 0u {
+        var disp = vec2<f32>(0.0, 0.0);
+        if (d.bits & 32u) != 0u {
+            disp = fld.xy;
+        }
+        value = fx_bilin_input(px - win_value + disp);
+        if src_orig == 2.0 {
+            orig = fx_bilin_input(px - d.rec[1].yz);
+        } else {
+            orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+        }
+    }
+#endif
+    if (d.bits & 512u) != 0u {
+        cov = 1.0;
+    }
+    let eff = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, value, orig, fld, d.u);
+    if (d.bits & 16384u) != 0u {
+        return eff + acc * (1.0 - eff.a);
+    }
+    if (d.bits & 128u) != 0u {
+        return fx_spread_value(d, acc, cov, value.a);
+    }
+    return mix(acc, eff, cov);
+}
+
+#ifdef rw_accum
+// The in-place (`rw_accum`) early-out: walk one tile's PTCL tags once and report whether ANY paint
+// command falls inside this dispatch's window — coverage-only commands (CMD_FILL/CMD_SOLID) change
+// nothing without a following paint, so they don't count. A tile with no work returns before
+// touching a pixel; the accumulator already holds the right bytes. The walk must mirror the
+// interpreter's tag sizes EXACTLY, or a param is read as a tag and the decision corrupts.
+fn fx_window_has_work(tile_ix: u32) -> bool {
+    var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 1u;
+    var scan_seg = 0u;
+    while true {
+        let t = ptcl[scan_ix];
+        if t == CMD_END {
+            break;
+        }
+        if t == CMD_EFFECT {
+            let round = ptcl[scan_ix + 3u];
+            if config.seg_target != SEG_ALL && round >= config.seg_target {
+                break;
+            }
+            scan_seg = round;
+            scan_ix += 6u;
+            continue;
+        }
+        if t == CMD_JUMP {
+            scan_ix = ptcl[scan_ix + 1u];
+            continue;
+        }
+        let in_window = scan_seg >= config.seg_lo
+            && (config.seg_target == SEG_ALL || scan_seg < config.seg_target);
+        if in_window && t != CMD_FILL && t != CMD_SOLID {
+            return true;
+        }
+        switch t {
+            case CMD_FILL: {
+                scan_ix += 4u;
+            }
+            case CMD_SOLID, CMD_BEGIN_CLIP: {
+                scan_ix += 1u;
+            }
+            case CMD_COLOR, CMD_IMAGE: {
+                scan_ix += 2u;
+            }
+            case CMD_END_CLIP, CMD_BLUR_RECT, CMD_LIN_GRAD, CMD_RAD_GRAD, CMD_SWEEP_GRAD: {
+                scan_ix += 3u;
+            }
+            default: {
+                scan_ix += 1u;
+            }
+        }
+    }
+    return false;
+}
+#endif
+
+// Store the tile's accumulator PREMULTIPLIED — everything that consumes a fine output (the
+// compositor blit/present, every effect pass, the phased base reload) treats the texel as
+// premultiplied; an un-premultiplied store here was the ~1px phased seam (a low-coverage edge
+// became `(colour, a≈0)`). `output` may be a reach-cropped scratch: the device coord shifts into
+// its frame by this tile's active origin (a blur mark's u[1].xy); a thread outside the scratch
+// extent lands OOB and WGSL drops the store, so an uncropped tile is unaffected.
+fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
+    let xy_uint = vec2<u32>(xy);
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        let coords = xy_uint + vec2(i, 0u);
+        if coords.x < config.target_width && coords.y < config.target_height {
+            textureStore(output, vec2<i32>(coords) - active_scratch_out, (*rgba)[i]);
+        }
+    }
 }
 
 // The X size should be 16 / PIXELS_PER_THREAD
@@ -1401,69 +1730,16 @@ fn main(
         // We use ptcl[0] for this so we don't use up a binding for bump.
         return;
     }
+    active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
     let tile_ix = wg_id.y * config.width_in_tiles + wg_id.x;
     let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
+    var chain: array<vec4<f32>, PIXELS_PER_THREAD>;
 #ifdef rw_accum
-    // Early-out: walk this tile's tags once, and when no command falls inside this dispatch's
-    // window, return without touching a pixel — the accumulator already holds the right bytes.
-    // The walk must mirror the interpreter's tag sizes below EXACTLY; a desync would read a param
-    // as a tag and corrupt the decision (the real walk below is unaffected either way).
-    // Coverage-only commands (`CMD_FILL`, `CMD_SOLID`) don't count as work: without a following
-    // paint command in the window they change nothing.
-    {
-        var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 1u;
-        var scan_seg = 0u;
-        var has_work = false;
-        while true {
-            let t = ptcl[scan_ix];
-            if t == CMD_END {
-                break;
-            }
-            if t == CMD_EFFECT {
-                let round = ptcl[scan_ix + 3u];
-                if config.seg_target != SEG_ALL && round >= config.seg_target {
-                    break;
-                }
-                scan_seg = round;
-                scan_ix += 6u;
-                continue;
-            }
-            if t == CMD_JUMP {
-                scan_ix = ptcl[scan_ix + 1u];
-                continue;
-            }
-            let in_window = scan_seg >= config.seg_lo
-                && (config.seg_target == SEG_ALL || scan_seg < config.seg_target);
-            if in_window && t != CMD_FILL && t != CMD_SOLID {
-                has_work = true;
-                break;
-            }
-            switch t {
-                case CMD_FILL: {
-                    scan_ix += 4u;
-                }
-                case CMD_SOLID, CMD_BEGIN_CLIP: {
-                    scan_ix += 1u;
-                }
-                case CMD_COLOR, CMD_IMAGE: {
-                    scan_ix += 2u;
-                }
-                case CMD_END_CLIP, CMD_BLUR_RECT, CMD_LIN_GRAD, CMD_RAD_GRAD, CMD_SWEEP_GRAD: {
-                    scan_ix += 3u;
-                }
-                default: {
-                    scan_ix += 1u;
-                }
-            }
-        }
-        if !has_work {
-            return;
-        }
+    if !fx_window_has_work(tile_ix) {
+        return;
     }
-    // In place: start from the accumulator's current pixels (stored premultiplied, see the store
-    // below) — the single-texture equivalent of the `load_base` reload.
     let base_xy = vec2<i32>(i32(global_id.x * PIXELS_PER_THREAD), i32(global_id.y));
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0));
@@ -1501,273 +1777,9 @@ fn main(
         if tag == CMD_END {
             break;
         }
-        // Effect boundary marker. Handled here (like CMD_END), NOT in the switch: a `break` inside a
-        // WGSL `switch` case exits only the switch, not this loop, which would spin on the same
-        // marker. The effect itself runs as a post-fine dispatch over the materialized backdrop
-        // (custom shaders included), never inline here.
-        //
-        // The marker carries the effect's ROUND (p1, word +3): the driver groups reach-disjoint
-        // effects into rounds, and every command's pass is decided PER TILE — a command is drawn in
-        // the pass whose window covers the round of the last marker before it on THIS tile. Tiles
-        // untouched by an effect never see its marker, so content elsewhere renders in the earliest
-        // window; total passes scale with the max effect stack DEPTH, not the effect count.
-        //   - Windowed dispatch (seg_target != SEG_ALL): draw commands whose tile round is in
-        //     [seg_lo, seg_target). Marker rounds are strictly increasing along one tile's PTCL (a
-        //     later effect on the same tile always conflicts with the earlier one), so a marker at or
-        //     past the window's end proves nothing below the window follows — stop.
-        //   - SEG_ALL with seg_lo = 0 (default): step over every marker and draw everything —
-        //     byte-for-byte the non-segmented render. SEG_ALL with seg_lo > 0 is the final window:
-        //     no upper bound, draw every tile round >= seg_lo.
-        // cmd_ix must move by exactly 6 so the PTCL walk stays synced with what coarse wrote; landing
-        // mid-command would read a param as the next tag and desync the whole tile.
         if tag == CMD_EFFECT {
             let round = ptcl[cmd_ix + 3u];
-            let effect_id = ptcl[cmd_ix + 1u];
-            // Effects-in-fine (Phase B): an effect flagged inline (effect_id >= EFFECT_INLINE_BASE)
-            // runs its pointwise chain over the tile accumulator here. `p2` (word +4) is the float
-            // offset into `effect_params` of this effect's descriptor: [bits, program, then the
-            // 24-float (6-vec4) unit uniform]. The driver flip enables this by emitting the sentinel
-            // id + descriptor; until then no marker sets it, so this branch never runs and fine
-            // steps over the marker exactly as before.
-            // A pointwise inline effect runs over the FORWARD accumulator — it belongs to the segment
-            // it closes (`seg_current`). A WARP samples the MATERIALIZED backdrop, so it must run in
-            // the RELOAD window after that backdrop is a finished `base_in` — it keys on the marker's
-            // own `round`, one segment later. `effect_params[base]` (bits) carries the WARP flag.
-            let inline_base = ptcl[cmd_ix + 4u];
-            // A head that samples base_in (WARP 32, BLUR 64) must run in the reload window where
-            // base_in is bound → key on the marker's own round. A SPREAD (128) does not read base_in,
-            // but it is SCHEDULED on a round too: a drop shadow's marker composites one round BEFORE the
-            // stack's imperative body so the body lands over it, so it must key on its descriptor round,
-            // not the z-segment it closes. Plain backdrop pointwise (tint/field) keys on the segment.
-            // A separable blur is TWO markers (H then V), each at its own round — the executor runs each
-            // dumbly and never knows it is "pass 2"; the planner ordered them.
-#ifdef have_input
-            // Every link that rides the have_input permutation (a frosted lens's blur-H, scatter, and
-            // tail shade+maskmix) reads a MATERIALISED surface — the previous link's output — so like a
-            // WARP/BLUR head it keys on its own RELOAD round, not the segment it closes.
-            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE;
-#else
-            let inline_reads_base = effect_id >= EFFECT_INLINE_BASE && (u32(effect_params[inline_base]) & (96u | 128u)) != 0u;
-#endif
-            let inline_key = select(seg_current, round, inline_reads_base);
-            if effect_id >= EFFECT_INLINE_BASE && inline_key >= config.seg_lo
-                && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
-                let base = ptcl[cmd_ix + 4u];
-                let bits = u32(effect_params[base]);
-                let program = u32(effect_params[base + 1u]);
-                var u: array<vec4<f32>, 6>;
-                for (var k = 0u; k < 6u; k = k + 1u) {
-                    let o = base + 2u + k * 4u;
-                    u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
-                }
-                let shade = (bits & 8u) != 0u;
-                let maskmix = (bits & 16u) != 0u;
-                // A SPREAD composite (bit 128): the value is a blurred SILHOUETTE coverage (its source
-                // was the shape's own silhouette, not the backdrop), and it lays down as the shadow
-                // colour source-OVER the accumulator — a layer under the body — rather than the masked
-                // mix a backdrop effect uses. The straight colour is u[3]; `value.a` is the blurred
-                // coverage. Only the drop/inner shadow spread sets it. (Dormant until the driver emits.)
-                let spread = (bits & 128u) != 0u;
-                // A WARP head (bit 32) samples the MATERIALIZED backdrop at a field-computed
-                // displacement — a gather that only a reload round can serve, since `base_in` is the
-                // finished prior surface (reading the in-place `rw_accum` at a displaced, cross-tile
-                // offset would race). Its self-clip coverage is the field's SDF mask (`fld.a`), not the
-                // shape silhouette in `area[i]` that a pointwise backdrop effect uses.
-                let warp = (bits & 32u) != 0u;
-                // A blur arm (BLUR 64) is SEPARABLE — two markers, each one 1D Gaussian pass of sigma
-                // u[0].z along the axis the descriptor carries (u[0].xy: H = (1,0), V = (0,1)). The H
-                // pass reads the backdrop (`base_in`) and writes its result UNMASKED to a draft (the
-                // planner points its `out` at the draft, cov = 1 below); the V pass reads that draft
-                // (`draft_in`) and composites masked ONCE. Splitting the mask off the first pass is the
-                // whole point: an in-place separable blur would clip its intermediate to the silhouette
-                // and the second pass would read holes. O(r), not O(r²). The V pass is the `have_draft`
-                // permutation; the H pass is plain `load_base`.
-                let blur = (bits & 64u) != 0u;
-                for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                    let px = vec2<f32>(f32(global_id.x * PIXELS_PER_THREAD + i), f32(global_id.y));
-                    // The field is evaluated at the pixel CENTRE (`px + 0.5`) to match the batched
-                    // oracle, whose fragment shader measures the field at `fragCoord` = pixel centre. `px`
-                    // here is the pixel-index corner; sampling the field half a pixel off shifts the
-                    // whole displacement/specular/mask field and rings every lens rim by ~1px.
-                    let fld = fx_computeField(program, u, px + vec2<f32>(0.5, 0.5));
-                    var value = rgba[i];
-                    var orig = rgba[i];
-                    var cov = area[i];
-#ifdef load_base
-                    if warp {
-                        let ipx = vec2<i32>(i32(px.x), i32(px.y));
-                        // Refracted backdrop sample at `px + disp`, bilinear (matches the oracle's linear
-                        // `unitSample`; a nearest textureLoad seams at the lens centre where the
-                        // displacement changes sign and rings the rim where it is steepest).
-                        let bp = px + fld.xy;
-                        // CHROMATIC ABERRATION: R and B are sampled shifted along the displacement
-                        // direction, the shift growing with |disp| (so it peaks at the rim). This is the
-                        // batched lens head's `caShift`; on a high-contrast backdrop its absence is a
-                        // bright colour fringe on every lens edge. `u[4].y` = CA amount, `u[4].x` = scale.
-                        let dlen = length(fld.xy);
-                        let castr = smoothstep(0.0, 5.0 * u[4].x, dlen);
-                        var cadir = vec2<f32>(0.0, 0.0);
-                        if (dlen > 0.01 * u[4].x) { cadir = fld.xy / dlen; }
-                        let cashift = cadir * u[4].y * castr;
-                        let cr = fx_bilin(bp - cashift);
-                        let cg = fx_bilin(bp);
-                        let cb = fx_bilin(bp + cashift);
-                        value = vec4<f32>(cr.r, cg.g, cb.b, cg.a);
-                        orig = textureLoad(base_in, ipx, 0);
-                        // The refraction mask (`fld.a`, analytic SDF coverage) is applied ONCE by the
-                        // MASKMIX unit in `fx_applyPointwise`; the OUTER composite keeps `area[i]` — the
-                        // RASTERISED silhouette AA the CmdFill left — matching the oracle's
-                        // maskmix(analytic) + stamp(silhouette). `cov = fld.a` here would apply the mask
-                        // twice (m²) and ring the rim; leave `cov` alone.
-                    }
-                    if blur {
-                        let sigma = max(u[0].z, 0.5);
-                        let radius = i32(ceil(3.0 * sigma));
-                        let ipx = vec2<i32>(i32(px.x), i32(px.y));
-                        let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
-                        let inv2s2 = 1.0 / (2.0 * sigma * sigma);
-                        // A background blur mixes in LINEAR light (`EffectPass::Blur { linear: true }`);
-                        // a frosted LENS blur mixes in sRGB (`linear: false`), matching its batched oracle.
-                        // Bit 1024 selects sRGB: taps are summed raw, no decode/encode around the kernel.
-                        let srgb_blur = (bits & 1024u) != 0u;
-                        // Beyond the viewport there is no backdrop — only the page. So an out-of-bounds
-                        // tap is the background colour, and a BACKDROP blur FADES toward it at the true edge
-                        // (matching tiled, which blurs an isolated crop cleared to the page). A SHADOW blur
-                        // (bit 2048) instead blurs a SILHOUETTE over transparency — beyond the viewport
-                        // there is no shadow, so its OOB tap is transparent 0, not the opaque page (else the
-                        // silhouette blur reads the page's alpha=1 as coverage and haloes the viewport edge).
-                        let shadow_edge = (bits & 2048u) != 0u;
-                        let bgraw = unpack4x8unorm(config.base_color);
-                        let bg = select(
-                            select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur),
-                            vec4<f32>(0.0, 0.0, 0.0, 0.0),
-                            shadow_edge,
-                        );
-                        var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-                        var wsum = 0.0;
-                        for (var tt = -radius; tt <= radius; tt = tt + 1) {
-                            let w = exp(-f32(tt * tt) * inv2s2);
-                            let sp = ipx + axis * tt;
-#ifdef have_draft
-                            // V pass: taps the H-pass result in the draft (a frosted lens's draft holds
-                            // its H-blurred WARP, a background blur's holds its H-blurred backdrop).
-                            let dims = vec2<i32>(textureDimensions(draft_in));
-                            let rawtap = textureLoad(draft_in, sp, 0);
-#else
-#ifdef have_input
-                            // Frosted lens H pass: taps the WARPED surface (the previous link's output),
-                            // routed to `input_in`, not the raw backdrop.
-                            let dims = vec2<i32>(textureDimensions(input_in));
-                            let rawtap = textureLoad(input_in, sp, 0);
-#else
-                            // Background blur H pass: taps the backdrop.
-                            let dims = vec2<i32>(textureDimensions(base_in));
-                            let rawtap = textureLoad(base_in, sp, 0);
-#endif
-#endif
-                            let inb = sp.x >= 0 && sp.y >= 0 && sp.x < dims.x && sp.y < dims.y;
-                            let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
-                            let tap = select(bg, tapc, inb);
-                            acc = acc + w * tap;
-                            wsum = wsum + w;
-                        }
-                        // Store sRGB either way: a linear-mixed blur re-encodes here; an sRGB-mixed blur
-                        // (frosted lens) already summed sRGB taps. The H pass's 8-bit draft then matches
-                        // the per-shape oracle's own separable intermediate.
-                        value = select(fx_premul_lin_to_srgb(acc / wsum), acc / wsum, srgb_blur);
-                        // The H pass writes the draft UNMASKED (its `out` is the draft, not the frame),
-                        // so the V pass has the full blurred field to sample; only the V pass masks.
-#ifndef have_draft
-                        cov = 1.0;
-#endif
-                    }
-                    // TEXT INNER FLOOD (bit 4096): recover the shape's FLOOD (unoffset glyph coverage) by
-                    // sampling the OFFSET silhouette in `base_in` shifted BACK by the shadow offset (`u[1].xy`,
-                    // device px) — a Text has no glyph coverage in `area[i]` (its outline is the bounds rect).
-                    // `value.a` here is the V-blurred punch; fold the flood and the tinted erase into `value.a`
-                    // so the band composites ONE precomputed coverage (bit 8192) instead of `area[i]` * erase.
-                    // Runs in the inner's V pass (`have_draft` + `load_base`, `base_in` = the silhouette).
-                    if ((bits & 4096u) != 0u) {
-                        let fpx = vec2<i32>(i32(px.x + u[1].x), i32(px.y + u[1].y));
-                        let fdims = vec2<i32>(textureDimensions(base_in));
-                        let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
-                        let flood = select(0.0, textureLoad(base_in, fpx, 0).a, finb);
-                        value = vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * value.a));
-                    }
-#endif
-#ifdef have_input
-                    // FROST SCATTER (bit 256): a 12-tap noise blur of the PRIMARY input surface (the
-                    // blurred-warp link of a frosted lens chain), a byte-for-byte port of the batched
-                    // Scatter unit (units.rs head==2). `fc` is the pixel CENTRE (matches the oracle's
-                    // fragment coord). Writes UNMASKED to its scratch `out` (cov = 1) so the next link
-                    // reads the full field; the tail shade/maskmix marker applies the silhouette.
-                    let scatter = (bits & 256u) != 0u;
-                    if scatter {
-                        let frost = u[4].z;
-                        let scl = u[4].x;
-                        let fc = px + vec2<f32>(0.5, 0.5);
-                        if (frost > 0.01) {
-                            var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-                            for (var t = 0u; t < 12u; t = t + 1u) {
-                                let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
-                                let off = n * frost * 6.0 * scl;
-                                sacc = sacc + fx_bilin_input(px + off);
-                            }
-                            value = sacc / 12.0;
-                        } else {
-                            value = fx_bilin_input(px);
-                        }
-                        cov = 1.0;
-                    }
-                    // Frosted lens TAIL (shade+maskmix, no warp/blur/scatter): its `value` is the
-                    // finished scattered surface routed to `input_in`; `orig` is the ORIGINAL backdrop
-                    // (`base_in`) the maskmix confines the lens over. Composites masked (cov = area).
-                    if ((bits & (32u | 64u | 256u)) == 0u) {
-                        value = fx_bilin_input(px);
-                        orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
-                    }
-#endif
-                    // MATERIALIZE (bit 512): an INTERMEDIATE link of a chained gather (a frosted lens's
-                    // warp / blur-V / scatter) writes its result UNMASKED to a scratch `out`, so the next
-                    // link reads the full field; only the FINAL link (shade+maskmix, or a background
-                    // blur's V) composites masked into the accumulator. Background blur's H already forces
-                    // cov = 1 via `#ifndef have_draft`; this bit covers the links that ride the have_draft
-                    // permutation (a frosted blur-V) where that guard does not fire.
-                    if ((bits & 512u) != 0u) {
-                        cov = 1.0;
-                    }
-                    let eff = fx_applyPointwise(bits, shade, maskmix, value, orig, fld, u);
-                    // Masked by the shape's coverage, which the inline effect's `CmdFill` (emitted by
-                    // coarse just before this marker) left in `area[i]` — so the effect is confined to
-                    // the silhouette, anti-aliased at its edge, exactly like the post-fine composite.
-                    if spread {
-                        // Shadow colour laid down over its coverage, premultiplied, source-OVER the
-                        // accumulator. The coverage depends on the shadow kind (all `u[3]` = colour):
-                        //  - SHARP drop (no blur): the rasterised offset silhouette in `area[i]` (`cov`).
-                        //  - BLURRED drop: the blurred silhouette alpha `value.a` (its `area[i]` is the
-                        //    dilated reach, so it does not clip the blur).
-                        //  - INNER shadow band (ERASE bit 2): the flood is the shape's own coverage
-                        //    (`area[i]`, the unoffset outline) with the offset+blurred punch ERASED out.
-                        //    The pre-pass oracle blurs a punch already TINTED by the shadow alpha, so its
-                        //    erase never fully clears deep inside — a residual `(1 - alpha)` broad darkening
-                        //    survives. `value.a` here is pure (untinted) coverage, so the alpha is folded
-                        //    into the erase term: `cov * (1 - alpha*value.a)`, over the body (this marker
-                        //    runs after it).
-                        let erase = (bits & 2u) != 0u;
-                        // A TEXT inner band reads a PRECOMPUTED coverage (bit 8192): its V pass already folded
-                        // flood*(1 - alpha*punch) into the punch scratch alpha, so `value.a` IS the band
-                        // coverage — no `area[i]` (the bounds rect for Text) and no separate erase term.
-                        let scratch_cov = (bits & 8192u) != 0u;
-                        var scov = select(cov, value.a, blur);
-                        if scratch_cov { scov = value.a; }
-                        else if erase { scov = cov * (1.0 - u[3].a * value.a); }
-                        let a = u[3].a * scov;
-                        rgba[i] = vec4<f32>(u[3].xyz * a, a) + rgba[i] * (1.0 - a);
-                    } else {
-                        rgba[i] = mix(rgba[i], eff, cov);
-                    }
-                }
-            }
+            fx_run_mark(cmd_ix, seg_current, xy, &rgba, &chain, &area);
             if config.seg_target != SEG_ALL && round >= config.seg_target {
                 break;
             }
@@ -1775,9 +1787,6 @@ fn main(
             cmd_ix += 6u;
             continue;
         }
-        // Windowed fine paints a command only when its tile round falls inside this dispatch's
-        // window; cmd_ix still advances for every command so the PTCL walk stays synced. With the
-        // default (seg_lo = 0, SEG_ALL) `seg_active` is always true.
         let seg_active = seg_current >= config.seg_lo
             && (config.seg_target == SEG_ALL || seg_current < config.seg_target);
         switch tag {
@@ -1786,12 +1795,6 @@ fn main(
 #ifdef msaa
                 fill_path_ms(fill, local_id.xy, &area);
 #else
-                // Coverage is STATE, not paint: a later command in a different window reads `area[i]`
-                // (a base-reading inline effect — WARP/BLUR — applies in its RELOAD segment, one past
-                // the segment its silhouette fill was tagged to). Gating the fill on `seg_active` would
-                // leave that effect reading a stale `area` — the previous fill's winding, i.e. the
-                // backdrop — and clip the blur to the backdrop's shape. So always recompute; only the
-                // paint (CMD_COLOR/CMD_EFFECT) is windowed. Matches CMD_SOLID, which sets area ungated.
                 fill_path(fill, local_xy, &area);
 #endif
                 cmd_ix += 4u;
@@ -2093,23 +2096,7 @@ fn main(
             default: {}
         }
     }
-    let xy_uint = vec2<u32>(xy);
-    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-        let coords = xy_uint + vec2(i, 0u);
-        if coords.x < config.target_width && coords.y < config.target_height {
-            let fg = rgba[i];
-            // Store the accumulator PREMULTIPLIED (as it is blended). Everything that consumes a fine
-            // output — the compositor blit/present and every effect pass (`premul_srgb_to_lin`, glass,
-            // blur) and the phased base reload — treats the texel as premultiplied and either uses it
-            // directly in a `One / OneMinusSrcAlpha` blend or unpremultiplies it itself. The previous
-            // store un-premultiplied here (`fg.rgb / fg.a, fg.a`), which disagreed with all of them: a
-            // low-coverage edge pixel became `(colour, a≈0)`, drawn too bright by present and dropped to
-            // black by the phased reload's `rgb*a` — the ~1px per-shape phased seam. Storing
-            // premultiplied removes the mismatch (edges get correct area-AA) and makes a phased render
-            // pixel-identical to the single render.
-            textureStore(output, vec2<i32>(coords), fg);
-        }
-    } 
+    fx_store_tile(xy, &rgba);
 }
 
 fn premul_alpha(rgba: vec4<f32>) -> vec4<f32> {
