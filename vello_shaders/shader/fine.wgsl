@@ -1458,13 +1458,16 @@ fn fx_load_desc(base: u32) -> FxDesc {
     return d;
 }
 // Whether a mark runs in the window of its OWN scheduled round (a unit reading a materialised
-// surface: a WARP/BLUR head, a SPREAD composite, or anything on the input permutation) rather than
-// the z-segment it closes (a plain backdrop pointwise, which reads the running accumulator).
+// surface: a WARP/BLUR head, a SPREAD or VALUE_OVER composite, or anything on the input
+// permutation) rather than the z-segment it closes (a plain backdrop pointwise, which reads the
+// running accumulator). A VALUE_OVER mark's value is a co-located source bound only by its own
+// round's dispatch — keyed on segment it would re-run in an earlier window with no input bound and
+// double-composite that window's register.
 fn fx_keys_on_round(base: u32) -> bool {
 #ifdef have_input
     return true;
 #else
-    return (u32(effect_params[base]) & (96u | 128u)) != 0u;
+    return (u32(effect_params[base]) & (96u | 128u | 16384u)) != 0u;
 #endif
 }
 // One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
