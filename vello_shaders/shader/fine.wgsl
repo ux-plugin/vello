@@ -1377,8 +1377,8 @@ fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, o
     }
     if ((bits & 4u) != 0u) {
         let tintColor = u[3];
-        let tinted = vec4<f32>(tintColor.rgb * tintColor.a, tintColor.a) * value.a;
-        value = mix(value, tinted, select(0.0, 1.0, tintColor.a >= 0.0));
+        value = vec4<f32>(tintColor.rgb * tintColor.a, tintColor.a) * value.a
+            + value * (1.0 - tintColor.a);
     }
     if (maskmix) {
         let mask = field.a;
