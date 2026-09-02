@@ -173,6 +173,11 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
 // reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
 
+// Whether an in-window FENCE already claimed this tile's store origin. The next in-window fence is
+// then a FLUSH boundary: the register tile is stored to the claimed lease and reset before the new
+// origin is adopted, so overlapping fenced draws on one tile keep distinct leases within ONE window.
+var<private> fence_live: bool = false;
+
 // MSAA-only bindings and utilities
 #ifdef msaa
 
@@ -1469,13 +1474,29 @@ fn fx_run_mark(
         return;
     }
     let d = fx_load_desc(inline_base);
+    // A zero-bit mark is a pure FENCE: it claims the store origin for its window's rasterized
+    // draws and touches no pixel itself. A second in-window fence on this tile FLUSHES first —
+    // store the register tile to the previous fence's lease, reset it transparent — so one window
+    // rasterizes any number of overlapping fenced silhouettes. An unstamped OUTPUT record (a lease
+    // that failed to place) falls back to the dispatch default origin (the OOB sentinel in a
+    // rasterize window), dropping the stores instead of clobbering the previous lease.
+    if (d.bits == 0u) {
+        if (fence_live) {
+            fx_store_tile(xy, rgba);
+            for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+                (*rgba)[i] = vec4(0.0);
+            }
+        }
+        if (d.rec[4].x != 0.0) {
+            active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
+        } else {
+            active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
+        }
+        fence_live = true;
+        return;
+    }
     if (d.rec[4].x != 0.0) {
         active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
-    }
-    // A zero-bit mark is a pure FENCE: it claims the round and the store origin for its window's
-    // rasterized draws, and touches no pixel itself.
-    if (d.bits == 0u) {
-        return;
     }
     let atomic_ctl = ptcl[cmd_ix + 5u];
     if (atomic_ctl & 1u) != 0u {
