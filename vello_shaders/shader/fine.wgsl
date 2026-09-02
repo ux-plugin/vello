@@ -141,8 +141,8 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
 }
 #endif
 
-// Per-tile reach-crop origin of the OUTPUT scratch, in device pixels — set from a blur marker's spare
-// u[1] as fine walks this tile's PTCL. The tile-tail store shifts the write by it, so a tile whose
+// Per-tile reach-crop origin of the OUTPUT scratch, in device pixels — set from a marker's OUTPUT
+// record (record 4) as fine walks this tile's PTCL. The tile-tail store shifts the write by it, so a tile whose
 // governing effect is cropped writes into its small draft while a tile with no cropped marker keeps
 // device coordinates (origin stays zero). This is what makes the crop PER-TILE, not per-dispatch:
 // reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
@@ -1423,8 +1423,8 @@ fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, o
 // on THIS tile, so total passes scale with effect DEPTH, not count. A mark keying on its own round
 // (see `fx_keys_on_round`) runs where its materialised inputs are bound; a plain pointwise runs in
 // the segment it closes. An id below EFFECT_INLINE_BASE is a boundary-only marker (a post-fine
-// effect) and just splits the walk. A BLUR mark installs its output lease origin (u[1].xy) as the
-// tile's scratch-store shift. Coverage in `area` is STATE shared across windows (a fill is never
+// effect) and just splits the walk. A mark whose OUTPUT record (record 4) names a lease installs
+// its origin as the tile's scratch-store shift. Coverage in `area` is STATE shared across windows (a fill is never
 // window-gated — see CMD_FILL in `main`), so an atomic boundary and a fused composite both mask by
 // the silhouette the last fill left.
 fn fx_run_mark(
@@ -1444,8 +1444,8 @@ fn fx_run_mark(
         return;
     }
     let d = fx_load_desc(inline_base);
-    if (d.bits & 64u) != 0u {
-        active_scratch_out = vec2<i32>(i32(d.u[1].x), i32(d.u[1].y));
+    if (d.rec[4].x != 0.0) {
+        active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
     }
     let atomic_ctl = ptcl[cmd_ix + 5u];
     if (atomic_ctl & 1u) != 0u {
@@ -1470,7 +1470,7 @@ struct FxDesc {
     bits: u32,
     program: u32,
     u: array<vec4<f32>, 6>,
-    rec: array<vec4<f32>, 4>,
+    rec: array<vec4<f32>, 5>,
 }
 fn fx_load_desc(base: u32) -> FxDesc {
     var d: FxDesc;
@@ -1480,7 +1480,7 @@ fn fx_load_desc(base: u32) -> FxDesc {
         let o = base + 2u + k * 4u;
         d.u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
-    for (var k = 0u; k < 4u; k = k + 1u) {
+    for (var k = 0u; k < 5u; k = k + 1u) {
         let o = base + 26u + k * 4u;
         d.rec[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
@@ -1507,7 +1507,7 @@ fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<
     var v = prev;
 #ifdef have_input
     if (ctl & 4u) != 0u {
-        v = fx_bilin_input(px);
+        v = fx_bilin_input(px - d.rec[0].yz);
     }
 #endif
 #ifdef load_base
@@ -1546,25 +1546,55 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var wsum = 0.0;
     let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
+    // A cropped input carries its producer's DEVICE rect in the record params (corners in tile
+    // units, x*1024+y). The full-viewport draft it replaces was stored on EVERY tile — unmarked
+    // tiles held the window's base — so a tap outside the rect reads `base_in` (the same chain
+    // root those tiles stored), and only a tap outside the viewport falls to the blur's OOB
+    // policy. The atlas itself is never consulted for bounds: a neighbouring lease is not content.
+    let blo = u32(d.rec[0].w);
+    let bhi = u32(d.rec[1].w);
+    let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
+    // The high corner is tile-ceiled but the stores were viewport-gated: past the viewport a
+    // slot's texels belong to an earlier tenant, so the rect clamps to the frame.
+    let dev_hi = min(
+        vec2<i32>(i32((bhi >> 10u) & 1023u) * 16, i32(bhi & 1023u) * 16),
+        vec2<i32>(i32(config.target_width), i32(config.target_height)),
+    );
     for (var tt = -radius; tt <= radius; tt = tt + 1) {
         let w = exp(-f32(tt * tt) * inv2s2);
         let sp = ipx + axis * tt;
 #ifdef have_draft
         let tc = sp - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(draft_in));
-        let rawtap = textureLoad(draft_in, tc, 0);
+        var rawtap = textureLoad(draft_in, tc, 0);
 #else
 #ifdef have_input
         let tc = sp - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(input_in));
-        let rawtap = textureLoad(input_in, tc, 0);
+        var rawtap = textureLoad(input_in, tc, 0);
 #else
         let tc = sp;
         let dims = vec2<i32>(textureDimensions(base_in));
-        let rawtap = textureLoad(base_in, tc, 0);
+        var rawtap = textureLoad(base_in, tc, 0);
 #endif
 #endif
-        let inb = tc.x >= 0 && tc.y >= 0 && tc.x < dims.x && tc.y < dims.y;
+        var inb = tc.x >= 0 && tc.y >= 0 && tc.x < dims.x && tc.y < dims.y;
+        if (bhi != 0u) {
+            let in_rect = sp.x >= dev_lo.x && sp.y >= dev_lo.y && sp.x < dev_hi.x && sp.y < dev_hi.y;
+            if (shadow_edge) {
+                // A coverage chain's draft holds the silhouette's window: beyond its rect the
+                // silhouette is transparent, which is exactly this blur's OOB colour.
+                inb = in_rect;
+            } else {
+                // A backdrop chain's draft stored its window base on every unmarked tile: beyond
+                // the rect the tap reads the same base directly; past the viewport, the page.
+                if (!in_rect) {
+                    rawtap = textureLoad(base_in, sp, 0);
+                }
+                inb = sp.x >= 0 && sp.y >= 0
+                    && sp.x < i32(config.target_width) && sp.y < i32(config.target_height);
+            }
+        }
         let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
         let tap = select(bg, tapc, inb);
         acc = acc + w * tap;
@@ -1585,20 +1615,22 @@ fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f
 }
 #endif
 #ifdef have_input
-// The frost scatter at one pixel (bit 256): a 12-tap jittered read of the input scratch, jitter
-// radius frost (u[4].z) × scale (u[4].x); zero frost degenerates to one bilinear read.
-fn fx_scatter_value(u: array<vec4<f32>, 6>, px: vec2<f32>) -> vec4<f32> {
-    let frost = u[4].z;
-    let scl = u[4].x;
+// The frost scatter at one pixel (bit 256): a 12-tap jittered read of the input scratch (shifted
+// to its lease frame by record 0's window), jitter radius frost (u[4].z) × scale (u[4].x); zero
+// frost degenerates to one bilinear read.
+fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
+    let frost = d.u[4].z;
+    let scl = d.u[4].x;
+    let win = d.rec[0].yz;
     let fc = px + vec2<f32>(0.5, 0.5);
     if (frost <= 0.01) {
-        return fx_bilin_input(px);
+        return fx_bilin_input(px - win);
     }
     var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
-        sacc = sacc + fx_bilin_input(px + off);
+        sacc = sacc + fx_bilin_input(px - win + off);
     }
     return sacc / 12.0;
 }
@@ -1651,7 +1683,7 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
 #endif
 #ifdef have_input
     if (d.bits & 256u) != 0u {
-        value = fx_scatter_value(d.u, px);
+        value = fx_scatter_value(d, px);
         cov = 1.0;
     }
     if src_value == 2.0 && (d.bits & (64u | 256u)) == 0u {
@@ -1738,7 +1770,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
 // compositor blit/present, every effect pass, the phased base reload) treats the texel as
 // premultiplied; an un-premultiplied store here was the ~1px phased seam (a low-coverage edge
 // became `(colour, a≈0)`). `output` may be a reach-cropped scratch: the device coord shifts into
-// its frame by this tile's active origin (a blur mark's u[1].xy); a thread outside the scratch
+// its frame by this tile's active origin (the mark's OUTPUT record); a thread outside the scratch
 // extent lands OOB and WGSL drops the store, so an uncropped tile is unaffected.
 fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
     let xy_uint = vec2<u32>(xy);
