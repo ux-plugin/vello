@@ -1795,8 +1795,18 @@ fn main(
         return;
     }
     active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
-    let tile_ix = wg_id.y * config.width_in_tiles + wg_id.x;
-    let xy = vec2(f32(global_id.x * PIXELS_PER_THREAD), f32(global_id.y));
+    // Sparse window dispatch: `sparse_n != 0` means the grid is a compact LIST of active tiles —
+    // one workgroup per entry, its tile coordinate read from `effect_params[sparse_base + wg_id.x]`
+    // (packed `y<<16 | x`, biased by 0x40000000 so the f32 bit pattern is always a normal float).
+    // The planner emits the list from the window's marker reach quads, so a tile outside every
+    // effect's reach never launches. `sparse_n == 0` keeps the full-viewport grid.
+    var tile_xy = wg_id.xy;
+    if (config.sparse_n != 0u) {
+        let packed = bitcast<u32>(effect_params[config.sparse_base + wg_id.x]) & 0x3fffffffu;
+        tile_xy = vec2(packed & 0xffffu, packed >> 16u);
+    }
+    let tile_ix = tile_xy.y * config.width_in_tiles + tile_xy.x;
+    let xy = vec2(f32(tile_xy.x * TILE_WIDTH + local_id.x * PIXELS_PER_THREAD), f32(tile_xy.y * TILE_HEIGHT + local_id.y));
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
     var chain: array<vec4<f32>, PIXELS_PER_THREAD>;
@@ -1804,7 +1814,7 @@ fn main(
     if !fx_window_has_work(tile_ix) {
         return;
     }
-    let base_xy = vec2<i32>(i32(global_id.x * PIXELS_PER_THREAD), i32(global_id.y));
+    let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0));
     }
@@ -1813,7 +1823,7 @@ fn main(
     // Phase > 0: start from the previous phase's output (its un-premultiplied pixels), re-premultiplied
     // so the source-over accumulation below is unchanged. This is what lets a later fine phase draw
     // *over* the earlier one within one render, instead of clearing.
-    let base_xy = vec2<i32>(i32(global_id.x * PIXELS_PER_THREAD), i32(global_id.y));
+    let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         // Load the previous phase's output (stored premultiplied, see the store below) straight into
         // the premultiplied accumulator — no conversion, since the base is already in the same space

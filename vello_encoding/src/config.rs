@@ -168,8 +168,7 @@ pub struct ConfigUniform {
     /// `CMD_EFFECT` marker carries its effect's round (the driver groups reach-disjoint effects into
     /// one round); a command's round is that of the last marker before it on ITS tile. Defaults to
     /// [`SEG_ALL`], which removes the upper bound (and with `seg_lo == 0` leaves a normal render
-    /// unchanged); the whole-viewport driver overrides it per pass. `_pad_seg` keeps the uniform
-    /// 16-byte aligned.
+    /// unchanged); the whole-viewport driver overrides it per pass.
     pub seg_target: u32,
     /// Lowest tile round (inclusive) this fine dispatch renders — see [`Self::seg_target`]. Tiles
     /// only carry markers for effects whose reach covers them, so a tile's round trails the global
@@ -180,10 +179,15 @@ pub struct ConfigUniform {
     /// (`scratch_in`) sub-rects — the reach-crop offsets. A producer writes `output` at
     /// `coords - scratch_out`; a consumer samples `draft_in`/`input_in` at `coords - scratch_in`. Both
     /// default `[0, 0]` — a full-viewport surface, so an un-cropped dispatch is byte-identical to before.
-    /// `base_in` (the backdrop) is never cropped, so it needs no origin. `_pad_seg` keeps 16-byte align.
+    /// `base_in` (the backdrop) is never cropped, so it needs no origin.
     pub scratch_out: [u32; 2],
     pub scratch_in: [u32; 2],
-    pub _pad_seg: [u32; 2],
+    /// Sparse window dispatch: when [`Self::sparse_n`] is non-zero, fine's grid is `(sparse_n, 1, 1)`
+    /// workgroups and workgroup `i` reads its tile coordinate from
+    /// `effect_params[sparse_base + i]` (`y<<16 | x`, biased by `0x40000000` so the f32 bit pattern
+    /// stays a normal float). Zero (the default) keeps the full-viewport grid.
+    pub sparse_base: u32,
+    pub sparse_n: u32,
 }
 
 /// CPU side setup and configuration.
@@ -231,7 +235,8 @@ impl RenderConfig {
                 seg_lo: 0,
                 scratch_out: [0; 2],
                 scratch_in: [0; 2],
-                _pad_seg: [0; 2],
+                sparse_base: 0,
+                sparse_n: 0,
                 layout: *layout,
             },
             workgroup_counts,

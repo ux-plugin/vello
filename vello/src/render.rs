@@ -439,6 +439,15 @@ impl PhasedSession {
         self.cpu_config.gpu.scratch_in = scratch_in;
     }
 
+    /// Set the sparse tile list for the NEXT fine dispatch: the grid becomes `(n, 1, 1)` workgroups
+    /// and workgroup `i` reads its tile coordinate from `effect_params[base + i]` (packed
+    /// `y<<16 | x`, biased by `0x40000000`). Each `record_fine_segment*` consumes it into its
+    /// per-dispatch config and resets to zero, so a full-viewport call needs no set.
+    pub fn set_sparse(&mut self, base: u32, n: u32) {
+        self.cpu_config.gpu.sparse_base = base;
+        self.cpu_config.gpu.sparse_n = n;
+    }
+
     /// DEBUG: the bump buffer's resource id, for the post-frame diagnostics readback.
     pub fn debug_bump_proxy_id(&self) -> crate::recording::ResourceId {
         self.bump_buf.as_buf().unwrap().id
@@ -832,6 +841,11 @@ pub(crate) fn record_fine_segment(
     // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
     session.cpu_config.gpu.scratch_out = [0; 2];
     session.cpu_config.gpu.scratch_in = [0; 2];
+    // Consume the sparse tile list the same way: it applies to exactly this dispatch. A non-zero
+    // count shrinks the grid to one workgroup per listed tile (`set_sparse`).
+    session.cpu_config.gpu.sparse_base = 0;
+    session.cpu_config.gpu.sparse_n = 0;
+    let fine_wg = if seg_cfg.sparse_n != 0 { (seg_cfg.sparse_n, 1, 1) } else { wg_counts.fine };
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
@@ -839,14 +853,14 @@ pub(crate) fn record_fine_segment(
         None => {
             recording.dispatch(
                 fine_area,
-                wg_counts.fine,
+                fine_wg,
                 [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf],
             );
         }
         Some(base) => {
             recording.dispatch(
                 fine_area_load,
-                wg_counts.fine,
+                fine_wg,
                 [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
             );
         }
@@ -882,12 +896,17 @@ pub(crate) fn record_fine_segment_draft(
     // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
     session.cpu_config.gpu.scratch_out = [0; 2];
     session.cpu_config.gpu.scratch_in = [0; 2];
+    // Consume the sparse tile list the same way: it applies to exactly this dispatch. A non-zero
+    // count shrinks the grid to one workgroup per listed tile (`set_sparse`).
+    session.cpu_config.gpu.sparse_base = 0;
+    session.cpu_config.gpu.sparse_n = 0;
+    let fine_wg = if seg_cfg.sparse_n != 0 { (seg_cfg.sparse_n, 1, 1) } else { wg_counts.fine };
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
     recording.dispatch(
         fine_area_load_draft,
-        wg_counts.fine,
+        fine_wg,
         [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(draft)],
     );
     recording.free_resource(config_buf);
@@ -922,12 +941,17 @@ pub(crate) fn record_fine_segment_input(
     // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
     session.cpu_config.gpu.scratch_out = [0; 2];
     session.cpu_config.gpu.scratch_in = [0; 2];
+    // Consume the sparse tile list the same way: it applies to exactly this dispatch. A non-zero
+    // count shrinks the grid to one workgroup per listed tile (`set_sparse`).
+    session.cpu_config.gpu.sparse_base = 0;
+    session.cpu_config.gpu.sparse_n = 0;
+    let fine_wg = if seg_cfg.sparse_n != 0 { (seg_cfg.sparse_n, 1, 1) } else { wg_counts.fine };
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
     recording.dispatch(
         fine_area_load_input,
-        wg_counts.fine,
+        fine_wg,
         [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(input)],
     );
     recording.free_resource(config_buf);
@@ -960,12 +984,17 @@ pub(crate) fn record_fine_segment_rw(
     // (full-viewport) call is inert. The caller sets them via `set_scratch_origins` right before.
     session.cpu_config.gpu.scratch_out = [0; 2];
     session.cpu_config.gpu.scratch_in = [0; 2];
+    // Consume the sparse tile list the same way: it applies to exactly this dispatch. A non-zero
+    // count shrinks the grid to one workgroup per listed tile (`set_sparse`).
+    session.cpu_config.gpu.sparse_base = 0;
+    session.cpu_config.gpu.sparse_n = 0;
+    let fine_wg = if seg_cfg.sparse_n != 0 { (seg_cfg.sparse_n, 1, 1) } else { wg_counts.fine };
     let config_buf =
         ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
 
     recording.dispatch(
         fine_area_rw,
-        wg_counts.fine,
+        fine_wg,
         [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas],
     );
     recording.free_resource(config_buf);

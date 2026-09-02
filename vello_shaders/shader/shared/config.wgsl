@@ -52,7 +52,7 @@ struct Config {
     // round); a command's round is that of the last marker before it on ITS tile, so untouched
     // tiles render early and total passes scale with effect stack depth, not effect count.
     // `seg_target == SEG_ALL` removes the upper bound; with `seg_lo == 0` (the defaults) that is
-    // the normal, non-windowed render. `_pad_seg*` keep the uniform a multiple of 16 bytes (a
+    // the normal, non-windowed render. the sparse fields keep the uniform a multiple of 16 bytes (a
     // WebGPU requirement). Must be kept in sync with `ConfigUniform` in `vello_encoding/src/config.rs`.
     seg_target: u32,
     seg_lo: u32,
@@ -64,8 +64,11 @@ struct Config {
     scratch_out_y: u32,
     scratch_in_x: u32,
     scratch_in_y: u32,
-    _pad_seg0: u32,
-    _pad_seg1: u32,
+    // Sparse window dispatch: when `sparse_n != 0`, fine's grid is `(sparse_n, 1, 1)` workgroups and
+    // workgroup i's tile coordinate is read from `effect_params[sparse_base + i]` (`y<<16 | x`,
+    // biased by 0x40000000 — see fine.wgsl `main`). Zero = full-viewport grid, byte-identical.
+    sparse_base: u32,
+    sparse_n: u32,
 }
 
 // Sentinel `seg_target` value meaning "render all segments in one pass" (the non-segmented default).
