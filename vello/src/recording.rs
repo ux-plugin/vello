@@ -38,6 +38,9 @@ pub struct BufferProxy {
 pub enum ImageFormat {
     Rgba8,
     Bgra8,
+    /// One 32-bit uint texel — the packed-rgba8 accumulator/snapshot format (`pack4x8unorm`).
+    /// The only portable read-write storage format family in core WebGPU.
+    R32Uint,
 }
 
 /// Proxy used as a handle to an image.
@@ -249,6 +252,7 @@ impl ImageFormat {
         match self {
             Self::Rgba8 => wgpu::TextureFormat::Rgba8Unorm,
             Self::Bgra8 => wgpu::TextureFormat::Bgra8Unorm,
+            Self::R32Uint => wgpu::TextureFormat::R32Uint,
         }
     }
 
@@ -257,6 +261,7 @@ impl ImageFormat {
         match format {
             wgpu::TextureFormat::Rgba8Unorm => Some(Self::Rgba8),
             wgpu::TextureFormat::Bgra8Unorm => Some(Self::Bgra8),
+            wgpu::TextureFormat::R32Uint => Some(Self::R32Uint),
             _ => None,
         }
     }

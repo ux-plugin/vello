@@ -53,6 +53,26 @@ pub struct FullShaders {
     /// accumulator, no ping-pong; a tile with no work in the dispatch window returns untouched.
     /// Only valid on devices with rgba8unorm read-write storage.
     pub fine_area_rw: Option<ShaderId>,
+    /// `fine_area` with `acc_u32`: output is the PACKED accumulator (`r32uint`, one `pack4x8unorm`
+    /// texel per pixel) bound read-write — the seed window (clears to the base color, only writes).
+    /// r32uint read-write storage is core WebGPU: no adapter-specific features on any platform.
+    pub fine_area_u: Option<ShaderId>,
+    /// `fine_area_u` + `rw_accum load_base base_u32`: in-place composite over the packed accumulator
+    /// (own-pixel read-modify-write), with `base_in` a packed SNAPSHOT of the accumulator for the
+    /// arms' backdrop reads (orig, escaped taps, fused warps).
+    pub fine_area_rwu: Option<ShaderId>,
+    /// `fine_area_rwu` + `have_input`: a chained gather's composite (binding 10 = the previous
+    /// link's materialised surface).
+    pub fine_area_rwu_input: Option<ShaderId>,
+    /// `fine_area_rwu` + `have_draft`: a separable blur's V-at-composite (binding 10 = the H draft).
+    pub fine_area_rwu_draft: Option<ShaderId>,
+    /// `fine_area_load` with `base_u32`: a materialize window (rgba8 draft output) whose backdrop
+    /// is the packed snapshot.
+    pub fine_area_loadu: Option<ShaderId>,
+    /// `fine_area_loadu` + `have_input`.
+    pub fine_area_loadu_input: Option<ShaderId>,
+    /// `fine_area_loadu` + `have_draft`.
+    pub fine_area_loadu_draft: Option<ShaderId>,
     pub fine_msaa8: Option<ShaderId>,
     pub fine_msaa16: Option<ShaderId>,
     // 2-level dispatch works for CPU pathtag scan even for large
@@ -336,6 +356,81 @@ pub(crate) fn full_shaders(
     } else {
         None
     };
+    // The packed-accumulator permutation family: r32uint read-write output (core WebGPU — no
+    // feature gate) and/or an r32uint snapshot backdrop. Draft inputs stay rgba8.
+    let fine_resources_u = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+    ];
+    let fine_resources_rwu = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+    ];
+    let fine_resources_rwu_two = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let fine_resources_loadu = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+    ];
+    let fine_resources_loadu_two = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let area = aa_support.area;
+    let fine_area_u = area.then(|| add_shader!(fine_area_u, fine_resources_u, CpuShaderType::Missing));
+    let fine_area_rwu = area.then(|| add_shader!(fine_area_rwu, fine_resources_rwu, CpuShaderType::Missing));
+    let fine_area_rwu_input =
+        area.then(|| add_shader!(fine_area_rwu_input, fine_resources_rwu_two, CpuShaderType::Missing));
+    let fine_area_rwu_draft =
+        area.then(|| add_shader!(fine_area_rwu_draft, fine_resources_rwu_two, CpuShaderType::Missing));
+    let fine_area_loadu = area.then(|| add_shader!(fine_area_loadu, fine_resources_loadu, CpuShaderType::Missing));
+    let fine_area_loadu_input =
+        area.then(|| add_shader!(fine_area_loadu_input, fine_resources_loadu_two, CpuShaderType::Missing));
+    let fine_area_loadu_draft =
+        area.then(|| add_shader!(fine_area_loadu_draft, fine_resources_loadu_two, CpuShaderType::Missing));
     let fine_msaa8 = if aa_support.msaa8 {
         Some(add_shader!(
             fine_msaa8,
@@ -380,6 +475,13 @@ pub(crate) fn full_shaders(
         fine_area_load_draft,
         fine_area_load_input,
         fine_area_rw,
+        fine_area_u,
+        fine_area_rwu,
+        fine_area_rwu_input,
+        fine_area_rwu_draft,
+        fine_area_loadu,
+        fine_area_loadu_input,
+        fine_area_loadu_draft,
         fine_msaa8,
         fine_msaa16,
         pathtag_is_cpu: options.use_cpu,

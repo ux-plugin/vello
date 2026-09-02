@@ -448,6 +448,12 @@ impl PhasedSession {
         self.cpu_config.gpu.sparse_n = n;
     }
 
+    /// A fresh `R32Uint` (packed-rgba8) image proxy sized to the frame — the in-place accumulator
+    /// or its round-boundary snapshot.
+    pub(crate) fn new_packed_image(&self) -> ImageProxy {
+        ImageProxy::new(self.width, self.height, ImageFormat::R32Uint)
+    }
+
     /// DEBUG: the bump buffer's resource id, for the post-frame diagnostics readback.
     pub fn debug_bump_proxy_id(&self) -> crate::recording::ResourceId {
         self.bump_buf.as_buf().unwrap().id
@@ -997,6 +1003,136 @@ pub(crate) fn record_fine_segment_rw(
         fine_wg,
         [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas],
     );
+    recording.free_resource(config_buf);
+    recording
+}
+
+/// The shared head of every packed-accumulator fine recorder: per-dispatch config (window bounds,
+/// consumed scratch origins and sparse list) and the grid override.
+#[cfg(feature = "wgpu")]
+fn seg_config(
+    session: &mut PhasedSession,
+    recording: &mut Recording,
+    seg_lo: u32,
+    seg_target: u32,
+) -> (ResourceProxy, WorkgroupSize) {
+    let mut seg_cfg = session.cpu_config.gpu;
+    seg_cfg.seg_lo = seg_lo;
+    seg_cfg.seg_target = seg_target;
+    session.cpu_config.gpu.scratch_out = [0; 2];
+    session.cpu_config.gpu.scratch_in = [0; 2];
+    session.cpu_config.gpu.sparse_base = 0;
+    session.cpu_config.gpu.sparse_n = 0;
+    let fine_wg = if seg_cfg.sparse_n != 0 {
+        (seg_cfg.sparse_n, 1, 1)
+    } else {
+        session.cpu_config.workgroup_counts.fine
+    };
+    let config_buf =
+        ResourceProxy::Buffer(recording.upload_uniform("vello.config.seg", bytemuck::bytes_of(&seg_cfg)));
+    (config_buf, fine_wg)
+}
+
+/// The SEED window over the packed accumulator: `fine_area_u` clears to the config base color and
+/// writes the r32uint target; nothing is read.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_seed_u(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    out_image: ImageProxy,
+) -> Recording {
+    let shader = shaders.fine_area_u.expect("packed accumulator needs fine_area_u");
+    let mut recording = Recording::default();
+    let (config_buf, fine_wg) = seg_config(session, &mut recording, seg_lo, seg_target);
+    recording.dispatch(
+        shader,
+        fine_wg,
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf],
+    );
+    recording.free_resource(config_buf);
+    recording
+}
+
+/// An in-place COMPOSITE window over the packed accumulator (`fine_area_rwu*`): the r32uint target
+/// is read-modified-written per own pixel; `snap` is the round's packed backdrop snapshot for the
+/// arms' neighbourhood/orig reads; `slot10` (when present) is the chained input or blur draft.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_rwu(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    snap: ImageProxy,
+    slot10: Option<(bool, ImageProxy)>,
+    out_image: ImageProxy,
+) -> Recording {
+    let mut recording = Recording::default();
+    let (config_buf, fine_wg) = seg_config(session, &mut recording, seg_lo, seg_target);
+    match slot10 {
+        None => {
+            let shader = shaders.fine_area_rwu.expect("packed accumulator needs fine_area_rwu");
+            recording.dispatch(
+                shader,
+                fine_wg,
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap)],
+            );
+        }
+        Some((is_draft, extra)) => {
+            let shader = if is_draft {
+                shaders.fine_area_rwu_draft.expect("packed accumulator needs fine_area_rwu_draft")
+            } else {
+                shaders.fine_area_rwu_input.expect("packed accumulator needs fine_area_rwu_input")
+            };
+            recording.dispatch(
+                shader,
+                fine_wg,
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra)],
+            );
+        }
+    }
+    recording.free_resource(config_buf);
+    recording
+}
+
+/// A MATERIALIZE window whose backdrop is the packed snapshot (`fine_area_loadu*`): output is an
+/// rgba8 draft (a lease in the scratch atlas or a full-viewport fallback), `snap` serves the arms'
+/// backdrop reads, `slot10` the chained input or blur draft.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_loadu(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    snap: ImageProxy,
+    slot10: Option<(bool, ImageProxy)>,
+    out_image: ImageProxy,
+) -> Recording {
+    let mut recording = Recording::default();
+    let (config_buf, fine_wg) = seg_config(session, &mut recording, seg_lo, seg_target);
+    match slot10 {
+        None => {
+            let shader = shaders.fine_area_loadu.expect("packed accumulator needs fine_area_loadu");
+            recording.dispatch(
+                shader,
+                fine_wg,
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap)],
+            );
+        }
+        Some((is_draft, extra)) => {
+            let shader = if is_draft {
+                shaders.fine_area_loadu_draft.expect("packed accumulator needs fine_area_loadu_draft")
+            } else {
+                shaders.fine_area_loadu_input.expect("packed accumulator needs fine_area_loadu_input")
+            };
+            recording.dispatch(
+                shader,
+                fine_wg,
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra)],
+            );
+        }
+    }
     recording.free_resource(config_buf);
     recording
 }

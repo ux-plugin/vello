@@ -44,12 +44,20 @@ var<storage, read_write> blend_spill: array<u32>;
 // updates it in place: a tile whose window holds no work returns before touching a pixel, so the
 // pass cost scales with the tiles that change, not the viewport. Requires rgba8unorm read-write
 // storage (adapter-specific format features / the browser's `texture-formats-tier2`).
+// The `acc_u32` permutations write the packed accumulator: one r32uint texel per pixel holding
+// `pack4x8unorm(premul rgba)` — the only READ-WRITE storage format core WebGPU guarantees on every
+// platform, so the single in-place accumulator needs no adapter-specific features anywhere.
+#ifdef acc_u32
+@group(0) @binding(5)
+var output: texture_storage_2d<r32uint, read_write>;
+#else
 #ifdef rw_accum
 @group(0) @binding(5)
 var output: texture_storage_2d<rgba8unorm, read_write>;
 #else
 @group(0) @binding(5)
 var output: texture_storage_2d<rgba8unorm, write>;
+#endif
 #endif
 
 @group(0) @binding(6)
@@ -68,8 +76,25 @@ var<storage> effect_params: array<f32>;
 // as its base instead of `config.base_color`. (A separate input texture — not the write target — so
 // there is no read/write hazard; the caller ping-pongs the two across phases.)
 #ifdef load_base
+#ifdef base_u32
+// The backdrop under `base_u32` is a SNAPSHOT of the packed r32uint accumulator (an encoder-level
+// copy taken at the round boundary): the live accumulator is a write-only target for fine, and
+// every backdrop read comes through here, unpacked per texel.
+@group(0) @binding(9)
+var base_in: texture_2d<u32>;
+#else
 @group(0) @binding(9)
 var base_in: texture_2d<f32>;
+#endif
+
+// One backdrop texel as premul rgba, whatever the binding's texel format.
+fn base_ld(p: vec2<i32>) -> vec4<f32> {
+#ifdef base_u32
+    return unpack4x8unorm(textureLoad(base_in, p, 0).x);
+#else
+    return textureLoad(base_in, p, 0);
+#endif
+}
 
 // Bilinear sample of the materialised backdrop at a continuous pixel position — the manual equivalent
 // of the batched lens oracle's linear `unitSample`. `pos = px + disp`; the sampler's −0.5 texel-centre
@@ -80,10 +105,10 @@ fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
     let fl = floor(pos);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = pos - fl;
-    let s00 = textureLoad(base_in, i0, 0);
-    let s10 = textureLoad(base_in, i0 + vec2<i32>(1, 0), 0);
-    let s01 = textureLoad(base_in, i0 + vec2<i32>(0, 1), 0);
-    let s11 = textureLoad(base_in, i0 + vec2<i32>(1, 1), 0);
+    let s00 = base_ld(i0);
+    let s10 = base_ld(i0 + vec2<i32>(1, 0));
+    let s01 = base_ld(i0 + vec2<i32>(0, 1));
+    let s11 = base_ld(i0 + vec2<i32>(1, 1));
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
@@ -1514,7 +1539,7 @@ fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<
     if (d.bits & 32u) != 0u {
         v = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
     } else {
-        let orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+        let orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
         v = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, v, orig, fld, d.u);
     }
 #else
@@ -1575,7 +1600,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
 #else
         let tc = sp;
         let dims = vec2<i32>(textureDimensions(base_in));
-        var rawtap = textureLoad(base_in, tc, 0);
+        var rawtap = base_ld(tc);
 #endif
 #endif
         var inb = tc.x >= 0 && tc.y >= 0 && tc.x < dims.x && tc.y < dims.y;
@@ -1589,7 +1614,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
                 // A backdrop chain's draft stored its window base on every unmarked tile: beyond
                 // the rect the tap reads the same base directly; past the viewport, the page.
                 if (!in_rect) {
-                    rawtap = textureLoad(base_in, sp, 0);
+                    rawtap = base_ld(sp);
                 }
                 inb = sp.x >= 0 && sp.y >= 0
                     && sp.x < i32(config.target_width) && sp.y < i32(config.target_height);
@@ -1610,7 +1635,7 @@ fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
     let fdims = vec2<i32>(textureDimensions(base_in));
     let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
-    let flood = select(0.0, textureLoad(base_in, fpx, 0).a, finb);
+    let flood = select(0.0, base_ld(fpx).a, finb);
     return vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * punch_a));
 }
 #endif
@@ -1669,7 +1694,7 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
 #ifdef load_base
     if (d.bits & 32u) != 0u && src_value != 2.0 {
         value = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
-        orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+        orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
     }
     if (d.bits & 64u) != 0u {
         value = fx_blur_value(d, vec2<i32>(i32(px.x), i32(px.y)));
@@ -1695,7 +1720,7 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
         if src_orig == 2.0 {
             orig = fx_bilin_input(px - d.rec[1].yz);
         } else {
-            orig = textureLoad(base_in, vec2<i32>(i32(px.x), i32(px.y)), 0);
+            orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
         }
     }
 #endif
@@ -1730,6 +1755,18 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             let round = ptcl[scan_ix + 3u];
             if config.seg_target != SEG_ALL && round >= config.seg_target {
                 break;
+            }
+            // The mark ITSELF is work when its key (own round, or the tile's current segment for
+            // an inline mark) falls inside the window — mirror of `fx_run_mark`'s gate. Without
+            // this, a tile whose only in-window content is a composite mark is skipped and the
+            // effect never lands.
+            let effect_id = ptcl[scan_ix + 1u];
+            let inline_base = ptcl[scan_ix + 4u];
+            let inline_key = select(scan_seg, round, fx_keys_on_round(inline_base));
+            if effect_id >= EFFECT_INLINE_BASE
+                && inline_key >= config.seg_lo
+                && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
+                return true;
             }
             scan_seg = round;
             scan_ix += 6u;
@@ -1777,7 +1814,11 @@ fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         let coords = xy_uint + vec2(i, 0u);
         if coords.x < config.target_width && coords.y < config.target_height {
+#ifdef acc_u32
+            textureStore(output, vec2<i32>(coords) - active_scratch_out, vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
+#else
             textureStore(output, vec2<i32>(coords) - active_scratch_out, (*rgba)[i]);
+#endif
         }
     }
 }
@@ -1816,7 +1857,11 @@ fn main(
     }
     let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+#ifdef acc_u32
+        rgba[i] = unpack4x8unorm(textureLoad(output, base_xy + vec2(i32(i), 0)).x);
+#else
         rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0));
+#endif
     }
 #else
 #ifdef load_base
@@ -1828,7 +1873,7 @@ fn main(
         // Load the previous phase's output (stored premultiplied, see the store below) straight into
         // the premultiplied accumulator — no conversion, since the base is already in the same space
         // the source-over blend works in.
-        let b = textureLoad(base_in, base_xy + vec2(i32(i), 0), 0);
+        let b = base_ld(base_xy + vec2(i32(i), 0));
         rgba[i] = b;
     }
 #else

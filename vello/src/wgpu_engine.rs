@@ -939,7 +939,11 @@ impl WgpuEngine {
                         visibility,
                         ty: if bind_type == BindType::ImageRead(format) {
                             wgpu::BindingType::Texture {
-                                sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                                sample_type: if format == crate::recording::ImageFormat::R32Uint {
+                                    wgpu::TextureSampleType::Uint
+                                } else {
+                                    wgpu::TextureSampleType::Float { filterable: true }
+                                },
                                 view_dimension: TextureViewDimension::D2,
                                 multisampled: false,
                             }
