@@ -57,6 +57,9 @@ pub struct FullShaders {
     /// texel per pixel) bound read-write — the seed window (clears to the base color, only writes).
     /// r32uint read-write storage is core WebGPU: no adapter-specific features on any platform.
     pub fine_area_u: Option<ShaderId>,
+    /// `fine_area` with `draft_clear`: a RASTERIZE window — transparent init, rgba8 draft output,
+    /// no base or slot-10 bindings; the window's fenced draws paint a silhouette into its lease.
+    pub fine_area_draft: Option<ShaderId>,
     /// `fine_area_u` + `rw_accum load_base base_u32`: in-place composite over the packed accumulator
     /// (own-pixel read-modify-write), with `base_in` a packed SNAPSHOT of the accumulator for the
     /// arms' backdrop reads (orig, escaped taps, fused warps).
@@ -419,8 +422,21 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
     ];
+    let fine_resources_draft = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+    ];
     let area = aa_support.area;
     let fine_area_u = area.then(|| add_shader!(fine_area_u, fine_resources_u, CpuShaderType::Missing));
+    let fine_area_draft =
+        area.then(|| add_shader!(fine_area_draft, fine_resources_draft, CpuShaderType::Missing));
     let fine_area_rwu = area.then(|| add_shader!(fine_area_rwu, fine_resources_rwu, CpuShaderType::Missing));
     let fine_area_rwu_input =
         area.then(|| add_shader!(fine_area_rwu_input, fine_resources_rwu_two, CpuShaderType::Missing));
@@ -476,6 +492,7 @@ pub(crate) fn full_shaders(
         fine_area_load_input,
         fine_area_rw,
         fine_area_u,
+        fine_area_draft,
         fine_area_rwu,
         fine_area_rwu_input,
         fine_area_rwu_draft,

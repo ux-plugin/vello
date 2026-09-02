@@ -1472,6 +1472,11 @@ fn fx_run_mark(
     if (d.rec[4].x != 0.0) {
         active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
     }
+    // A zero-bit mark is a pure FENCE: it claims the round and the store origin for its window's
+    // rasterized draws, and touches no pixel itself.
+    if (d.bits == 0u) {
+        return;
+    }
     let atomic_ctl = ptcl[cmd_ix + 5u];
     if (atomic_ctl & 1u) != 0u {
         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
@@ -1521,7 +1526,10 @@ fn fx_keys_on_round(base: u32) -> bool {
 #ifdef have_input
     return true;
 #else
-    return (u32(effect_params[base]) & (96u | 128u | 16384u)) != 0u;
+    // A ZERO-bit desc is a rasterize fence: it exists only to claim its own round's window and
+    // stamp the store origin for that window's draws, so it must key on its round.
+    let b = u32(effect_params[base]);
+    return b == 0u || (b & (96u | 128u | 16384u)) != 0u;
 #endif
 }
 // One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
@@ -1877,10 +1885,18 @@ fn main(
         rgba[i] = b;
     }
 #else
+#ifdef draft_clear
+    // A rasterize window: the output is a transparent draft lease the fenced silhouette draws
+    // paint into — never the base color.
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        rgba[i] = vec4(0.0);
+    }
+#else
     let base_color = unpack4x8unorm(config.base_color);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = base_color;
     }
+#endif
 #endif
 #endif
     var blend_stack: array<array<u32, PIXELS_PER_THREAD>, BLEND_STACK_SPLIT>;

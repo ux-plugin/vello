@@ -8,6 +8,7 @@ fine
 + fine_area_load_input: load_base have_input
 + fine_area_rw: rw_accum
 + fine_area_u: acc_u32
++ fine_area_draft: draft_clear
 + fine_area_rwu: rw_accum acc_u32 load_base base_u32
 + fine_area_rwu_input: rw_accum acc_u32 load_base base_u32 have_input
 + fine_area_rwu_draft: rw_accum acc_u32 load_base base_u32 have_draft

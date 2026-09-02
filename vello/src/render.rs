@@ -1055,6 +1055,28 @@ pub(crate) fn record_fine_segment_seed_u(
     recording
 }
 
+/// A RASTERIZE window: `fine_area_draft` clears to transparent and lets the window's fenced draws
+/// paint into the rgba8 draft; the zero-bit mark's OUTPUT record shifts the stores into its lease.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_fine_segment_draftonly(
+    session: &mut PhasedSession,
+    shaders: &FullShaders,
+    seg_lo: u32,
+    seg_target: u32,
+    out_image: ImageProxy,
+) -> Recording {
+    let shader = shaders.fine_area_draft.expect("source fold needs fine_area_draft");
+    let mut recording = Recording::default();
+    let (config_buf, fine_wg) = seg_config(session, &mut recording, seg_lo, seg_target);
+    recording.dispatch(
+        shader,
+        fine_wg,
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf],
+    );
+    recording.free_resource(config_buf);
+    recording
+}
+
 /// An in-place COMPOSITE window over the packed accumulator (`fine_area_rwu*`): the r32uint target
 /// is read-modified-written per own pixel; `snap` is the round's packed backdrop snapshot for the
 /// arms' neighbourhood/orig reads; `slot10` (when present) is the chained input or blur draft.

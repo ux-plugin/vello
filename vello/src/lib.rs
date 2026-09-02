@@ -903,6 +903,35 @@ impl Renderer {
         Ok(())
     }
 
+    /// Dispatch a RASTERIZE window (`fine_area_draft`): transparent init, the window's fenced
+    /// draws paint the rgba8 draft `out`.
+    pub fn phased_fine_segment_draftonly_into(
+        &mut self,
+        session: &mut render::PhasedSession,
+        device: &Device,
+        queue: &Queue,
+        encoder: &mut wgpu::CommandEncoder,
+        seg_lo: u32,
+        seg_target: u32,
+        out: &TextureView,
+    ) -> Result<()> {
+        let out_image = session.new_out_image();
+        let recording = render::record_fine_segment_draftonly(session, &self.shaders, seg_lo, seg_target, out_image);
+        let external_resources = [ExternalResource::Image(out_image, out)];
+        self.engine.run_recording_into(
+            device,
+            queue,
+            &recording,
+            &external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            &mut self.profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            "phased_fine_segment_draftonly_into",
+        )?;
+        Ok(())
+    }
+
     /// Dispatch an in-place COMPOSITE window over the packed accumulator (`fine_area_rwu*`):
     /// `target` (r32uint, STORAGE_BINDING) is read-modified-written per own pixel; `snap` (r32uint,
     /// TEXTURE_BINDING) is the round's backdrop snapshot; `slot10` is `Some((is_draft, view))` for a
