@@ -177,6 +177,11 @@ var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
 // then a FLUSH boundary: the register tile is stored to the claimed lease and reset before the new
 // origin is adopted, so overlapping fenced draws on one tile keep distinct leases within ONE window.
 var<private> fence_live: bool = false;
+// The tile's WINDOW range: config.seg_lo/seg_target by default; a merged dispatch's sparse entry
+// (bit 29 on the tile word) overrides both from its parallel range word, so each workgroup walks
+// its own window.
+var<private> win_lo: u32 = 0u;
+var<private> win_hi: u32 = 0u;
 
 // MSAA-only bindings and utilities
 #ifdef msaa
@@ -1469,8 +1474,8 @@ fn fx_run_mark(
     let effect_id = ptcl[cmd_ix + 1u];
     let inline_base = ptcl[cmd_ix + 4u];
     let inline_key = select(seg_current, round, fx_keys_on_round(inline_base));
-    if effect_id < EFFECT_INLINE_BASE || inline_key < config.seg_lo
-        || (config.seg_target != SEG_ALL && inline_key >= config.seg_target) {
+    if effect_id < EFFECT_INLINE_BASE || inline_key < win_lo
+        || (win_hi != SEG_ALL && inline_key >= win_hi) {
         return;
     }
     let d = fx_load_desc(inline_base);
@@ -1801,7 +1806,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
         }
         if t == CMD_EFFECT {
             let round = ptcl[scan_ix + 3u];
-            if config.seg_target != SEG_ALL && round >= config.seg_target {
+            if win_hi != SEG_ALL && round >= win_hi {
                 break;
             }
             // The mark ITSELF is work when its key (own round, or the tile's current segment for
@@ -1812,8 +1817,8 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             let inline_base = ptcl[scan_ix + 4u];
             let inline_key = select(scan_seg, round, fx_keys_on_round(inline_base));
             if effect_id >= EFFECT_INLINE_BASE
-                && inline_key >= config.seg_lo
-                && (config.seg_target == SEG_ALL || inline_key < config.seg_target) {
+                && inline_key >= win_lo
+                && (win_hi == SEG_ALL || inline_key < win_hi) {
                 return true;
             }
             scan_seg = round;
@@ -1824,8 +1829,8 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             scan_ix = ptcl[scan_ix + 1u];
             continue;
         }
-        let in_window = scan_seg >= config.seg_lo
-            && (config.seg_target == SEG_ALL || scan_seg < config.seg_target);
+        let in_window = scan_seg >= win_lo
+            && (win_hi == SEG_ALL || scan_seg < win_hi);
         if in_window && t != CMD_FILL && t != CMD_SOLID {
             return true;
         }
@@ -1889,10 +1894,20 @@ fn main(
     // (packed `y<<16 | x`, biased by 0x40000000 so the f32 bit pattern is always a normal float).
     // The planner emits the list from the window's marker reach quads, so a tile outside every
     // effect's reach never launches. `sparse_n == 0` keeps the full-viewport grid.
+    win_lo = config.seg_lo;
+    win_hi = config.seg_target;
     var tile_xy = wg_id.xy;
     if (config.sparse_n != 0u) {
-        let packed = bitcast<u32>(effect_params[config.sparse_base + wg_id.x]) & 0x3fffffffu;
-        tile_xy = vec2(packed & 0xffffu, packed >> 16u);
+        let raw = bitcast<u32>(effect_params[config.sparse_base + wg_id.x]);
+        tile_xy = vec2(raw & 0xffffu, (raw >> 16u) & 0x1fffu);
+        // A MERGED window's entry (bit 29) carries this tile's own range in the parallel block
+        // right after the tile words: lo in bits 0..12, hi in 12..24, 0xfff = open end.
+        if ((raw & 0x20000000u) != 0u) {
+            let rw = bitcast<u32>(effect_params[config.sparse_base + config.sparse_n + wg_id.x]);
+            win_lo = rw & 0xfffu;
+            let h = (rw >> 12u) & 0xfffu;
+            win_hi = select(h, SEG_ALL, h == 0xfffu);
+        }
     }
     let tile_ix = tile_xy.y * config.width_in_tiles + tile_xy.x;
     let xy = vec2(f32(tile_xy.x * TILE_WIDTH + local_id.x * PIXELS_PER_THREAD), f32(tile_xy.y * TILE_HEIGHT + local_id.y));
@@ -1955,15 +1970,15 @@ fn main(
         if tag == CMD_EFFECT {
             let round = ptcl[cmd_ix + 3u];
             fx_run_mark(cmd_ix, seg_current, xy, &rgba, &chain, &area);
-            if config.seg_target != SEG_ALL && round >= config.seg_target {
+            if win_hi != SEG_ALL && round >= win_hi {
                 break;
             }
             seg_current = round;
             cmd_ix += 6u;
             continue;
         }
-        let seg_active = seg_current >= config.seg_lo
-            && (config.seg_target == SEG_ALL || seg_current < config.seg_target);
+        let seg_active = seg_current >= win_lo
+            && (win_hi == SEG_ALL || seg_current < win_hi);
         switch tag {
             case CMD_FILL: {
                 let fill = read_fill(cmd_ix);
