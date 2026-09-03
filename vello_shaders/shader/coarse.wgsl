@@ -63,6 +63,10 @@ var<workgroup> sh_tile_base: array<u32, WG_SIZE>;
 
 var<private> cmd_offset: u32;
 var<private> cmd_limit: u32;
+// The slot pair awaiting this tile's next marker offsets ([slot] = group start, [slot + 1] =
+// marker word): the head-link header words first, then each emitted marker's link words. Patched
+// (same thread, plain store) when the next group lands.
+var<private> fx_link_slot: u32;
 
 // Make sure there is space for a command of given size, plus a jump if needed
 fn alloc_cmd(size: u32) {
@@ -154,14 +158,16 @@ fn write_blurred_rounded_rect(color: CmdColor, info_offset: u32) {
 }
 
 fn write_effect(effect_id: u32, p0: u32, p1: u32, p2: u32, p3: u32) {
-    alloc_cmd(6u);
+    alloc_cmd(8u);
     ptcl[cmd_offset] = CMD_EFFECT;
     ptcl[cmd_offset + 1u] = effect_id;
     ptcl[cmd_offset + 2u] = p0;
     ptcl[cmd_offset + 3u] = p1;
     ptcl[cmd_offset + 4u] = p2;
     ptcl[cmd_offset + 5u] = p3;
-    cmd_offset += 6u;
+    ptcl[cmd_offset + 6u] = 0u;
+    ptcl[cmd_offset + 7u] = 0u;
+    cmd_offset += 8u;
 }
 
 @compute @workgroup_size(256)
@@ -220,6 +226,12 @@ fn main(
 
     let blend_offset = cmd_offset;
     cmd_offset += 1u;
+    fx_link_slot = cmd_offset;
+    if bin_tile_x + tile_x < config.width_in_tiles && bin_tile_y + tile_y < config.height_in_tiles {
+        ptcl[fx_link_slot] = 0u;
+        ptcl[fx_link_slot + 1u] = 0u;
+    }
+    cmd_offset += 2u;
 
     while true {
         for (var i = 0u; i < N_SLICE; i += 1u) {
@@ -401,16 +413,21 @@ fn main(
                         write_blurred_rounded_rect(CmdColor(rgba_color), info_offset);
                     }
                     case DRAWTAG_EFFECT: {
-                        // A barrier effect (id < 100) records ONLY the 6-word marker: a z-boundary for
+                        // A barrier effect (id < 100) records ONLY the 8-word marker: a z-boundary for
                         // segmented fine, not a paint, so `write_path` is skipped and the effect
                         // composites separately post-fine. An INLINE effect (id >= 100, effects-in-fine)
                         // ALSO emits its shape's coverage as a `CmdFill` first, so fine's `area[i]` holds
                         // the silhouette when it applies the effect to the accumulator (masked by it).
                         let effect_id = scene[dd];
+                        let fx_group = cmd_offset;
                         if effect_id >= 100u {
                             write_path(tile, tile_ix, draw_flags);
                         }
+                        let fx_marker = cmd_offset;
                         write_effect(effect_id, scene[dd + 1u], scene[dd + 2u], scene[dd + 3u], scene[dd + 4u]);
+                        ptcl[fx_link_slot] = fx_group;
+                        ptcl[fx_link_slot + 1u] = fx_marker;
+                        fx_link_slot = cmd_offset - 2u;
                     }
                     case DRAWTAG_FILL_LIN_GRADIENT: {
                         write_path(tile, tile_ix, draw_flags);

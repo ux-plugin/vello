@@ -1797,7 +1797,13 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
 // touching a pixel; the accumulator already holds the right bytes. The walk must mirror the
 // interpreter's tag sizes EXACTLY, or a param is read as a tag and the decision corrupts.
 fn fx_window_has_work(tile_ix: u32) -> bool {
-    var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 1u;
+    var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 3u;
+    if win_lo > 0u {
+        let hm = ptcl[tile_ix * PTCL_INITIAL_ALLOC + 2u];
+        if hm != 0u {
+            scan_ix = hm;
+        }
+    }
     var scan_seg = 0u;
     while true {
         let t = ptcl[scan_ix];
@@ -1822,7 +1828,11 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
                 return true;
             }
             scan_seg = round;
-            scan_ix += 6u;
+            let hm = ptcl[scan_ix + 7u];
+            scan_ix += 8u;
+            if scan_seg < win_lo && hm != 0u {
+                scan_ix = hm;
+            }
             continue;
         }
         if t == CMD_JUMP {
@@ -1959,7 +1969,20 @@ fn main(
     var area: array<f32, PIXELS_PER_THREAD>;
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
-    cmd_ix += 1u;
+    // Header words 2/3 are the HEAD LINKS: the first marker's group/marker offsets. A window that
+    // starts past segment 0 jumps straight there — the plain-draw prefix below every effect is
+    // never decoded — landing on the group (the mark's own CmdFill) only when that mark's round
+    // reaches the window, on the bare marker otherwise so a gated mark's fill is skipped too.
+    let fx_head_group = ptcl[cmd_ix + 1u];
+    let fx_head_marker = ptcl[cmd_ix + 2u];
+    cmd_ix += 3u;
+    if win_lo > 0u && fx_head_group != 0u {
+        var pm = fx_head_marker;
+        if ptcl[pm] == CMD_JUMP {
+            pm = ptcl[pm + 1u];
+        }
+        cmd_ix = select(fx_head_marker, fx_head_group, ptcl[pm + 3u] >= win_lo);
+    }
     var seg_current = 0u;
     // main interpretation loop
     while true {
@@ -1974,7 +1997,21 @@ fn main(
                 break;
             }
             seg_current = round;
-            cmd_ix += 6u;
+            let fx_link_group = ptcl[cmd_ix + 6u];
+            let fx_link_marker = ptcl[cmd_ix + 7u];
+            cmd_ix += 8u;
+            // The whole segment this marker opens sits below the window: every command in it is a
+            // gated no-op, so jump to the next marker instead of decoding and filling it. The next
+            // mark's fill matters only if that mark can be live — its round reaches the window (its
+            // other possible key, the segment it closes, is this skipped one) — so peek the round
+            // (through a page jump if the group paged mid-emit) and land on the group only then.
+            if seg_current < win_lo && fx_link_group != 0u {
+                var pm = fx_link_marker;
+                if ptcl[pm] == CMD_JUMP {
+                    pm = ptcl[pm + 1u];
+                }
+                cmd_ix = select(fx_link_marker, fx_link_group, ptcl[pm + 3u] >= win_lo);
+            }
             continue;
         }
         let seg_active = seg_current >= win_lo

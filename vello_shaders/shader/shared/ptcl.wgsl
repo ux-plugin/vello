@@ -23,10 +23,18 @@ const CMD_BEGIN_CLIP = 10u;
 const CMD_END_CLIP = 11u;
 const CMD_JUMP = 12u;
 const CMD_BLUR_RECT = 13u;
-// Backdrop-effect boundary marker. Layout: [CMD_EFFECT, effect_id, p0, p1, p2, p3] (6 words).
-// p0 = the effect's z index + 1 (diagnostic); p1 = the effect's ROUND, which fine uses to set the
-// tile's running round for windowed dispatches. Fine steps over the marker (the effect runs as a
-// post-fine dispatch); the scheduler reads effect_id + params.
+// Backdrop-effect boundary marker. Layout: [CMD_EFFECT, effect_id, p0, p1, p2, p3, link_group,
+// link_marker] (8 words). p0 = the effect's z index + 1 (diagnostic); p1 = the effect's ROUND,
+// which fine uses to set the tile's running round for windowed dispatches. Fine steps over the
+// marker (the effect runs as a post-fine dispatch); the scheduler reads effect_id + params. The
+// two links address the NEXT marker on this tile (0 = last marker), backpatched by coarse, so a
+// fine dispatch whose window starts later can JUMP over a whole inactive segment instead of
+// decoding and coverage-rasterizing every command in it: `link_group` is the group start — the
+// next inline mark's own CmdFill, the silhouette it masks by — taken when that mark may be live
+// (its round reaches the window); `link_marker` is the marker word itself, taken when the next
+// mark is gated too, so its fill's coverage rasterization is also skipped. The tile header's
+// second/third words (after blend_offset) are the HEAD group/marker links to the first marker
+// (0 = no markers).
 const CMD_EFFECT = 14u;
 
 // The individual PTCL structs are written here, but read/write is by
