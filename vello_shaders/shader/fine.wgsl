@@ -1695,7 +1695,11 @@ fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f
 #ifdef have_input
 // The frost scatter at one pixel (bit 256): a 12-tap jittered read of the input scratch (shifted
 // to its lease frame by record 0's window), jitter radius frost (u[4].z) × scale (u[4].x); zero
-// frost degenerates to one bilinear read.
+// frost degenerates to one bilinear read. Taps clamp to the lens box + a rim margin: the scratch
+// is only WRITTEN over the mark's reach tiles, so an unclamped tap past them reads the lease's
+// previous tenant — phantom content, visible whenever frost × scale outruns the reach slack (high
+// zoom). The margin stays under the reach's own +20, and the mask confines the display to the
+// lens, so clamping costs nothing visually.
 fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     let frost = d.u[4].z;
     let scl = d.u[4].x;
@@ -1704,11 +1708,15 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     if (frost <= 0.01) {
         return fx_bilin_input(px - win);
     }
+    let lens_c = d.u[0].zw;
+    let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
+    let lo = lens_c - lens_h;
+    let hi = lens_c + lens_h;
     var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
-        sacc = sacc + fx_bilin_input(px - win + off);
+        sacc = sacc + fx_bilin_input(clamp(px + off, lo, hi) - win);
     }
     return sacc / 12.0;
 }
