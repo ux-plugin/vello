@@ -122,6 +122,9 @@ pub mod low_level {
     //!
     //! These APIs have not been carefully designed, and might not be powerful enough for this use case.
 
+    #[cfg(feature = "wgpu")]
+    pub use crate::wgpu_engine::dispatch_stats;
+
     pub use crate::debug::DebugLayers;
     pub use crate::recording::{
         BindType, BufferProxy, Command, ImageFormat, ImageProxy, Recording, ResourceId,

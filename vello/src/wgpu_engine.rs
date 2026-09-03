@@ -52,6 +52,19 @@ pub(crate) struct WgpuEngine {
     pending_dispatches: Vec<PendingDispatch>,
 }
 
+/// DEBUG counters: compute passes actually begun and dispatches issued through the pending queue
+/// (native probes read them via [`dispatch_stats`]; wraparound is irrelevant at probe scale).
+static STAT_PASSES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static STAT_DISPATCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Read the (passes, dispatches) debug counters.
+pub fn dispatch_stats() -> (u64, u64) {
+    (
+        STAT_PASSES.load(std::sync::atomic::Ordering::Relaxed),
+        STAT_DISPATCHES.load(std::sync::atomic::Ordering::Relaxed),
+    )
+}
+
 struct PendingDispatch {
     shader: ShaderId,
     wg: (u32, u32, u32),
@@ -62,6 +75,8 @@ fn flush_pending(pending: &mut Vec<PendingDispatch>, shaders: &[Shader], encoder
     if pending.is_empty() {
         return;
     }
+    STAT_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    STAT_DISPATCHES.fetch_add(pending.len() as u64, std::sync::atomic::Ordering::Relaxed);
     let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
     for p in pending.drain(..) {
         let shader = &shaders[p.shader.0];
@@ -834,6 +849,8 @@ impl WgpuEngine {
                             {
                                 desc.timestamp_writes = pass_query.compute_pass_timestamp_writes();
                             }
+                            STAT_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            STAT_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let mut cpass = encoder.begin_compute_pass(&desc);
                             #[cfg_attr(
                                 not(feature = "debug_layers"),
@@ -896,6 +913,8 @@ impl WgpuEngine {
                             {
                                 desc.timestamp_writes = pass_query.compute_pass_timestamp_writes();
                             }
+                            STAT_PASSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            STAT_DISPATCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                             let mut cpass = encoder.begin_compute_pass(&desc);
                             #[cfg_attr(
                                 not(feature = "debug_layers"),
