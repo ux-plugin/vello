@@ -63,6 +63,8 @@ pub struct FullShaders {
     /// `fine_area_u` + `rw_accum load_base base_u32`: in-place composite over the packed accumulator
     /// (own-pixel read-modify-write), with `base_in` a packed SNAPSHOT of the accumulator for the
     /// arms' backdrop reads (orig, escaped taps, fused warps).
+    /// Rect copy accumulator -> snapshot inside a compute pass (the batched blit).
+    pub snap_copy: Option<ShaderId>,
     pub fine_area_rwu: Option<ShaderId>,
     /// `fine_area_rwu` + `have_input`: a chained gather's composite (binding 10 = the previous
     /// link's materialised surface).
@@ -437,6 +439,13 @@ pub(crate) fn full_shaders(
     let fine_area_u = area.then(|| add_shader!(fine_area_u, fine_resources_u, CpuShaderType::Missing));
     let fine_area_draft =
         area.then(|| add_shader!(fine_area_draft, fine_resources_draft, CpuShaderType::Missing));
+    let snap_copy = area.then(|| {
+        add_shader!(
+            snap_copy,
+            [BufReadOnly, ImageRead(ImageFormat::R32Uint), Image(ImageFormat::R32Uint)],
+            CpuShaderType::Missing
+        )
+    });
     let fine_area_rwu = area.then(|| add_shader!(fine_area_rwu, fine_resources_rwu, CpuShaderType::Missing));
     let fine_area_rwu_input =
         area.then(|| add_shader!(fine_area_rwu_input, fine_resources_rwu_two, CpuShaderType::Missing));
@@ -493,6 +502,7 @@ pub(crate) fn full_shaders(
         fine_area_rw,
         fine_area_u,
         fine_area_draft,
+        snap_copy,
         fine_area_rwu,
         fine_area_rwu_input,
         fine_area_rwu_draft,

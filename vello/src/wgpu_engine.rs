@@ -46,6 +46,35 @@ pub(crate) struct WgpuEngine {
     /// why recycling them immediately would be unsound.
     pending_free_bufs: HashSet<ResourceId>,
     pending_free_images: HashSet<ResourceId>,
+    /// GPU dispatches recorded but not yet issued into a compute pass — consecutive dispatches
+    /// (across recordings, for the deferred phased path) share ONE pass when flushed. Always empty
+    /// in profiler builds (timestamps need per-dispatch passes).
+    pending_dispatches: Vec<PendingDispatch>,
+}
+
+struct PendingDispatch {
+    shader: ShaderId,
+    wg: (u32, u32, u32),
+    bind_group: BindGroup,
+}
+
+fn flush_pending(pending: &mut Vec<PendingDispatch>, shaders: &[Shader], encoder: &mut CommandEncoder) {
+    if pending.is_empty() {
+        return;
+    }
+    let mut cpass = encoder.begin_compute_pass(&ComputePassDescriptor::default());
+    for p in pending.drain(..) {
+        let shader = &shaders[p.shader.0];
+        let ShaderKind::Wgpu(wgpu_shader) = shader.select() else {
+            unreachable!("only GPU dispatches are enqueued");
+        };
+        let PipelineState::Compute(pipeline) = &wgpu_shader.pipeline else {
+            panic!("cannot issue a dispatch with a render pipeline");
+        };
+        cpass.set_pipeline(pipeline);
+        cpass.set_bind_group(0, &p.bind_group, &[]);
+        cpass.dispatch_workgroups(p.wg.0, p.wg.1, p.wg.2);
+    }
 }
 
 enum PipelineState {
@@ -433,6 +462,34 @@ impl WgpuEngine {
         #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
         #[cfg(feature = "wgpu-profiler")] label: &'static str,
     ) -> Result<()> {
+        let r = self.run_recording_into_deferred(
+            device,
+            queue,
+            recording,
+            external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            label,
+        );
+        self.flush_dispatches(encoder);
+        r
+    }
+
+    /// [`Self::run_recording_into`] without the trailing dispatch flush: consecutive recordings
+    /// into the SAME encoder keep extending one compute pass. The caller owns the invariant that
+    /// [`Self::flush_dispatches`] runs before the encoder is used directly or finished.
+    pub fn run_recording_into_deferred(
+        &mut self,
+        device: &Device,
+        queue: &Queue,
+        recording: &Recording,
+        external_resources: &[ExternalResource<'_>],
+        encoder: &mut CommandEncoder,
+        #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
+        #[cfg(feature = "wgpu-profiler")] label: &'static str,
+    ) -> Result<()> {
         let (free_bufs, free_images) = self.record(
             device,
             queue,
@@ -447,6 +504,40 @@ impl WgpuEngine {
         self.pending_free_bufs.extend(free_bufs);
         self.pending_free_images.extend(free_images);
         Ok(())
+    }
+
+    /// Issue every deferred dispatch into one compute pass on `encoder`. No-op when none pend.
+    pub fn flush_dispatches(&mut self, encoder: &mut CommandEncoder) {
+        flush_pending(&mut self.pending_dispatches, &self.shaders, encoder);
+    }
+
+    /// [`Self::run_recording_into`] or its deferred variant, selected by `defer`.
+    pub fn run_recording_into_sel(
+        &mut self,
+        defer: bool,
+        device: &Device,
+        queue: &Queue,
+        recording: &Recording,
+        external_resources: &[ExternalResource<'_>],
+        encoder: &mut CommandEncoder,
+        #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
+        #[cfg(feature = "wgpu-profiler")] label: &'static str,
+    ) -> Result<()> {
+        let r = self.run_recording_into_deferred(
+            device,
+            queue,
+            recording,
+            external_resources,
+            encoder,
+            #[cfg(feature = "wgpu-profiler")]
+            profiler,
+            #[cfg(feature = "wgpu-profiler")]
+            label,
+        );
+        if !defer {
+            self.flush_dispatches(encoder);
+        }
+        r
     }
 
     pub fn run_recording(
@@ -525,7 +616,24 @@ impl WgpuEngine {
         let mut transient_map = TransientBindMap::new(external_resources);
         #[cfg(feature = "wgpu-profiler")]
         let query = profiler.begin_query(label, encoder);
+        // PASS BATCHING: consecutive GPU dispatches share ONE compute pass — the implementation
+        // still orders them (each dispatch is its own synchronization scope), but the per-pass
+        // encoder churn is paid once per run instead of once per dispatch. Bind groups are created
+        // while the encoder is free, before the pass opens. A command that touches the encoder
+        // flushes the run; buffer uploads are queue-timeline writes and frees are bookkeeping, so
+        // neither breaks a batch (the pool releases nothing until after a submit, so an uploaded
+        // buffer can never alias one a pending dispatch reads).
         for command in &recording.commands {
+            if !matches!(
+                command,
+                Command::Dispatch(..)
+                    | Command::FreeBuffer(..)
+                    | Command::FreeImage(..)
+                    | Command::Upload(..)
+                    | Command::UploadUniform(..)
+            ) {
+                flush_pending(&mut self.pending_dispatches, &self.shaders, encoder);
+            }
             match command {
                 Command::Upload(buf_proxy, bytes) => {
                     transient_map
@@ -678,10 +786,12 @@ impl WgpuEngine {
                             // mechanisms, as the CPU dispatch can't run until the preceding
                             // command buffer submission completes (and, in WebGPU, the async
                             // mapping operations on the buffers completes).
+                            flush_pending(&mut self.pending_dispatches, &self.shaders, encoder);
                             let resources =
                                 transient_map.create_cpu_resources(&mut self.bind_map, bindings);
                             (cpu_shader.shader)(x, &resources);
                         }
+                        #[cfg(not(feature = "wgpu-profiler"))]
                         ShaderKind::Wgpu(wgpu_shader) => {
                             // Workaround for https://github.com/linebender/vello/issues/637
                             if x == 0 || y == 0 || z == 0 {
@@ -696,12 +806,31 @@ impl WgpuEngine {
                                 &wgpu_shader.bind_group_layout,
                                 bindings,
                             );
-                            #[cfg(feature = "wgpu-profiler")]
+                            self.pending_dispatches.push(PendingDispatch {
+                                shader: *shader_id,
+                                wg: (x, y, z),
+                                bind_group,
+                            });
+                        }
+                        #[cfg(feature = "wgpu-profiler")]
+                        ShaderKind::Wgpu(wgpu_shader) => {
+                            // Workaround for https://github.com/linebender/vello/issues/637
+                            if x == 0 || y == 0 || z == 0 {
+                                continue;
+                            }
+                            let bind_group = transient_map.create_bind_group(
+                                &mut self.bind_map,
+                                &mut self.pool,
+                                device,
+                                queue,
+                                encoder,
+                                &wgpu_shader.bind_group_layout,
+                                bindings,
+                            );
                             let pass_query = profiler
                                 .begin_pass_query(shader.label, encoder)
                                 .with_parent(Some(&query));
                             let mut desc = ComputePassDescriptor::default();
-                            #[cfg(feature = "wgpu-profiler")]
                             {
                                 desc.timestamp_writes = pass_query.compute_pass_timestamp_writes();
                             }
@@ -720,7 +849,6 @@ impl WgpuEngine {
                             cpass.set_bind_group(0, &bind_group, &[]);
                             cpass.dispatch_workgroups(x, y, z);
                             drop(cpass);
-                            #[cfg(feature = "wgpu-profiler")]
                             profiler.end_query(encoder, pass_query);
                         }
                     }

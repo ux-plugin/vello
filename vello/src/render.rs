@@ -1077,6 +1077,38 @@ pub(crate) fn record_fine_segment_draftonly(
     recording
 }
 
+/// Rect copies accumulator -> snapshot as ONE compute dispatch (the batched form of the encoder
+/// blits): the rects are decomposed into 16x16 tiles, uploaded as a `(tile_x, tile_y, clip_x1,
+/// clip_y1)` table, and workgroup `i` copies tile `i` — a whole refresh costs one dispatch, not
+/// one per rect.
+#[cfg(feature = "wgpu")]
+pub(crate) fn record_snap_copy(
+    shaders: &FullShaders,
+    rects: &[[u32; 4]],
+    src: ImageProxy,
+    dst: ImageProxy,
+) -> Recording {
+    let mut recording = Recording::default();
+    let shader = shaders.snap_copy.expect("packed accumulator needs snap_copy");
+    let mut tiles: Vec<[u32; 4]> = Vec::new();
+    for r in rects {
+        for ty in 0..(r[3] - r[1]).div_ceil(16) {
+            for tx in 0..(r[2] - r[0]).div_ceil(16) {
+                tiles.push([r[0] + tx * 16, r[1] + ty * 16, r[2], r[3]]);
+            }
+        }
+    }
+    if !tiles.is_empty() {
+        let buf = ResourceProxy::Buffer(
+            recording.upload("vello.snapcopy.tiles", bytemuck::cast_slice::<_, u8>(&tiles).to_vec()),
+        );
+        let wg = (u32::try_from(tiles.len()).expect("tile table fits u32"), 1, 1);
+        recording.dispatch(shader, wg, [buf, ResourceProxy::Image(src), ResourceProxy::Image(dst)]);
+        recording.free_resource(buf);
+    }
+    recording
+}
+
 /// An in-place COMPOSITE window over the packed accumulator (`fine_area_rwu*`): the r32uint target
 /// is read-modified-written per own pixel; `snap` is the round's packed backdrop snapshot for the
 /// arms' neighbourhood/orig reads; `slot10` (when present) is the chained input or blur draft.
