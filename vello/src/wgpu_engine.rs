@@ -526,35 +526,6 @@ impl WgpuEngine {
         flush_pending(&mut self.pending_dispatches, &self.shaders, encoder);
     }
 
-    /// [`Self::run_recording_into`] or its deferred variant, selected by `defer`.
-    pub fn run_recording_into_sel(
-        &mut self,
-        defer: bool,
-        device: &Device,
-        queue: &Queue,
-        recording: &Recording,
-        external_resources: &[ExternalResource<'_>],
-        encoder: &mut CommandEncoder,
-        #[cfg(feature = "wgpu-profiler")] profiler: &mut wgpu_profiler::GpuProfiler,
-        #[cfg(feature = "wgpu-profiler")] label: &'static str,
-    ) -> Result<()> {
-        let r = self.run_recording_into_deferred(
-            device,
-            queue,
-            recording,
-            external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            label,
-        );
-        if !defer {
-            self.flush_dispatches(encoder);
-        }
-        r
-    }
-
     pub fn run_recording(
         &mut self,
         device: &Device,

@@ -336,9 +336,6 @@ pub struct Renderer {
     )]
     options: RendererOptions,
     engine: WgpuEngine,
-    /// Defer phased fine dispatches so consecutive windows share one compute pass; flushed by any
-    /// non-deferred recording, [`Self::flush_dispatches`], or `phased_finish_into`.
-    phased_defer: bool,
     resolver: Resolver,
     image_atlas: Option<recording::ImageProxy>,
     shaders: FullShaders,
@@ -455,7 +452,6 @@ impl Renderer {
         Ok(Self {
             options,
             engine,
-            phased_defer: false,
             resolver: Resolver::new(),
             image_atlas: None,
             shaders,
@@ -714,8 +710,7 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<()> {
         let recording = render::record_frontend_full(session, &self.shaders);
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -752,8 +747,7 @@ impl Renderer {
         if let (Some(img), Some(view)) = (base_image, base) {
             external_resources.push(ExternalResource::Image(img, view));
         }
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -793,8 +787,7 @@ impl Renderer {
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(draft_image, draft),
         ];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -834,8 +827,7 @@ impl Renderer {
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(input_image, input),
         ];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -870,8 +862,7 @@ impl Renderer {
         let out_image = session.new_out_image();
         let recording = render::record_fine_segment_rw(session, &self.shaders, seg_lo, seg_target, out_image);
         let external_resources = [ExternalResource::Image(out_image, target)];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -901,8 +892,7 @@ impl Renderer {
         let out_image = session.new_packed_image();
         let recording = render::record_fine_segment_seed_u(session, &self.shaders, seg_lo, seg_target, out_image);
         let external_resources = [ExternalResource::Image(out_image, target)];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -931,8 +921,7 @@ impl Renderer {
         let out_image = session.new_out_image();
         let recording = render::record_fine_segment_draftonly(session, &self.shaders, seg_lo, seg_target, out_image);
         let external_resources = [ExternalResource::Image(out_image, out)];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -965,8 +954,7 @@ impl Renderer {
             ExternalResource::Image(src_img, src),
             ExternalResource::Image(dst_img, dst),
         ];
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -1014,8 +1002,7 @@ impl Renderer {
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
         }
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -1063,8 +1050,7 @@ impl Renderer {
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
         }
-        self.engine.run_recording_into_sel(
-            self.phased_defer,
+        self.engine.run_recording_into_deferred(
             device,
             queue,
             &recording,
@@ -1101,11 +1087,6 @@ impl Renderer {
 
     /// Free the phased render's shared buffers into `encoder` (deferred until after submit). Ends the
     /// session; the `session` is consumed.
-    /// Enable or disable phased dispatch batching (see `phased_defer`).
-    pub fn set_dispatch_batching(&mut self, on: bool) {
-        self.phased_defer = on;
-    }
-
     /// Issue every deferred phased dispatch into one compute pass on `encoder`.
     pub fn flush_dispatches(&mut self, encoder: &mut wgpu::CommandEncoder) {
         self.engine.flush_dispatches(encoder);
