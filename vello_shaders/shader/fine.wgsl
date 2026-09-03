@@ -1495,10 +1495,29 @@ fn fx_run_mark(
         fence_live = true;
         return;
     }
-    if (d.rec[4].x != 0.0) {
-        active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
-    }
+    // A FLUSH-flagged materialize mark (rec[4].w — set by the planner on front-merged marks, whose
+    // value is complete in the register when the next producer arrives) claims the store origin
+    // exactly like a fence does: a second one on this tile in one window stores the register tile
+    // to the previous mark's lease and re-seeds the register to the window's entry state, so one
+    // window materializes any number of overlapping chains' drafts. Un-flagged marks keep their
+    // register flow verbatim (glass chains thread values between marks by design).
     let atomic_ctl = ptcl[cmd_ix + 5u];
+    if (d.rec[4].x != 0.0) {
+        if (d.rec[4].w != 0.0 && fence_live) {
+            fx_store_tile(xy, rgba);
+            for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+#ifdef load_base
+                (*rgba)[i] = base_ld(vec2<i32>(i32(xy.x) + i32(i), i32(xy.y)));
+#else
+                (*rgba)[i] = vec4(0.0);
+#endif
+            }
+        }
+        active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
+        if (d.rec[4].w != 0.0) {
+            fence_live = true;
+        }
+    }
     if (atomic_ctl & 1u) != 0u {
         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
             let px = xy + vec2<f32>(f32(i), 0.0);
