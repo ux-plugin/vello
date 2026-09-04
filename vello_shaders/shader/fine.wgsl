@@ -1606,11 +1606,17 @@ fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<
 // scratch shifts taps by its u[1].zw origin. An out-of-bounds tap is the page colour for a backdrop
 // blur and transparent for a silhouette blur (bit 2048); an sRGB blur (bit 1024) sums raw texels,
 // a linear one converts around the kernel. The result is stored sRGB either way.
+// u[0].w is the planner-stamped tap stride (1 = every texel, the exact kernel): large sigmas walk
+// the same radius in strided steps, the Gaussian evaluated at each strided offset and renormalized
+// by wsum — a coarser quadrature of the same kernel, not a different blur. The range is trimmed to
+// a stride multiple so the taps stay symmetric around the centre.
 fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     let u = d.u;
     let bits = d.bits;
     let sigma = max(u[0].z, 0.5);
-    let radius = i32(ceil(3.0 * sigma));
+    let stride = max(i32(u[0].w), 1);
+    var radius = i32(ceil(3.0 * sigma));
+    radius = radius - (radius % stride);
     let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
     let inv2s2 = 1.0 / (2.0 * sigma * sigma);
     let srgb_blur = u[2].z != 0.0;
@@ -1638,7 +1644,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         vec2<i32>(i32((bhi >> 10u) & 1023u) * 16, i32(bhi & 1023u) * 16),
         vec2<i32>(i32(config.target_width), i32(config.target_height)),
     );
-    for (var tt = -radius; tt <= radius; tt = tt + 1) {
+    for (var tt = -radius; tt <= radius; tt = tt + stride) {
         let w = exp(-f32(tt * tt) * inv2s2);
         let sp = ipx + axis * tt;
 #ifdef have_draft
