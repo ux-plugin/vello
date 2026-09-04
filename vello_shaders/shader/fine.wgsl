@@ -1581,7 +1581,15 @@ fn fx_keys_on_round(base: u32) -> bool {
     // A ZERO-bit desc is a rasterize fence: it exists only to claim its own round's window and
     // stamp the store origin for that window's draws, so it must key on its round.
     let b = u32(effect_params[base]);
-    return b == 0u || (b & (96u | 128u | 16384u)) != 0u;
+    if b == 0u || (b & (96u | 128u | 16384u)) != 0u {
+        return true;
+    }
+    // A mark that OWNS A LEASE (a stamped output record) materialises in its own round's window —
+    // in every permutation. Keyed on segment it can collide with a FOREIGN round's window on tiles
+    // whose segment count happens to match (the count is z- and framing-dependent); there its value
+    // path may be permutation-compiled out, but the rec[4] install still runs and hijacks the
+    // window's scratch-store origin, landing that window's whole store at the wrong lease offset.
+    return effect_params[base + 42u] != 0.0;
 #endif
 }
 // One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
@@ -1729,7 +1737,11 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     let frost = d.u[4].z;
     let scl = d.u[4].x;
     let win = d.rec[0].yz;
-    let fc = px + vec2<f32>(0.5, 0.5);
+    // The jitter hash is seeded in LENS-LOCAL coordinates (pixel relative to the lens box's
+    // top-left), not screen pixels: a screen-seeded pattern re-rolls under every pan/zoom, so
+    // the frost visibly swims over the content as the view moves — and it is what the batched
+    // executor's cell-local `fc` already does.
+    let fc = px + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
     if (frost <= 0.01) {
         return fx_bilin_input(px - win);
     }
