@@ -101,14 +101,19 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 // convention cancels the fragment-centre +0.5, so no half-texel bias is added. Interpolates the stored
 // premul-sRGB texels directly (the hardware sampler the oracle uses interpolates raw unorm, not linear
 // light), so no colour-space conversion here.
+// The position clamps to the backdrop's texel range (edge extend, the backdrop-filter convention):
+// past the texture a raw load returns zero, which whitens or darkens every tap that crosses the
+// viewport edge — the visible band whenever a lens hangs off the screen.
 fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
-    let fl = floor(pos);
+    let dmax = vec2<f32>(textureDimensions(base_in)) - vec2<f32>(1.0, 1.0);
+    let cp = clamp(pos, vec2<f32>(0.0, 0.0), dmax);
+    let fl = floor(cp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = pos - fl;
+    let f = cp - fl;
     let s00 = base_ld(i0);
-    let s10 = base_ld(i0 + vec2<i32>(1, 0));
-    let s01 = base_ld(i0 + vec2<i32>(0, 1));
-    let s11 = base_ld(i0 + vec2<i32>(1, 1));
+    let s10 = base_ld(min(i0 + vec2<i32>(1, 0), vec2<i32>(dmax)));
+    let s01 = base_ld(min(i0 + vec2<i32>(0, 1), vec2<i32>(dmax)));
+    let s11 = base_ld(min(i0 + vec2<i32>(1, 1), vec2<i32>(dmax)));
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
@@ -155,13 +160,15 @@ var input_in: texture_2d<f32>;
 // scratch's own frame (both zero → full-viewport, unchanged).
 fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
     let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
-    let fl = floor(p);
+    let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
+    let cp = clamp(p, vec2<f32>(0.0, 0.0), dmax);
+    let fl = floor(cp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = p - fl;
+    let f = cp - fl;
     let s00 = textureLoad(input_in, i0, 0);
-    let s10 = textureLoad(input_in, i0 + vec2<i32>(1, 0), 0);
-    let s01 = textureLoad(input_in, i0 + vec2<i32>(0, 1), 0);
-    let s11 = textureLoad(input_in, i0 + vec2<i32>(1, 1), 0);
+    let s10 = textureLoad(input_in, min(i0 + vec2<i32>(1, 0), vec2<i32>(dmax)), 0);
+    let s01 = textureLoad(input_in, min(i0 + vec2<i32>(0, 1), vec2<i32>(dmax)), 0);
+    let s11 = textureLoad(input_in, min(i0 + vec2<i32>(1, 1), vec2<i32>(dmax)), 0);
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 #endif
@@ -1679,6 +1686,18 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
                     && sp.x < i32(config.target_width) && sp.y < i32(config.target_height);
             }
         }
+        // A backdrop chain's tap past the frame edge-extends (the viewport crops a document that
+        // continues past it — blending the page colour in painted a pale band along every edge a
+        // lens hangs off); a coverage chain keeps transparent (the silhouette really ends).
+        if (!shadow_edge && !inb) {
+            let cl = clamp(
+                sp,
+                vec2<i32>(0, 0),
+                vec2<i32>(i32(config.target_width) - 1, i32(config.target_height) - 1),
+            );
+            rawtap = base_ld(cl);
+            inb = true;
+        }
         let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
         let tap = select(bg, tapc, inb);
         acc = acc + w * tap;
@@ -1716,8 +1735,9 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     }
     let lens_c = d.u[0].zw;
     let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
-    let lo = lens_c - lens_h;
-    let hi = lens_c + lens_h;
+    let vp_hi = vec2<f32>(f32(config.target_width), f32(config.target_height)) - vec2<f32>(1.0, 1.0);
+    let lo = max(lens_c - lens_h, vec2<f32>(0.0, 0.0));
+    let hi = min(lens_c + lens_h, vp_hi);
     var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
