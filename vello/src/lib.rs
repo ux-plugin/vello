@@ -150,6 +150,28 @@ use peniko::ImageData;
 pub use wgpu;
 
 pub use scene::{DrawGlyphs, Scene};
+
+/// The frame extent override for the next render: `(w << 32) | h`, or 0 for "frame == target".
+/// Set by the whole-viewport driver when interest-region rows are rented below the frame, so the
+/// tile grid (target) is taller than the accumulator (frame) and backdrop clamps must know both.
+static FRAME_EXTENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Declare the FRAME extent (the accumulator/backdrop rows) for subsequent renders whose target
+/// extent covers a taller tile grid. `(0, 0)` restores the default (frame == target).
+pub fn set_frame(width: u32, height: u32) {
+    FRAME_EXTENT.store(
+        (u64::from(width) << 32) | u64::from(height),
+        std::sync::atomic::Ordering::Relaxed,
+    );
+}
+
+pub(crate) fn apply_frame_extent(gpu: &mut vello_encoding::ConfigUniform) {
+    let v = FRAME_EXTENT.load(std::sync::atomic::Ordering::Relaxed);
+    if v != 0 {
+        gpu.frame_width = (v >> 32) as u32;
+        gpu.frame_height = v as u32;
+    }
+}
 pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
 
 use low_level::ShaderId;

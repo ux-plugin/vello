@@ -69,6 +69,15 @@ struct Config {
     // biased by 0x40000000 — see fine.wgsl `main`). Zero = full-viewport grid, byte-identical.
     sparse_base: u32,
     sparse_n: u32,
+    // The FRAME extent in pixels: the accumulator/backdrop rows. The target extent covers the whole
+    // tile grid — frame rows plus any interest-region rows rented below them — so backdrop reads and
+    // their edge-extend clamps must bound against the frame, never the grid. Equal to target_* when
+    // no regions are rented, leaving every clamp byte-identical.
+    frame_width: u32,
+    frame_height: u32,
+    // Pad to a 16-byte multiple (WebGPU uniform requirement).
+    frame_pad0: u32,
+    frame_pad1: u32,
 }
 
 // Sentinel `seg_target` value meaning "render all segments in one pass" (the non-segmented default).

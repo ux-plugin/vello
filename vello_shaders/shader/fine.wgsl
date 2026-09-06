@@ -1657,7 +1657,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     // slot's texels belong to an earlier tenant, so the rect clamps to the frame.
     let dev_hi = min(
         vec2<i32>(i32((bhi >> 10u) & 1023u) * 16, i32(bhi & 1023u) * 16),
-        vec2<i32>(i32(config.target_width), i32(config.target_height)),
+        vec2<i32>(i32(config.frame_width), i32(config.frame_height)),
     );
     for (var tt = -radius; tt <= radius; tt = tt + stride) {
         let w = exp(-f32(tt * tt) * inv2s2);
@@ -1691,7 +1691,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
                     rawtap = base_ld(sp);
                 }
                 inb = sp.x >= 0 && sp.y >= 0
-                    && sp.x < i32(config.target_width) && sp.y < i32(config.target_height);
+                    && sp.x < i32(config.frame_width) && sp.y < i32(config.frame_height);
             }
         }
         // A backdrop chain's tap past the frame edge-extends (the viewport crops a document that
@@ -1701,7 +1701,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
             let cl = clamp(
                 sp,
                 vec2<i32>(0, 0),
-                vec2<i32>(i32(config.target_width) - 1, i32(config.target_height) - 1),
+                vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
             );
             rawtap = base_ld(cl);
             inb = true;
@@ -1747,7 +1747,7 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     }
     let lens_c = d.u[0].zw;
     let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
-    let vp_hi = vec2<f32>(f32(config.target_width), f32(config.target_height)) - vec2<f32>(1.0, 1.0);
+    let vp_hi = vec2<f32>(f32(config.frame_width), f32(config.frame_height)) - vec2<f32>(1.0, 1.0);
     let lo = max(lens_c - lens_h, vec2<f32>(0.0, 0.0));
     let hi = min(lens_c + lens_h, vp_hi);
     var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);

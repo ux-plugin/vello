@@ -162,7 +162,8 @@ pub(crate) fn render_encoding_phased(
     // A full-range config for the shared front-end (draw_reduce/draw_leaf must see every draw so a
     // later phase can reference high draw indices). Its buffer_sizes/workgroup_counts drive every
     // buffer allocation below, and are identical across phases (they don't depend on the draw range).
-    let cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+    let mut cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+    crate::apply_frame_extent(&mut cpu_config.gpu);
     let buffer_sizes = &cpu_config.buffer_sizes;
     let wg_counts = &cpu_config.workgroup_counts;
     if std::env::var("VELLO_DBG_CFG").is_ok() {
@@ -509,7 +510,8 @@ pub(crate) fn begin_phased(
     }
     let image_atlas = ResourceProxy::Image(image_atlas);
 
-    let cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+    let mut cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+    crate::apply_frame_extent(&mut cpu_config.gpu);
     let buffer_sizes = &cpu_config.buffer_sizes;
     let wg_counts = &cpu_config.workgroup_counts;
 
@@ -1333,8 +1335,9 @@ impl Render {
         for image in images.images {
             recording.write_image(image_atlas, image.1, image.2, image.0.clone());
         }
-        let cpu_config =
+        let mut cpu_config =
             RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        crate::apply_frame_extent(&mut cpu_config.gpu);
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
             * cpu_config.workgroup_counts.coarse.1

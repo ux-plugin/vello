@@ -188,6 +188,13 @@ pub struct ConfigUniform {
     /// stays a normal float). Zero (the default) keeps the full-viewport grid.
     pub sparse_base: u32,
     pub sparse_n: u32,
+    /// The FRAME extent in pixels — the accumulator/backdrop rows. `target_*` covers the whole tile
+    /// grid (frame rows plus rented interest-region rows), so backdrop reads and edge-extend clamps
+    /// bound against these instead. Defaults to `target_*` (no regions), keeping clamps identical.
+    pub frame_width: u32,
+    pub frame_height: u32,
+    /// Pad to a 16-byte multiple (WebGPU uniform requirement).
+    pub frame_pad: [u32; 2],
 }
 
 /// CPU side setup and configuration.
@@ -237,6 +244,9 @@ impl RenderConfig {
                 scratch_in: [0; 2],
                 sparse_base: 0,
                 sparse_n: 0,
+                frame_width: width,
+                frame_height: height,
+                frame_pad: [0; 2],
                 layout: *layout,
             },
             workgroup_counts,
