@@ -96,6 +96,52 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 #endif
 }
 
+#ifdef region_reads
+// The region atlas: every interest region's materialized lease, mapped one-to-one from the rented
+// grid band. Bound read-only in every backdrop-tapping dispatch; the running arm's route records
+// say which rect of it serves this reader and at what density.
+#ifdef have_input
+@group(0) @binding(11)
+var region_atlas: texture_2d<f32>;
+#else
+#ifdef have_draft
+@group(0) @binding(11)
+var region_atlas: texture_2d<f32>;
+#else
+@group(0) @binding(10)
+var region_atlas: texture_2d<f32>;
+#endif
+#endif
+
+// Whether the running arm's region serves device point `p` — a tap past the frame that lands in
+// the region's source rect resolves to materialized content instead of the edge-extend clamp.
+fn fx_region_serves(p: vec2<f32>) -> bool {
+    return region_route.w != 0.0
+        && (p.x < 0.0 || p.y < 0.0
+            || p.x >= f32(config.frame_width) || p.y >= f32(config.frame_height))
+        && p.x >= region_rect.x && p.y >= region_rect.y
+        && p.x < region_rect.z && p.y < region_rect.w;
+}
+
+// One region tap at device point `p`: map through the route (atlas origin + density), clamp inside
+// the lease so a boundary tap never reads a neighbouring region, and bilinearly interpolate the
+// stored premul texels (the same raw-unorm convention as fx_bilin).
+fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
+    let k = region_route.z;
+    let lo = region_route.xy;
+    let hi = lo + (region_rect.zw - region_rect.xy) * k - vec2<f32>(1.0, 1.0);
+    let a = clamp(lo + (p - region_rect.xy) * k, lo, hi);
+    let fl = floor(a);
+    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
+    let f = a - fl;
+    let c00 = textureLoad(region_atlas, i0, 0);
+    let c10 = textureLoad(region_atlas, i0 + vec2<i32>(1, 0), 0);
+    let c01 = textureLoad(region_atlas, i0 + vec2<i32>(0, 1), 0);
+    let c11 = textureLoad(region_atlas, i0 + vec2<i32>(1, 1), 0);
+    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+}
+#endif
+
 // Bilinear sample of the materialised backdrop at a continuous pixel position — the manual equivalent
 // of the batched lens oracle's linear `unitSample`. `pos = px + disp`; the sampler's −0.5 texel-centre
 // convention cancels the fragment-centre +0.5, so no half-texel bias is added. Interpolates the stored
@@ -105,6 +151,11 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 // past the texture a raw load returns zero, which whitens or darkens every tap that crosses the
 // viewport edge — the visible band whenever a lens hangs off the screen.
 fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
+#ifdef region_reads
+    if (fx_region_serves(pos)) {
+        return fx_region_tap(pos);
+    }
+#endif
     let dmax = vec2<f32>(textureDimensions(base_in)) - vec2<f32>(1.0, 1.0);
     let cp = clamp(pos, vec2<f32>(0.0, 0.0), dmax);
     let fl = floor(cp);
@@ -179,6 +230,14 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
 // device coordinates (origin stays zero). This is what makes the crop PER-TILE, not per-dispatch:
 // reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
+#ifdef region_reads
+// The running arm's REGION ROUTE (records 5/6): the serving interest region's device source rect
+// and its lease's [atlas origin, density k, flag]. Zero flag = no region — escaped backdrop taps
+// keep the edge-extend clamp. Set per mark in fx_run_mark, exactly like the store origin above.
+var<private> region_rect: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+var<private> region_route: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+#endif
+
 
 // Whether an in-window FENCE already claimed this tile's store origin. The next in-window fence is
 // then a FLUSH boundary: the register tile is stored to the claimed lease and reset before the new
@@ -1486,6 +1545,10 @@ fn fx_run_mark(
         return;
     }
     let d = fx_load_desc(inline_base);
+#ifdef region_reads
+    region_rect = d.rec[5];
+    region_route = d.rec[6];
+#endif
     // A zero-bit mark is a pure FENCE: it claims the store origin for its window's rasterized
     // draws and touches no pixel itself. A second in-window fence on this tile FLUSHES first —
     // store the register tile to the previous fence's lease, reset it transparent — so one window
@@ -1552,7 +1615,7 @@ struct FxDesc {
     bits: u32,
     program: u32,
     u: array<vec4<f32>, 6>,
-    rec: array<vec4<f32>, 5>,
+    rec: array<vec4<f32>, 7>,
 }
 fn fx_load_desc(base: u32) -> FxDesc {
     var d: FxDesc;
@@ -1562,7 +1625,7 @@ fn fx_load_desc(base: u32) -> FxDesc {
         let o = base + 2u + k * 4u;
         d.u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
-    for (var k = 0u; k < 5u; k = k + 1u) {
+    for (var k = 0u; k < 7u; k = k + 1u) {
         let o = base + 26u + k * 4u;
         d.rec[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
@@ -1698,12 +1761,25 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         // continues past it — blending the page colour in painted a pale band along every edge a
         // lens hangs off); a coverage chain keeps transparent (the silhouette really ends).
         if (!shadow_edge && !inb) {
+#ifdef region_reads
+            if (fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {
+                rawtap = fx_region_tap(vec2<f32>(f32(sp.x), f32(sp.y)));
+            } else {
+                let cl = clamp(
+                    sp,
+                    vec2<i32>(0, 0),
+                    vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
+                );
+                rawtap = base_ld(cl);
+            }
+#else
             let cl = clamp(
                 sp,
                 vec2<i32>(0, 0),
                 vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
             );
             rawtap = base_ld(cl);
+#endif
             inb = true;
         }
         let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);

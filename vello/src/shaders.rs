@@ -385,6 +385,7 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_rwu_two = [
         Uniform,
@@ -398,6 +399,7 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_loadu = [
         Uniform,
@@ -410,6 +412,7 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_loadu_two = [
         Uniform,
@@ -422,6 +425,7 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_draft = [

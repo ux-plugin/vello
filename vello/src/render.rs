@@ -1122,6 +1122,7 @@ pub(crate) fn record_fine_segment_rwu(
     seg_target: u32,
     snap: ImageProxy,
     slot10: Option<(bool, ImageProxy)>,
+    region: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let mut recording = Recording::default();
@@ -1132,7 +1133,7 @@ pub(crate) fn record_fine_segment_rwu(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(region)],
             );
         }
         Some((is_draft, extra)) => {
@@ -1144,7 +1145,7 @@ pub(crate) fn record_fine_segment_rwu(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra), ResourceProxy::Image(region)],
             );
         }
     }
@@ -1163,6 +1164,7 @@ pub(crate) fn record_fine_segment_loadu(
     seg_target: u32,
     snap: ImageProxy,
     slot10: Option<(bool, ImageProxy)>,
+    region: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let mut recording = Recording::default();
@@ -1173,7 +1175,7 @@ pub(crate) fn record_fine_segment_loadu(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(region)],
             );
         }
         Some((is_draft, extra)) => {
@@ -1185,7 +1187,7 @@ pub(crate) fn record_fine_segment_loadu(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(snap), ResourceProxy::Image(extra), ResourceProxy::Image(region)],
             );
         }
     }
