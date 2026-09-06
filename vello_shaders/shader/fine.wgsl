@@ -103,24 +103,31 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 #ifdef have_input
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
+@group(0) @binding(12)
+var region_chain: texture_2d<f32>;
 #else
 #ifdef have_draft
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
+@group(0) @binding(12)
+var region_chain: texture_2d<f32>;
 #else
 @group(0) @binding(10)
 var region_atlas: texture_2d<f32>;
+@group(0) @binding(11)
+var region_chain: texture_2d<f32>;
 #endif
 #endif
 
 // Whether the running arm's region serves device point `p` — a tap past the frame that lands in
 // the region's source rect resolves to materialized content instead of the edge-extend clamp.
 fn fx_region_serves(p: vec2<f32>) -> bool {
-    return region_route.w != 0.0
+    let slack = abs(region_route.w);
+    return slack != 0.0
         && (p.x < 0.0 || p.y < 0.0
             || p.x >= f32(config.frame_width) || p.y >= f32(config.frame_height))
-        && p.x >= region_rect.x && p.y >= region_rect.y
-        && p.x < region_rect.z && p.y < region_rect.w;
+        && p.x >= region_rect.x - slack && p.y >= region_rect.y - slack
+        && p.x < region_rect.z + slack && p.y < region_rect.w + slack;
 }
 
 // One region tap at device point `p`: map through the route (atlas origin + density), clamp inside
@@ -130,10 +137,20 @@ fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
     let k = region_route.z;
     let lo = region_route.xy;
     let hi = lo + (region_rect.zw - region_rect.xy) * k - vec2<f32>(1.0, 1.0);
-    let a = clamp(lo + (p - region_rect.xy) * k, lo, hi);
+    let pc = clamp(p, region_rect.xy, region_rect.zw - vec2<f32>(1.0, 1.0));
+    let a = clamp(lo + (pc - region_rect.xy) * k, lo, hi);
     let fl = floor(a);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = a - fl;
+    // A negative slack word selects the CHAIN atlas — region-space intermediates (an H' blur's
+    // lease), which live in their own texture so producing them can read the values atlas.
+    if (region_route.w < 0.0) {
+        let c00 = textureLoad(region_chain, i0, 0);
+        let c10 = textureLoad(region_chain, i0 + vec2<i32>(1, 0), 0);
+        let c01 = textureLoad(region_chain, i0 + vec2<i32>(0, 1), 0);
+        let c11 = textureLoad(region_chain, i0 + vec2<i32>(1, 1), 0);
+        return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
+    }
     let c00 = textureLoad(region_atlas, i0, 0);
     let c10 = textureLoad(region_atlas, i0 + vec2<i32>(1, 0), 0);
     let c01 = textureLoad(region_atlas, i0 + vec2<i32>(0, 1), 0);

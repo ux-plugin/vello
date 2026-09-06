@@ -1004,12 +1004,14 @@ impl Renderer {
         snap: &TextureView,
         slot10: Option<(bool, &TextureView)>,
         region: &TextureView,
+        chain: &TextureView,
         target: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_packed_image();
         let snap_image = session.new_packed_image();
         let slot_image = slot10.map(|(d, _)| (d, session.new_out_image()));
         let region_image = session.new_out_image();
+        let chain_image = session.new_out_image();
         let recording = render::record_fine_segment_rwu(
             session,
             &self.shaders,
@@ -1018,12 +1020,14 @@ impl Renderer {
             snap_image,
             slot_image,
             region_image,
+            chain_image,
             out_image,
         );
         let mut external_resources = vec![
             ExternalResource::Image(out_image, target),
             ExternalResource::Image(snap_image, snap),
             ExternalResource::Image(region_image, region),
+            ExternalResource::Image(chain_image, chain),
         ];
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
@@ -1056,12 +1060,14 @@ impl Renderer {
         snap: &TextureView,
         slot10: Option<(bool, &TextureView)>,
         region: &TextureView,
+        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let snap_image = session.new_packed_image();
         let slot_image = slot10.map(|(d, _)| (d, session.new_out_image()));
         let region_image = session.new_out_image();
+        let chain_image = session.new_out_image();
         let recording = render::record_fine_segment_loadu(
             session,
             &self.shaders,
@@ -1070,12 +1076,14 @@ impl Renderer {
             snap_image,
             slot_image,
             region_image,
+            chain_image,
             out_image,
         );
         let mut external_resources = vec![
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(snap_image, snap),
             ExternalResource::Image(region_image, region),
+            ExternalResource::Image(chain_image, chain),
         ];
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
