@@ -225,7 +225,10 @@ var input_in: texture_2d<f32>;
 
 // Bilinear sample of the primary input surface at a continuous pixel position (see `fx_bilin`).
 // `input_in` is always a reach-cropped scratch, so the device position shifts by `scratch_in` to the
-// scratch's own frame (both zero → full-viewport, unchanged).
+// scratch's own frame (both zero → full-viewport, unchanged). NO region hook here: several call
+// sites pass positions already shifted into a producer's crop frame (a shade's chain seed, a
+// maskmix displaced read), where a device-space serve test would fire on garbage — the one arm
+// whose input taps stray, the scatter, serves at its own tap site instead.
 fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
     let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
     let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
@@ -1856,7 +1859,18 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
-        sacc = sacc + fx_bilin_input(clamp(px + off, lo, hi) - win);
+        // A tap past the frame resolves through the mark's region route when one is stamped —
+        // the planner routes a scatter at its INPUT's band instance (the region-space blurred
+        // surface), so escaped grain taps read chain-correct content. The serve test runs on
+        // the lens-box-clamped DEVICE position, before the viewport pin the scratch read needs.
+        let pb = clamp(px + off, lens_c - lens_h, lens_c + lens_h);
+#ifdef region_reads
+        if (fx_region_serves(pb)) {
+            sacc = sacc + fx_region_tap(pb);
+            continue;
+        }
+#endif
+        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi) - win);
     }
     return sacc / 12.0;
 }
