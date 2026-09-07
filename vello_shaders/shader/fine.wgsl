@@ -1776,7 +1776,16 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         }
         // A backdrop chain's tap past the frame edge-extends (the viewport crops a document that
         // continues past it — blending the page colour in painted a pale band along every edge a
-        // lens hangs off); a coverage chain keeps transparent (the silhouette really ends).
+        // lens hangs off); a coverage chain keeps transparent (the silhouette really ends) —
+        // UNLESS the mark carries a region route: then the content continues off-frame in a
+        // materialized lease (a layer blur's own body rows) and the tap resolves there. A shadow
+        // silhouette pass carries no route (its record stays zero), so its fade is untouched.
+#ifdef region_reads
+        if (shadow_edge && !inb && fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {
+            rawtap = fx_region_tap(vec2<f32>(f32(sp.x), f32(sp.y)));
+            inb = true;
+        }
+#endif
         if (!shadow_edge && !inb) {
 #ifdef region_reads
             if (fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {

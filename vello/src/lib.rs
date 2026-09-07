@@ -797,17 +797,23 @@ impl Renderer {
         seg_target: u32,
         base: &TextureView,
         draft: &TextureView,
+        region: &TextureView,
+        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let base_image = session.new_out_image();
         let draft_image = session.new_out_image();
+        let region_image = session.new_out_image();
+        let chain_image = session.new_out_image();
         let recording =
-            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, out_image);
+            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, region_image, chain_image, out_image);
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(draft_image, draft),
+            ExternalResource::Image(region_image, region),
+            ExternalResource::Image(chain_image, chain),
         ];
         self.engine.run_recording_into_deferred(
             device,
@@ -837,17 +843,23 @@ impl Renderer {
         seg_target: u32,
         base: &TextureView,
         input: &TextureView,
+        region: &TextureView,
+        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let base_image = session.new_out_image();
         let input_image = session.new_out_image();
+        let region_image = session.new_out_image();
+        let chain_image = session.new_out_image();
         let recording =
-            render::record_fine_segment_input(session, &self.shaders, seg_lo, seg_target, base_image, input_image, out_image);
+            render::record_fine_segment_input(session, &self.shaders, seg_lo, seg_target, base_image, input_image, region_image, chain_image, out_image);
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(input_image, input),
+            ExternalResource::Image(region_image, region),
+            ExternalResource::Image(chain_image, chain),
         ];
         self.engine.run_recording_into_deferred(
             device,

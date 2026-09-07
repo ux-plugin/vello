@@ -889,6 +889,8 @@ pub(crate) fn record_fine_segment_draft(
     seg_target: u32,
     base: ImageProxy,
     draft: ImageProxy,
+    region: ImageProxy,
+    chain: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let fine_area_load_draft = shaders
@@ -915,7 +917,7 @@ pub(crate) fn record_fine_segment_draft(
     recording.dispatch(
         fine_area_load_draft,
         fine_wg,
-        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(draft)],
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(draft), ResourceProxy::Image(region), ResourceProxy::Image(chain)],
     );
     recording.free_resource(config_buf);
     recording
@@ -934,6 +936,8 @@ pub(crate) fn record_fine_segment_input(
     seg_target: u32,
     base: ImageProxy,
     input: ImageProxy,
+    region: ImageProxy,
+    chain: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let fine_area_load_input = shaders
@@ -960,7 +964,7 @@ pub(crate) fn record_fine_segment_input(
     recording.dispatch(
         fine_area_load_input,
         fine_wg,
-        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(input)],
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(input), ResourceProxy::Image(region), ResourceProxy::Image(chain)],
     );
     recording.free_resource(config_buf);
     recording
