@@ -55,6 +55,12 @@ var image_atlas: texture_2d<f32>;
 @group(0) @binding(8)
 var<storage> effect_params: array<f32>;
 
+#ifdef staging_rw
+fn stg_ld(p: vec2<i32>) -> vec4<f32> {
+    return unpack4x8unorm(textureLoad(output, p).x);
+}
+#endif
+
 #ifdef load_base
 #ifdef base_u32
 @group(0) @binding(9)
@@ -78,8 +84,13 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 var region_atlas: texture_2d<f32>;
 #else
 #ifdef have_draft
+#ifdef staging_rw
+@group(0) @binding(10)
+var region_atlas: texture_2d<f32>;
+#else
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
+#endif
 #else
 @group(0) @binding(10)
 var region_atlas: texture_2d<f32>;
@@ -143,25 +154,77 @@ fn fx_warp_sample(px: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32)
 #endif
 
 #ifdef have_draft
+#ifndef staging_rw
+#ifdef input_u32
+@group(0) @binding(10)
+var draft_in: texture_2d<u32>;
+#else
 @group(0) @binding(10)
 var draft_in: texture_2d<f32>;
 #endif
+#endif
+#endif
 
 #ifdef have_input
+#ifdef input_u32
+@group(0) @binding(10)
+var input_in: texture_2d<u32>;
+#else
 @group(0) @binding(10)
 var input_in: texture_2d<f32>;
+#endif
 
-fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
+fn input_ld(p: vec2<i32>) -> vec4<f32> {
+#ifdef input_u32
+    return unpack4x8unorm(textureLoad(input_in, p, 0).x);
+#else
+    return textureLoad(input_in, p, 0);
+#endif
+}
+#endif
+
+#ifdef have_draft
+#ifndef staging_rw
+fn draft_ld(p: vec2<i32>) -> vec4<f32> {
+#ifdef input_u32
+    return unpack4x8unorm(textureLoad(draft_in, p, 0).x);
+#else
+    return textureLoad(draft_in, p, 0);
+#endif
+}
+#endif
+#endif
+
+#ifdef fx_value_reads
+fn fx_bilin_input(pos: vec2<f32>, r: vec4<f32>) -> vec4<f32> {
     let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
+#ifdef staging_rw
+    let dmax = vec2<f32>(textureDimensions(output)) - vec2<f32>(1.0, 1.0);
+#else
     let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
-    let cp = clamp(p, vec2<f32>(0.0, 0.0), dmax);
+#endif
+    var lo = vec2<f32>(0.0, 0.0);
+    var hi = dmax;
+    if (r.z > r.x) {
+        lo = max(lo, r.xy);
+        hi = min(hi, r.zw - vec2<f32>(1.0, 1.0));
+    }
+    let cp = clamp(p, lo, hi);
     let fl = floor(cp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = cp - fl;
-    let s00 = textureLoad(input_in, i0, 0);
-    let s10 = textureLoad(input_in, min(i0 + vec2<i32>(1, 0), vec2<i32>(dmax)), 0);
-    let s01 = textureLoad(input_in, min(i0 + vec2<i32>(0, 1), vec2<i32>(dmax)), 0);
-    let s11 = textureLoad(input_in, min(i0 + vec2<i32>(1, 1), vec2<i32>(dmax)), 0);
+    let ihi = vec2<i32>(i32(hi.x), i32(hi.y));
+#ifdef staging_rw
+    let s00 = stg_ld(i0);
+    let s10 = stg_ld(min(i0 + vec2<i32>(1, 0), ihi));
+    let s01 = stg_ld(min(i0 + vec2<i32>(0, 1), ihi));
+    let s11 = stg_ld(min(i0 + vec2<i32>(1, 1), ihi));
+#else
+    let s00 = input_ld(i0);
+    let s10 = input_ld(min(i0 + vec2<i32>(1, 0), ihi));
+    let s01 = input_ld(min(i0 + vec2<i32>(0, 1), ihi));
+    let s11 = input_ld(min(i0 + vec2<i32>(1, 1), ihi));
+#endif
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 #endif
@@ -1090,6 +1153,11 @@ fn fractalNoise(p: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(_fbm(p, 0.0), _fbm(p, 37.0), _fbm(p, 71.0), _fbm(p, 113.0));
 }
 #ifdef have_input
+#ifdef input_u32
+fn fx_fieldDistance_sampled(fc: vec2<f32>, decode: f32) -> f32 {
+    return 0.0;
+}
+#else
 fn fx_fieldDistance_sampled(fc: vec2<f32>, decode: f32) -> f32 {
     let fp = fc - vec2<f32>(0.5, 0.5);
     let fl = floor(fp);
@@ -1102,6 +1170,7 @@ fn fx_fieldDistance_sampled(fc: vec2<f32>, decode: f32) -> f32 {
     let texel = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
     return (texel - 0.5) * decode;
 }
+#endif
 #endif
 
 fn fx_fieldDistance_lens(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
@@ -1288,7 +1357,7 @@ fn fx_load_desc(base: u32) -> FxDesc {
     return d;
 }
 fn fx_keys_on_round(base: u32) -> bool {
-#ifdef have_input
+#ifdef fx_value_reads
     return true;
 #else
     let b = u32(effect_params[base]);
@@ -1301,9 +1370,9 @@ fn fx_keys_on_round(base: u32) -> bool {
 fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<f32> {
     let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
     var v = prev;
-#ifdef have_input
+#ifdef fx_value_reads
     if (ctl & 4u) != 0u {
-        v = fx_bilin_input(px - d.rec[0].yz);
+        v = fx_bilin_input(px - d.rec[0].yz, d.rec[1]);
     }
 #endif
 #ifdef load_base
@@ -1349,22 +1418,39 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     for (var tt = -radius; tt <= radius; tt = tt + stride) {
         let w = exp(-f32(tt * tt) * inv2s2);
         let sp = ipx + axis * tt;
+#ifdef stg_taps
+        let tc = sp - scratch_in_i;
+        var dims = vec2<i32>(textureDimensions(output));
+        if (d.rec[1].z > d.rec[1].x) {
+            dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
+        }
+        var rawtap = stg_ld(tc);
+#else
 #ifdef have_draft
         let tc = sp - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(draft_in));
-        var rawtap = textureLoad(draft_in, tc, 0);
+        var rawtap = draft_ld(tc);
 #else
 #ifdef have_input
         let tc = sp - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(input_in));
-        var rawtap = textureLoad(input_in, tc, 0);
+        var rawtap = input_ld(tc);
 #else
         let tc = sp;
         let dims = vec2<i32>(textureDimensions(base_in));
         var rawtap = base_ld(tc);
 #endif
 #endif
+#endif
+#ifdef stg_taps
+        var tlo = vec2<i32>(0, 0);
+        if (d.rec[1].z > d.rec[1].x) {
+            tlo = vec2<i32>(i32(d.rec[1].x), i32(d.rec[1].y));
+        }
+        var inb = tc.x >= tlo.x && tc.y >= tlo.y && tc.x < dims.x && tc.y < dims.y;
+#else
         var inb = tc.x >= 0 && tc.y >= 0 && tc.x < dims.x && tc.y < dims.y;
+#endif
         if (bhi != 0u) {
             let in_rect = sp.x >= dev_lo.x && sp.y >= dev_lo.y && sp.x < dev_hi.x && sp.y < dev_hi.y;
             if (shadow_edge) {
@@ -1414,20 +1500,28 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
 }
 fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
+#ifdef staging_rw
+    let fdims = vec2<i32>(textureDimensions(output));
+#else
     let fdims = vec2<i32>(textureDimensions(base_in));
+#endif
     let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
+#ifdef staging_rw
+    let flood = select(0.0, stg_ld(fpx).a, finb);
+#else
     let flood = select(0.0, base_ld(fpx).a, finb);
+#endif
     return vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * punch_a));
 }
 #endif
-#ifdef have_input
+#ifdef fx_value_reads
 fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     let frost = d.u[4].z;
     let scl = d.u[4].x;
     let win = d.rec[0].yz;
     let fc = px + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
     if (frost <= 0.01) {
-        return fx_bilin_input(px - win);
+        return fx_bilin_input(px - win, d.rec[1]);
     }
     let lens_c = d.u[0].zw;
     let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
@@ -1445,7 +1539,7 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
             continue;
         }
 #endif
-        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi) - win);
+        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi) - win, d.rec[1]);
     }
     return sacc / 12.0;
 }
@@ -1491,7 +1585,7 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
         }
     }
 #endif
-#ifdef have_input
+#ifdef fx_value_reads
     if (d.bits & 256u) != 0u {
         value = fx_scatter_value(d, px);
         cov = 1.0;
@@ -1501,11 +1595,13 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
         if (d.bits & 32u) != 0u {
             disp = fld.xy;
         }
-        value = fx_bilin_input(px - win_value + disp);
+        value = fx_bilin_input(px - win_value + disp, d.rec[1]);
         if src_orig == 2.0 {
-            orig = fx_bilin_input(px - d.rec[2].yz);
+            orig = fx_bilin_input(px - d.rec[2].yz, d.rec[3]);
         } else {
+#ifdef load_base
             orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
+#endif
         }
     }
 #endif

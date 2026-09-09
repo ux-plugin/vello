@@ -71,13 +71,34 @@ pub struct FullShaders {
     pub fine_area_rwu_input: Option<ShaderId>,
     /// `fine_area_rwu` + `have_draft`: a separable blur's V-at-composite (binding 10 = the H draft).
     pub fine_area_rwu_draft: Option<ShaderId>,
+    /// `fine_area_rwu_input` + `input_u32`: the chained input at binding 10 is a packed r32uint
+    /// staging lease instead of an rgba8 draft.
+    pub fine_area_rwu_input_pk: Option<ShaderId>,
+    /// `fine_area_rwu_draft` + `input_u32`.
+    pub fine_area_rwu_draft_pk: Option<ShaderId>,
     /// `fine_area_load` with `base_u32`: a materialize window (rgba8 draft output) whose backdrop
     /// is the packed snapshot.
     pub fine_area_loadu: Option<ShaderId>,
+    /// `fine_area_loadu` without `region_reads`: the region STORE window — reads the packed
+    /// staging store as `base_in` and writes the region atlas, so the atlas must not also be
+    /// bound as the route atlas.
+    pub fine_area_loadu_store: Option<ShaderId>,
     /// `fine_area_loadu` + `have_input`.
     pub fine_area_loadu_input: Option<ShaderId>,
     /// `fine_area_loadu` + `have_draft`.
     pub fine_area_loadu_draft: Option<ShaderId>,
+    /// `staging_rw` + `draft_clear`: a rasterize window writing the packed staging store.
+    pub fine_area_stg: Option<ShaderId>,
+    /// `staging_rw` + `load_base base_u32`: a materialize window over the packed accumulator
+    /// backdrop, output and value reads through the packed staging store.
+    pub fine_area_stg_load: Option<ShaderId>,
+    /// `fine_area_stg_load` + `have_input`: slot 10 binds a sampled (SDF) texture.
+    pub fine_area_stg_load_sdf: Option<ShaderId>,
+    /// `staging_rw` + `base_u32 stg_taps`: a chain materialize — taps and value ride the packed
+    /// staging store, the packed accumulator is the read-only base for backdrop-edge taps and orig.
+    pub fine_area_stg_chain: Option<ShaderId>,
+    /// `fine_area_stg_chain` + `have_draft` (the separable-blur cov semantics).
+    pub fine_area_stg_chain_draft: Option<ShaderId>,
     pub fine_msaa8: Option<ShaderId>,
     pub fine_msaa16: Option<ShaderId>,
     // 2-level dispatch works for CPU pathtag scan even for large
@@ -458,11 +479,104 @@ pub(crate) fn full_shaders(
         area.then(|| add_shader!(fine_area_rwu_input, fine_resources_rwu_two, CpuShaderType::Missing));
     let fine_area_rwu_draft =
         area.then(|| add_shader!(fine_area_rwu_draft, fine_resources_rwu_two, CpuShaderType::Missing));
+    let fine_resources_rwu_two_pk = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let fine_area_rwu_input_pk = area
+        .then(|| add_shader!(fine_area_rwu_input_pk, fine_resources_rwu_two_pk, CpuShaderType::Missing));
+    let fine_area_rwu_draft_pk = area
+        .then(|| add_shader!(fine_area_rwu_draft_pk, fine_resources_rwu_two_pk, CpuShaderType::Missing));
     let fine_area_loadu = area.then(|| add_shader!(fine_area_loadu, fine_resources_loadu, CpuShaderType::Missing));
+    let fine_resources_loadu_store = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        Image(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+    ];
+    let fine_area_loadu_store = area
+        .then(|| add_shader!(fine_area_loadu_store, fine_resources_loadu_store, CpuShaderType::Missing));
     let fine_area_loadu_input =
         area.then(|| add_shader!(fine_area_loadu_input, fine_resources_loadu_two, CpuShaderType::Missing));
     let fine_area_loadu_draft =
         area.then(|| add_shader!(fine_area_loadu_draft, fine_resources_loadu_two, CpuShaderType::Missing));
+    let fine_resources_stg = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+    ];
+    let fine_resources_stg_load = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let fine_resources_stg_load_sdf = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let fine_resources_stg_chain = [
+        Uniform,
+        BufReadOnly,
+        BufReadOnly,
+        BufReadOnly,
+        Buffer,
+        ImageReadWrite(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::Rgba8),
+        BufReadOnly,
+        ImageRead(ImageFormat::R32Uint),
+        ImageRead(ImageFormat::Rgba8),
+    ];
+    let fine_area_stg =
+        area.then(|| add_shader!(fine_area_stg, fine_resources_stg, CpuShaderType::Missing));
+    let fine_area_stg_load =
+        area.then(|| add_shader!(fine_area_stg_load, fine_resources_stg_load, CpuShaderType::Missing));
+    let fine_area_stg_load_sdf =
+        area.then(|| add_shader!(fine_area_stg_load_sdf, fine_resources_stg_load_sdf, CpuShaderType::Missing));
+    let fine_area_stg_chain =
+        area.then(|| add_shader!(fine_area_stg_chain, fine_resources_stg_chain, CpuShaderType::Missing));
+    let fine_area_stg_chain_draft =
+        area.then(|| add_shader!(fine_area_stg_chain_draft, fine_resources_stg_chain, CpuShaderType::Missing));
     let fine_msaa8 = if aa_support.msaa8 {
         Some(add_shader!(
             fine_msaa8,
@@ -513,9 +627,17 @@ pub(crate) fn full_shaders(
         fine_area_rwu,
         fine_area_rwu_input,
         fine_area_rwu_draft,
+        fine_area_rwu_input_pk,
+        fine_area_rwu_draft_pk,
         fine_area_loadu,
+        fine_area_loadu_store,
         fine_area_loadu_input,
         fine_area_loadu_draft,
+        fine_area_stg,
+        fine_area_stg_load,
+        fine_area_stg_load_sdf,
+        fine_area_stg_chain,
+        fine_area_stg_chain_draft,
         fine_msaa8,
         fine_msaa16,
         pathtag_is_cpu: options.use_cpu,
