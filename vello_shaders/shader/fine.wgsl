@@ -1913,6 +1913,20 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
     if (d.bits & 4096u) != 0u {
         value = fx_flood_value(d.u, px, value.a);
     }
+    // A RAW-only arm (no head, no chain source) is a COPY: one bilinear tap of `base_in` at the
+    // record-0 window offset, written through. A store window binds staging as base and lands a
+    // lease in the atlas; a transport mark's tap rides its route record instead (out-of-frame
+    // positions resolve through fx_region_serves inside fx_bilin). u[1], when non-degenerate, is
+    // the copy's pixel rect: the mark bins per tile, so a partial edge tile keeps the register
+    // (the window's replayed content) outside the rect instead of bleeding the tap across it.
+    if (d.bits & 512u) != 0u && (d.bits & (32u | 64u | 256u | 4096u)) == 0u && src_value != 2.0 {
+        let clo = d.u[1].xy;
+        let chi = d.u[1].zw;
+        if (chi.x <= clo.x
+            || (px.x >= clo.x && px.y >= clo.y && px.x < chi.x && px.y < chi.y)) {
+            value = fx_bilin(px - win_value);
+        }
+    }
 #endif
 #ifdef have_input
     if (d.bits & 256u) != 0u {

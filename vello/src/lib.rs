@@ -965,14 +965,6 @@ impl Renderer {
 
     /// Refresh snapshot rects from the accumulator as one batched compute copy (deferred with the
     /// phased fine dispatches when dispatch batching is on).
-    /// Flush every deferred fine dispatch into `encoder` now. Phased dispatches batch into one
-    /// compute pass at the next flush boundary; a raw encoder command (a lease write-back or
-    /// transport `copy_texture_to_texture`) that must observe their writes calls this first, or it
-    /// records ahead of the work it depends on.
-    pub fn phased_flush_dispatches(&mut self, encoder: &mut wgpu::CommandEncoder) {
-        self.engine.flush_dispatches(encoder);
-    }
-
     pub fn phased_snap_copy_into(
         &mut self,
         session: &mut render::PhasedSession,
