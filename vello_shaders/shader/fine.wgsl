@@ -1,10 +1,3 @@
-// Copyright 2022 the Vello Authors
-// SPDX-License-Identifier: Apache-2.0 OR MIT OR Unlicense
-
-// Fine rasterizer.
-//
-// To enable multisampled rendering, turn on both the msaa ifdef and one of msaa8
-// or msaa16.
 
 struct Tile {
     backdrop: i32,
@@ -40,13 +33,6 @@ var<storage> info: array<u32>;
 @group(0) @binding(4)
 var<storage, read_write> blend_spill: array<u32>;
 
-// The whole-viewport single-accumulator permutation (`rw_accum`) binds the output READ-WRITE and
-// updates it in place: a tile whose window holds no work returns before touching a pixel, so the
-// pass cost scales with the tiles that change, not the viewport. Requires rgba8unorm read-write
-// storage (adapter-specific format features / the browser's `texture-formats-tier2`).
-// The `acc_u32` permutations write the packed accumulator: one r32uint texel per pixel holding
-// `pack4x8unorm(premul rgba)` — the only READ-WRITE storage format core WebGPU guarantees on every
-// platform, so the single in-place accumulator needs no adapter-specific features anywhere.
 #ifdef acc_u32
 @group(0) @binding(5)
 var output: texture_storage_2d<r32uint, read_write>;
@@ -66,20 +52,11 @@ var gradients: texture_2d<f32>;
 @group(0) @binding(7)
 var image_atlas: texture_2d<f32>;
 
-// Effects-in-fine: per-effect unit descriptors — each a header + the 24-float (6-vec4) unit
-// uniform — packed back-to-back, indexed by the CMD_EFFECT marker. Authored per DAG node by the
-// scheduler's emitter; a 1-element dummy when no effect rides fine. Always binding 8.
 @group(0) @binding(8)
 var<storage> effect_params: array<f32>;
 
-// Whole-viewport gather phasing: phase > 0 composites over the previous phase's output, loaded here
-// as its base instead of `config.base_color`. (A separate input texture — not the write target — so
-// there is no read/write hazard; the caller ping-pongs the two across phases.)
 #ifdef load_base
 #ifdef base_u32
-// The backdrop under `base_u32` is a SNAPSHOT of the packed r32uint accumulator (an encoder-level
-// copy taken at the round boundary): the live accumulator is a write-only target for fine, and
-// every backdrop read comes through here, unpacked per texel.
 @group(0) @binding(9)
 var base_in: texture_2d<u32>;
 #else
@@ -87,7 +64,6 @@ var base_in: texture_2d<u32>;
 var base_in: texture_2d<f32>;
 #endif
 
-// One backdrop texel as premul rgba, whatever the binding's texel format.
 fn base_ld(p: vec2<i32>) -> vec4<f32> {
 #ifdef base_u32
     return unpack4x8unorm(textureLoad(base_in, p, 0).x);
@@ -97,10 +73,6 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 }
 
 #ifdef region_reads
-// The region atlas: every interest region's materialized lease, mapped one-to-one from the rented
-// grid band. Bound read-only in every backdrop-tapping dispatch (region windows write a staging
-// texture the sink blits back, never this binding); the running arm's OVERFLOW record says where
-// its out-of-frame taps resolve and at what density.
 #ifdef have_input
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
@@ -114,11 +86,6 @@ var region_atlas: texture_2d<f32>;
 #endif
 #endif
 
-// Whether the running arm serves point `p`: a route is stamped (record 5, installed per mark),
-// the point is out-of-frame (frame-content taps keep the live accumulator; band positions are
-// out-of-frame by construction, so piece arms always route), and the mapped position lands in the
-// serving lease — a tap escaping in a direction the lease does not cover keeps the edge-extend
-// clamp instead of reading through the wrong window.
 fn fx_region_serves(p: vec2<f32>) -> bool {
     if (region_route.x == 0.0
         || (p.x >= 0.0 && p.y >= 0.0
@@ -130,11 +97,6 @@ fn fx_region_serves(p: vec2<f32>) -> bool {
         && a.x <= region_clamp.z && a.y <= region_clamp.w;
 }
 
-// One region tap at point `p`: the route's affine (`atlas = p * k + offset`), clamped to the
-// lease's own texel rect so a tap straying past the serve window edge-extends at the lease
-// instead of reading a shelf neighbour (hi is inclusive-minus-one, so the bilinear +1 texel
-// contributes with weight zero at the edge). Interpolates the stored premul texels (the same
-// raw-unorm convention as fx_bilin).
 fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
     let a = clamp(p * region_route.w + region_route.yz, region_clamp.xy, region_clamp.zw);
     let fl = floor(a);
@@ -148,14 +110,6 @@ fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
 }
 #endif
 
-// Bilinear sample of the materialised backdrop at a continuous pixel position — the manual equivalent
-// of the batched lens oracle's linear `unitSample`. `pos = px + disp`; the sampler's −0.5 texel-centre
-// convention cancels the fragment-centre +0.5, so no half-texel bias is added. Interpolates the stored
-// premul-sRGB texels directly (the hardware sampler the oracle uses interpolates raw unorm, not linear
-// light), so no colour-space conversion here.
-// The position clamps to the backdrop's texel range (edge extend, the backdrop-filter convention):
-// past the texture a raw load returns zero, which whitens or darkens every tap that crosses the
-// viewport edge — the visible band whenever a lens hangs off the screen.
 fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
 #ifdef region_reads
     if (fx_region_serves(pos)) {
@@ -174,9 +128,6 @@ fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-// Refracted backdrop sample for a WARP head: bilinear at `px + disp`, with CHROMATIC ABERRATION —
-// R and B sampled shifted along the displacement direction, the shift growing with |disp| so it
-// peaks at the lens rim. `ca_scale` = field scale (u[4].x), `ca_amount` = CA amount (u[4].y).
 fn fx_warp_sample(px: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32) -> vec4<f32> {
     let bp = px + disp;
     let dlen = length(disp);
@@ -191,33 +142,15 @@ fn fx_warp_sample(px: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32)
 }
 #endif
 
-// A separable blur's SECOND pass reads its first pass's UNMASKED result from here — a "draft" the
-// planner had the first pass write to (out = draft) while `base_in` still holds the original backdrop.
-// Two sampled inputs let the V pass take its blur taps from the H result (the draft) and its
-// margin/pass-through pixels from the original (base_in), so the silhouette mask is applied exactly
-// once, at composite. Present only in the `have_draft` permutation (the V dispatch).
 #ifdef have_draft
 @group(0) @binding(10)
 var draft_in: texture_2d<f32>;
 #endif
 
-// A CHAINED gather (frosted glass: warp → blur → scatter → shade) materialises intermediate surfaces
-// the way the batched lens stages do. `input_in` is the marker's PRIMARY input surface — the previous
-// link's output — routed here by the scheduler (the warped surface for the blur H, the blurred surface
-// for the scatter, the scattered surface for the shade). It shares binding 10 with `draft_in`: a marker
-// reads AT MOST one second surface (a frosted blur-V reads the draft; warp/blur-H/scatter/tail read the
-// input), so `have_draft` and `have_input` are never set together. `base_in` still holds the ORIGINAL
-// backdrop (warp displacement + maskmix orig). Present only in the `have_input` permutation.
 #ifdef have_input
 @group(0) @binding(10)
 var input_in: texture_2d<f32>;
 
-// Bilinear sample of the primary input surface at a continuous pixel position (see `fx_bilin`).
-// `input_in` is always a reach-cropped scratch, so the device position shifts by `scratch_in` to the
-// scratch's own frame (both zero → full-viewport, unchanged). NO region hook here: several call
-// sites pass positions already shifted into a producer's crop frame (a shade's chain seed, a
-// maskmix displaced read), where a device-space serve test would fire on garbage — the one arm
-// whose input taps stray, the scatter, serves at its own tap site instead.
 fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
     let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
     let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
@@ -233,36 +166,16 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
 }
 #endif
 
-// Per-tile reach-crop origin of the OUTPUT scratch, in device pixels — set from a marker's OUTPUT
-// record (record 4) as fine walks this tile's PTCL. The tile-tail store shifts the write by it, so a tile whose
-// governing effect is cropped writes into its small draft while a tile with no cropped marker keeps
-// device coordinates (origin stays zero). This is what makes the crop PER-TILE, not per-dispatch:
-// reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
 #ifdef region_reads
-// The running arm's OVERFLOW route (record 5): [SRC_REGION flag, offset x, offset y, k] — the
-// affine mapping an out-of-frame tap into its serving lease. Zero flag = no serving; escaped
-// backdrop taps keep the edge-extend clamp. Set per mark in fx_run_mark, exactly like the store
-// origin above.
 var<private> region_route: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-// The route's extension row (record 5's second vec4): the lease's texel rect in the atlas,
-// [lo_x, lo_y, hi_x, hi_y] with hi inclusive-minus-one — the clamp keeping a straying tap
-// edge-extended at its own lease instead of reading a shelf neighbour.
 var<private> region_clamp: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 #endif
 
-
-// Whether an in-window FENCE already claimed this tile's store origin. The next in-window fence is
-// then a FLUSH boundary: the register tile is stored to the claimed lease and reset before the new
-// origin is adopted, so overlapping fenced draws on one tile keep distinct leases within ONE window.
 var<private> fence_live: bool = false;
-// The tile's WINDOW range: config.seg_lo/seg_target by default; a merged dispatch's sparse entry
-// (bit 29 on the tile word) overrides both from its parallel range word, so each workgroup walks
-// its own window.
 var<private> win_lo: u32 = 0u;
 var<private> win_hi: u32 = 0u;
 
-// MSAA-only bindings and utilities
 #ifdef msaa
 
 const MASK_LUT_INDEX: u32 = 9;
@@ -272,7 +185,6 @@ const MASK_WIDTH = 32u;
 const MASK_HEIGHT = 32u;
 const SH_SAMPLES_SIZE = 512u;
 const SAMPLE_WORDS_PER_PIXEL = 2u;
-// This might be better in uniform, but that has 16 byte alignment
 @group(0) @binding(MASK_LUT_INDEX)
 var<storage> mask_lut: array<u32, 256u>;
 #endif
@@ -289,85 +201,28 @@ var<storage> mask_lut: array<u32, 2048u>;
 const WG_SIZE = 64u;
 var<workgroup> sh_count: array<u32, WG_SIZE>;
 
-// This array contains the winding number of the top left corner of each
-// 16 pixel wide row of pixels, relative to the top left corner of the row
-// immediately above.
-//
-// The values are stored packed, as 4 8-bit subwords in a 32 bit word.
-// The values are biased signed integers, with 0x80 representing a winding
-// number of 0, so that the range of -128 to 127 (inclusive) can be stored
-// without carry.
-//
-// For the even-odd case, the same storage is repurposed, so that a single
-// word contains 16 one-bit winding parity values packed to the word.
 var<workgroup> sh_winding_y: array<atomic<u32>, 4u>;
-// This array contains the winding number of the top left corner of each
-// 16 pixel wide row of pixels, relative to the top left corner of the tile.
-// It is expanded from sh_winding_y by inclusive prefix sum.
 var<workgroup> sh_winding_y_prefix: array<atomic<u32>, 4u>;
-// This array contains winding numbers of the top left corner of each
-// pixel, relative to the top left corner of the enclosing 16 pixel
-// wide row.
-//
-// During winding number accumulation, it stores a delta (winding number
-// relative to the pixel immediately to the left), then expanded using
-// prefix sum and reusing the same storage.
-//
-// The encoding and packing is the same as `sh_winding_y`. For the even-odd
-// case, only the first 16 values are used, and each word stores packed
-// parity values for one row of pixels.
 var<workgroup> sh_winding: array<atomic<u32>, 64u>;
-// This array contains winding numbers of multiple sample points within
-// a pixel, relative to the winding number of the top left corner of the
-// pixel. The encoding and packing is the same as `sh_winding_y`.
 var<workgroup> sh_samples: array<atomic<u32>, SH_SAMPLES_SIZE>;
 
-// number of integer cells spanned by interval defined by a, b
 fn span(a: f32, b: f32) -> u32 {
     return u32(max(ceil(max(a, b)) - floor(min(a, b)), 1.0));
 }
 
 const SEG_SIZE = 5u;
 
-// See cpu_shaders/util.rs for explanation of these.
 const ONE_MINUS_ULP: f32 = 0.99999994;
 const ROBUST_EPSILON: f32 = 2e-7;
 
-// Multisampled path rendering algorithm.
-//
-// FIXME: This could return an array when https://github.com/gfx-rs/naga/issues/1930 is fixed.
-//
-// Generally, this algorithm works in an accumulation phase followed by a
-// resolving phase, with arrays in workgroup shared memory accumulating
-// winding number deltas as the results of edge crossings detected in the
-// path segments. Accumulation is in two stages: first a counting stage
-// which computes the number of pixels touched by each line segment (with
-// each thread processing one line segment), then a stage in which the
-// deltas are bumped. Separating these two is a partition-wide prefix sum
-// and a binary search to assign the work to threads in a load-balanced
-// manner.
-//
-// The resolving phase is also two stages: prefix sums in both x and y
-// directions, then counting nonzero winding numbers for all samples within
-// all pixels in the tile.
-//
-// A great deal of SIMD within a register (SWAR) logic is used, as there
-// are a great many winding numbers to be computed. The interested reader
-// is invited to study the even-odd case first, as there only one bit is
-// needed to represent a winding number parity, thus there is a lot less
-// bit shifting, and less shuffling altogether.
 fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<f32, PIXELS_PER_THREAD>>) {
     let even_odd = (fill.size_and_rule & 1u) != 0u;
-    // This isn't a divergent branch because the fill parameters are workgroup uniform,
-    // provably so because the ptcl buffer is bound read-only.
     if even_odd {
         fill_path_ms_evenodd(fill, local_id, result);
         return;
     }
     let n_segs = fill.size_and_rule >> 1u;
     let th_ix = local_id.y * (TILE_WIDTH / PIXELS_PER_THREAD) + local_id.x;
-    // Initialize winding number arrays to a winding number of 0, which is 0x80 in an
-    // 8 bit biased signed integer encoding.
     if th_ix < 64u {
         if th_ix < 4u {
             atomicStore(&sh_winding_y[th_ix], 0x80808080u);
@@ -385,7 +240,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
         let seg_off = fill.seg_data + seg_ix;
         var count = 0u;
         let slice_size = min(n_segs - batch * WG_SIZE, WG_SIZE);
-        // TODO: might save a register rewriting this in terms of limit
         if th_ix < slice_size {
             let segment = segments[seg_off];
             let xy0 = segment.point0;
@@ -397,7 +251,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
             } else if xy1.x == 0.0 {
                 y_edge_f = xy1.y;
             }
-            // discard horizontal lines aligned to pixel grid
             if !(xy0.y == xy1.y && xy0.y == floor(xy0.y)) {
                 count = span(xy0.x, xy1.x) + span(xy0.y, xy1.y) - 1u;
             }
@@ -406,7 +259,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
                 atomicAdd(&sh_winding_y[y_edge >> 2u], u32(delta) << ((y_edge & 3u) << 3u));
             }
         }
-        // workgroup prefix sum of counts
         sh_count[th_ix] = count;
         let lg_n = firstLeadingBit(slice_size * 2u - 1u);
         for (var i = 0u; i < lg_n; i++) {
@@ -419,7 +271,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
         }
         let total = workgroupUniformLoad(&sh_count[slice_size - 1u]);
         for (var i = th_ix; i < total; i += WG_SIZE) {
-            // binary search to find pixel
             var lo = 0u;
             var hi = slice_size;
             let goal = i;
@@ -436,22 +287,16 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
             let sub_ix = i - select(0u, sh_count[el_ix - 1u], el_ix > 0u);
             let seg_off = fill.seg_data + batch * WG_SIZE + el_ix;
             let segment = segments[seg_off];
-            // Coordinates are relative to tile origin
             let xy0_in = segment.point0;
             let xy1_in = segment.point1;
             let is_down = xy1_in.y >= xy0_in.y;
             let xy0 = select(xy1_in, xy0_in, is_down);
             let xy1 = select(xy0_in, xy1_in, is_down);
 
-            // Set up data for line rasterization
-            // Note: this is duplicated work if total count exceeds a workgroup.
-            // One alternative is to compute it in a separate dispatch.
             let dx = abs(xy1.x - xy0.x);
             let dy = xy1.y - xy0.y;
             let idxdy = 1.0 / (dx + dy);
             var a = dx * idxdy;
-            // is_positive_slope is true for \ and | slopes, false for /. For
-            // horizontal lines, it follows the original data.
             let is_positive_slope = xy1.x >= xy0.x;
             let x_sign = select(-1.0, 1.0, is_positive_slope);
             let xt0 = floor(xy0.x * x_sign);
@@ -466,35 +311,18 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
                 a -= ROBUST_EPSILON * sign(robust_err);
             }
             let x0i = i32(xt0 * x_sign + 0.5 * (x_sign - 1.0));
-            // Use line equation to plot pixel coordinates
 
             let zf = a * f32(sub_ix) + b;
             let z = floor(zf);
             let x = x0i + i32(x_sign * z);
             let y = i32(y0i) + i32(sub_ix) - i32(z);
-            // is_delta captures whether the line crosses the top edge of this
-            // pixel. If so, then a delta is added to `sh_winding`, followed by
-            // a prefix sum, so that a winding number delta is applied to all
-            // pixels to the right of this one.
             var is_delta: bool;
-            // is_bump captures whether x0 crosses the left edge of this pixel.
             var is_bump = false;
             let zp = floor(a * f32(sub_ix - 1u) + b);
             if sub_ix == 0u {
-                // The first (top-most) pixel in the line. It is considered to be
-                // a line crossing when it touches the top of the pixel.
-                //
-                // Note: horizontal lines aligned to the pixel grid have already
-                // been discarded.
                 is_delta = y0i == xy0.y;
-                // The pixel is counted as a left edge crossing only at the left
-                // edge of the tile (and when it is not the top left corner,
-                // using logic analogous to tiling).
                 is_bump = xy0.x == 0.0 && y0i != xy0.y;
             } else {
-                // Pixels other than the first are a crossing at the top or on
-                // the side, based on the conservative line rasterization. When
-                // positive slope, the crossing is on the left.
                 is_delta = z == zp;
                 is_bump = is_positive_slope && !is_delta;
             }
@@ -506,7 +334,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
                     atomicAdd(&sh_winding[delta_pix >> 2u], delta);
                 }
             }
-            // Apply sample mask
             let mask_block = u32(is_positive_slope) * (MASK_WIDTH * MASK_HEIGHT / 2u);
             let half_height = f32(MASK_HEIGHT / 2u);
             let mask_row = floor(min(a * half_height, half_height - 1.0)) * f32(MASK_WIDTH);
@@ -515,7 +342,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
 #ifdef msaa8
             var mask = mask_lut[mask_ix / 4u] >> ((mask_ix % 4u) * 8u);
             mask &= 0xffu;
-            // Intersect with y half-plane masks
             if sub_ix == 0u && !is_bump {
                 let mask_shift = u32(round(8.0 * (xy0.y - f32(y))));
                 mask &= 0xffu << mask_shift;
@@ -524,12 +350,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
                 let mask_shift = u32(round(8.0 * (xy1.y - f32(y))));
                 mask &= ~(0xffu << mask_shift);
             }
-            // Expand an 8 bit mask value to 8 1-bit values, packed 4 to a subword,
-            // so that two words are used to represent the result. An efficient
-            // technique is carry-less multiplication by 0b10_0000_0100_0000_1000_0001
-            // followed by and-masking to extract bit in position 4 * k.
-            //
-            // See https://en.wikipedia.org/wiki/Carry-less_product
             let mask_a = mask ^ (mask << 7u);
             let mask_b = mask_a ^ (mask_a << 14u);
             let mask0_exp = mask_b & 0x1010101u;
@@ -547,7 +367,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
 #ifdef msaa16
             var mask = mask_lut[mask_ix / 2u] >> ((mask_ix % 2u) * 16u);
             mask &= 0xffffu;
-            // Intersect with y half-plane masks
             if sub_ix == 0u && !is_bump {
                 let mask_shift = u32(round(16.0 * (xy0.y - f32(y))));
                 mask &= 0xffffu << mask_shift;
@@ -556,16 +375,8 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
                 let mask_shift = u32(round(16.0 * (xy1.y - f32(y))));
                 mask &= ~(0xffffu << mask_shift);
             }
-            // Similar logic as above, only a 16 bit mask is divided into
-            // two 8 bit halves first, then each is expanded as above.
-            // Mask is 0bABCD_EFGH_IJKL_MNOP. Expand to 4 32 bit words
-            // mask0_exp will be 0b0000_000M_0000_000N_0000_000O_0000_000P
-            // mask3_exp will be 0b0000_000A_0000_000B_0000_000C_0000_000D
             let mask0 = mask & 0xffu;
-            // mask0_a = 0b0IJK_LMNO_*JKL_MNOP
             let mask0_a = mask0 ^ (mask0 << 7u);
-            // mask0_b = 0b000I_JKLM_NO*J_KLMN_O*K_LMNO_*JKL_MNOP
-            //                ^    ^    ^    ^   ^    ^    ^    ^
             let mask0_b = mask0_a ^ (mask0_a << 14u);
             let mask0_exp = mask0_b & 0x1010101u;
             var mask0_signed = select(mask0_exp, u32(-i32(mask0_exp)), is_down);
@@ -573,9 +384,7 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
             var mask1_signed = select(mask1_exp, u32(-i32(mask1_exp)), is_down);
             let mask1 = (mask >> 8u) & 0xffu;
             let mask1_a = mask1 ^ (mask1 << 7u);
-            // mask1_a = 0b0ABC_DEFG_*BCD_EFGH
             let mask1_b = mask1_a ^ (mask1_a << 14u);
-            // mask1_b = 0b000A_BCDE_FG*B_CDEF_G*C_DEFG_*BCD_EFGH
             let mask2_exp = mask1_b & 0x1010101u;
             var mask2_signed = select(mask2_exp, u32(-i32(mask2_exp)), is_down);
             let mask3_exp = (mask1_b >> 4u) & 0x1010101u;
@@ -598,15 +407,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
     var area: array<f32, PIXELS_PER_THREAD>;
     let major = (th_ix * PIXELS_PER_THREAD) >> 2u;
     var packed_w = atomicLoad(&sh_winding[major]);
-    // Compute prefix sums of both `sh_winding` and `sh_winding_y`. Both
-    // use the same technique. First, a per-word prefix sum is computed
-    // of the 4 subwords within each word. The last subword is the sum
-    // (reduction) of that group of 4 values, and is stored to shared
-    // memory for broadcast to other threads. Then each thread computes
-    // the prefix by adding the preceding reduced values.
-    //
-    // Addition of 2 biased signed values is accomplished by adding the
-    // values, then subtracting the bias.
     packed_w += (packed_w - 0x808080u) << 8u;
     packed_w += (packed_w - 0x8080u) << 16u;
     var packed_y = atomicLoad(&sh_winding_y[local_id.y >> 2u]);
@@ -618,50 +418,19 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
         atomicStore(&sh_winding_y_prefix[local_id.y >> 2u], prefix_y);
     }
     let prefix_x = ((packed_w >> 24u) - 0x80u) * 0x1010101u;
-    // reuse sh_winding to store prefix as well
     atomicStore(&sh_winding[major], prefix_x);
     workgroupBarrier();
     for (var i = (major & ~3u); i < major; i++) {
         packed_w += atomicLoad(&sh_winding[i]);
     }
-    // packed_w now contains the winding numbers for a slice of 4 pixels,
-    // each relative to the top left of the row.
     for (var i = 0u; i < (local_id.y >> 2u); i++) {
         wind_y += atomicLoad(&sh_winding_y_prefix[i]);
     }
-    // wind_y now contains the winding number of the top left of the row of
-    // pixels relative to the top left of the tile. Note that this is actually
-    // a signed quantity stored without bias.
-
-    // The winding number of a sample point is the sum of four levels of
-    // hierarchy:
-    // * The winding number of the top left of the tile (backdrop)
-    // * The winding number of the pixel row relative to tile (wind_y)
-    // * The winding number of the pixel relative to row (packed_w)
-    // * The winding number of the sample relative to pixel (sh_samples)
-    //
-    // Conceptually, we want to compute each of these total winding numbers
-    // for each sample within a pixel, then count the number that are non-zero.
-    // However, we apply a shortcut, partly to make the computation more
-    // efficient, and partly to avoid overflow of intermediate results.
-    //
-    // Here's the technique that's used. The `expected_zero` value contains
-    // the *negation* of the sum of the first three levels of the hierarchy.
-    // Thus, `sample - expected` is zero when the sum of all levels in the
-    // hierarchy is zero, and this is true when `sample = expected`. We
-    // compute this using SWAR techniques as follows: we compute the xor of
-    // all bits of `expected` (repeated to all subwords) against the packed
-    // samples, then the or-reduction of the bits within each subword. This
-    // value is 1 when the values are unequal, thus the sum is nonzero, and
-    // 0 when the sum is zero. These bits are then masked and counted.
 
     for (var i = 0u; i < PIXELS_PER_THREAD; i++) {
         let pix_ix = th_ix * PIXELS_PER_THREAD + i;
-        let minor = i; // assumes PIXELS_PER_THREAD == 4
+        let minor = i;
         let expected_zero = (((packed_w >> (minor * 8u)) + wind_y) & 0xffu) - u32(fill.backdrop);
-        // When the expected_zero value exceeds the range of what can be stored
-        // in a (biased) signed integer, then there is no sample value that can
-        // be equal to the expected value, thus all resulting bits are 1.
         if expected_zero >= 256u {
             area[i] = 1.0;
         } else {
@@ -672,11 +441,8 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
             let xored0_2 = xored0 | (xored0 * 2u);
             let xored1 = (expected_zero * 0x1010101u) ^ samples1;
             let xored1_2 = xored1 | (xored1 >> 1u);
-            // xored2 contains 2-reductions from each word, interleaved
             let xored2 = (xored0_2 & 0xAAAAAAAAu) | (xored1_2 & 0x55555555u);
-            // bits 4 * k + 2 and 4 * k + 3 contain 4-reductions
             let xored4 = xored2 | (xored2 * 4u);
-            // bits 8 * k + 6 and 8 * k + 7 contain 8-reductions
             let xored8 = xored4 | (xored4 * 16u);
             area[i] = f32(countOneBits(xored8 & 0xC0C0C0C0u)) * 0.125;
 #endif
@@ -689,21 +455,15 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
             let xored0_2 = xored0 | (xored0 * 2u);
             let xored1 = (expected_zero * 0x1010101u) ^ samples1;
             let xored1_2 = xored1 | (xored1 >> 1u);
-            // xored01 contains 2-reductions from words 0 and 1, interleaved
             let xored01 = (xored0_2 & 0xAAAAAAAAu) | (xored1_2 & 0x55555555u);
-            // bits 4 * k + 2 and 4 * k + 3 contain 4-reductions
             let xored01_4 = xored01 | (xored01 * 4u);
             let xored2 = (expected_zero * 0x1010101u) ^ samples2;
             let xored2_2 = xored2 | (xored2 * 2u);
             let xored3 = (expected_zero * 0x1010101u) ^ samples3;
             let xored3_2 = xored3 | (xored3 >> 1u);
-            // xored23 contains 2-reductions from words 2 and 3, interleaved
             let xored23 = (xored2_2 & 0xAAAAAAAAu) | (xored3_2 & 0x55555555u);
-            // bits 4 * k and 4 * k + 1 contain 4-reductions
             let xored23_4 = xored23 | (xored23 >> 2u);
-            // each bit is a 4-reduction, with values from all 4 words
             let xored4 = (xored01_4 & 0xCCCCCCCCu) | (xored23_4 & 0x33333333u);
-            // bits 8 * k + {4, 5, 6, 7} contain 8-reductions
             let xored8 = xored4 | (xored4 * 16u);
             area[i] = f32(countOneBits(xored8 & 0xF0F0F0F0u)) * 0.0625;
 #endif
@@ -712,15 +472,6 @@ fn fill_path_ms(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<
     *result = area;
 }
 
-// Path rendering specialized to the even-odd rule.
-//
-// This proceeds very much the same as `fill_path_ms`, but is simpler because
-// all winding numbers can be represented in one bit. Formally, addition is
-// modulo 2, or, equivalently, winding numbers are elements of GF(2). One
-// simplification is that we don't need to track the direction of crossings,
-// as both have the same effect on winding number.
-//
-// TODO: factor some logic out to reduce code duplication.
 fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function, array<f32, PIXELS_PER_THREAD>>) {
     let n_segs = fill.size_and_rule >> 1u;
     let th_ix = local_id.y * (TILE_WIDTH / PIXELS_PER_THREAD) + local_id.x;
@@ -741,10 +492,8 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
         let seg_off = fill.seg_data + seg_ix;
         var count = 0u;
         let slice_size = min(n_segs - batch * WG_SIZE, WG_SIZE);
-        // TODO: might save a register rewriting this in terms of limit
         if th_ix < slice_size {
             let segment = segments[seg_off];
-            // Coordinates are relative to tile origin
             let xy0 = segment.point0;
             let xy1 = segment.point1;
             var y_edge_f = f32(TILE_HEIGHT);
@@ -753,7 +502,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
             } else if xy1.x == 0.0 {
                 y_edge_f = xy1.y;
             }
-            // discard horizontal lines aligned to pixel grid
             if !(xy0.y == xy1.y && xy0.y == floor(xy0.y)) {
                 count = span(xy0.x, xy1.x) + span(xy0.y, xy1.y) - 1u;
             }
@@ -762,7 +510,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
                 atomicXor(&sh_winding_y[0], 1u << y_edge);
             }
         }
-        // workgroup prefix sum of counts
         sh_count[th_ix] = count;
         let lg_n = firstLeadingBit(slice_size * 2u - 1u);
         for (var i = 0u; i < lg_n; i++) {
@@ -775,7 +522,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
         }
         let total = workgroupUniformLoad(&sh_count[slice_size - 1u]);
         for (var i = th_ix; i < total; i += WG_SIZE) {
-            // binary search to find pixel
             var lo = 0u;
             var hi = slice_size;
             let goal = i;
@@ -798,9 +544,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
             let xy0 = select(xy1_in, xy0_in, is_down);
             let xy1 = select(xy0_in, xy1_in, is_down);
 
-            // Set up data for line rasterization
-            // Note: this is duplicated work if total count exceeds a workgroup.
-            // One alternative is to compute it in a separate dispatch.
             let dx = abs(xy1.x - xy0.x);
             let dy = xy1.y - xy0.y;
             let idxdy = 1.0 / (dx + dy);
@@ -819,14 +562,12 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
                 a -= ROBUST_EPSILON * sign(robust_err);
             }
             let x0i = i32(xt0 * x_sign + 0.5 * (x_sign - 1.0));
-            // Use line equation to plot pixel coordinates
 
             let zf = a * f32(sub_ix) + b;
             let z = floor(zf);
             let x = x0i + i32(x_sign * z);
             let y = i32(y0i) + i32(sub_ix) - i32(z);
             var is_delta: bool;
-            // See comments in nonzero case.
             var is_bump = false;
             let zp = floor(a * f32(sub_ix - 1u) + b);
             if sub_ix == 0u {
@@ -841,7 +582,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
                     atomicXor(&sh_winding[y], 2u << u32(x));
                 }
             }
-            // Apply sample mask
             let mask_block = u32(is_positive_slope) * (MASK_WIDTH * MASK_HEIGHT / 2u);
             let half_height = f32(MASK_HEIGHT / 2u);
             let mask_row = floor(min(a * half_height, half_height - 1.0)) * f32(MASK_WIDTH);
@@ -851,7 +591,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
 #ifdef msaa8
             var mask = mask_lut[mask_ix / 4u] >> ((mask_ix % 4u) * 8u);
             mask &= 0xffu;
-            // Intersect with y half-plane masks
             if sub_ix == 0u && !is_bump {
                 let mask_shift = u32(round(8.0 * (xy0.y - f32(y))));
                 mask &= 0xffu << mask_shift;
@@ -868,7 +607,6 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
 #ifdef msaa16
             var mask = mask_lut[mask_ix / 2u] >> ((mask_ix % 2u) * 16u);
             mask &= 0xffffu;
-            // Intersect with y half-plane masks
             if sub_ix == 0u && !is_bump {
                 let mask_shift = u32(round(16.0 * (xy0.y - f32(y))));
                 mask &= 0xffffu << mask_shift;
@@ -887,30 +625,22 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
     }
     var area: array<f32, PIXELS_PER_THREAD>;
     var scan_x = atomicLoad(&sh_winding[local_id.y]);
-    // prefix sum over GF(2) is equivalent to carry-less multiplication
-    // by 0xFFFF
     scan_x ^= scan_x << 1u;
     scan_x ^= scan_x << 2u;
     scan_x ^= scan_x << 4u;
     scan_x ^= scan_x << 8u;
-    // scan_x contains the winding number parity for all pixels in the row
     var scan_y = atomicLoad(&sh_winding_y[0]);
     scan_y ^= scan_y << 1u;
     scan_y ^= scan_y << 2u;
     scan_y ^= scan_y << 4u;
     scan_y ^= scan_y << 8u;
-    // winding number parity for the row of pixels is in the LSB of row_parity
     let row_parity = (scan_y >> local_id.y) ^ u32(fill.backdrop);
 
     for (var i = 0u; i < PIXELS_PER_THREAD; i++) {
         let pix_ix = th_ix * PIXELS_PER_THREAD + i;
         let samples = atomicLoad(&sh_samples[pix_ix]);
         let pix_parity = row_parity ^ (scan_x >> (pix_ix % TILE_WIDTH));
-        // The LSB of pix_parity contains the sum of the first three levels
-        // of the hierarchy, thus the absolute winding number of the top left
-        // of the pixel.
         let pix_mask = u32(-i32(pix_parity & 1u));
-        // pix_mask is pix_party broadcast to all bits in the word.
 #ifdef msaa8
         area[i] = f32(countOneBits((samples ^ pix_mask) & 0xffu)) * 0.125;
 #endif
@@ -920,14 +650,9 @@ fn fill_path_ms_evenodd(fill: CmdFill, local_id: vec2<u32>, result: ptr<function
     }
     *result = area;
 }
-#endif // msaa
+#endif
 
-// Error function approximation.
-//
-// https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
 fn erf7(x: f32) -> f32 {
-    // Clamp to prevent overflow.
-    // Intermediate steps calculate pow(x, 14).
     let y = clamp(x * 1.1283791671, -100.0, 100.0);
     let yy = y * y;
     let z = y + (0.24295 + (0.03395 + 0.0104 * yy) * yy) * (y * yy);
@@ -1031,7 +756,6 @@ fn read_image(cmd_ix: u32) -> CmdImage {
     let quality = (sample_alpha >> 12u) & 0x3u;
     let x_extend = (sample_alpha >> 10u) & 0x3u;
     let y_extend = (sample_alpha >> 8u) & 0x3u;
-    // The following are not intended to be bitcasts
     let x = f32(xy >> 16u);
     let y = f32(xy & 0xffffu);
     let width = f32(width_height >> 16u);
@@ -1047,11 +771,9 @@ fn read_end_clip(cmd_ix: u32) -> CmdEndClip {
 
 const PIXEL_FORMAT_RGBA: u32 = 0u;
 const PIXEL_FORMAT_BGRA: u32 = 1u;
-// Normalises subpixel order loaded from an image, based on the image's format.
 fn pixel_format(pixel: vec4f, format: u32) -> vec4f {
     switch format {
         case PIXEL_FORMAT_BGRA: {
-            // The conversion from RGBA to BGRA is its own inverse.
             return pixel.bgra;
         }
         case PIXEL_FORMAT_RGBA, default: {
@@ -1062,7 +784,6 @@ fn pixel_format(pixel: vec4f, format: u32) -> vec4f {
 
 const ALPHA: u32 = 0u;
 const PREMULTIPLIED_ALPHA: u32 = 1u;
-// Premultiplies alpha if not already
 fn maybe_premul_alpha(pixel: vec4f, alpha_type: u32) -> vec4f {
     switch alpha_type {
         case PREMULTIPLIED_ALPHA: {
@@ -1105,8 +826,6 @@ fn extend_mode(t: f32, mode: u32, max: f32) -> f32 {
     }
 }
 
-// Cubic resampler logic borrowed from Skia (same as CPU cubic_resampler function)
-// Mitchell-Netravali cubic filter coefficients with parameters B=1/3 and C=1/3
 const MF: array<vec4<f32>, 4> = array<vec4<f32>, 4>(
     vec4<f32>(
         (1.0 / 6.0) / 3.0,
@@ -1134,7 +853,6 @@ const MF: array<vec4<f32>, 4> = array<vec4<f32>, 4>(
     )
 );
 
-// Calculate the weights for a single fractional value (same as CPU weights function)
 fn cubic_weights(fract: f32) -> vec4<f32> {
     return vec4<f32>(
         single_weight(fract, MF[0][0], MF[0][1], MF[0][2], MF[0][3]),
@@ -1144,22 +862,10 @@ fn cubic_weights(fract: f32) -> vec4<f32> {
     );
 }
 
-// Calculate a weight based on the fractional value t and the cubic coefficients
-// This matches the CPU implementation exactly
 fn single_weight(t: f32, a: f32, b: f32, c: f32, d: f32) -> f32 {
     return t * (t * (t * d + c) + b) + a;
 }
 
-// Bicubic filtering using Mitchell filter with B=1/3, C=1/3
-//
-// Cubic resampling consists of sampling the 16 surrounding pixels of the target point and
-// interpolating them with a cubic filter. The generated matrix is 4x4 and represent the coefficients
-// of the cubic function used to calculate weights based on the `x_fract` and `y_fract` of the
-// location we are looking at.
-//
-// This is adapted from the sparse-strips shader for the main Vello image path:
-// - the atlas is a single `texture_2d`, not a texture array
-// - each tap is premultiplied before filtering, matching the existing bilinear path
 fn bicubic_sample(
     coords: vec2<f32>,
     atlas_offset: vec2<f32>,
@@ -1167,11 +873,9 @@ fn bicubic_sample(
     alpha_type: u32,
 ) -> vec4<f32> {
     let frac_coords = fract(coords + vec2(0.5));
-    // Get cubic weights for x and y directions
     let cx = cubic_weights(frac_coords.x);
     let cy = cubic_weights(frac_coords.y);
 
-    // Sample 4x4 grid around coords
     let s00 = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(clamp(coords + vec2(-1.5, -1.5), atlas_offset, atlas_max)), 0), alpha_type);
     let s10 = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(clamp(coords + vec2(-0.5, -1.5), atlas_offset, atlas_max)), 0), alpha_type);
     let s20 = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(clamp(coords + vec2(0.5, -1.5), atlas_offset, atlas_max)), 0), alpha_type);
@@ -1192,15 +896,12 @@ fn bicubic_sample(
     let s23 = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(clamp(coords + vec2(0.5, 1.5), atlas_offset, atlas_max)), 0), alpha_type);
     let s33 = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(clamp(coords + vec2(1.5, 1.5), atlas_offset, atlas_max)), 0), alpha_type);
 
-    // Interpolate in x direction for each row
     let row0 = cx.x * s00 + cx.y * s10 + cx.z * s20 + cx.w * s30;
     let row1 = cx.x * s01 + cx.y * s11 + cx.z * s21 + cx.w * s31;
     let row2 = cx.x * s02 + cx.y * s12 + cx.z * s22 + cx.w * s32;
     let row3 = cx.x * s03 + cx.y * s13 + cx.z * s23 + cx.w * s33;
-    // Interpolate in y direction
     let result = cy.x * row0 + cy.y * row1 + cy.z * row2 + cy.w * row3;
 
-    // Clamp alpha first, then clamp premultiplied color channels against it.
     let a = clamp(result.a, 0.0, 1.0);
     return vec4<f32>(clamp(result.rgb, vec3(0.0), vec3(a)), a);
 }
@@ -1209,12 +910,6 @@ const PIXELS_PER_THREAD = 4u;
 
 #ifndef msaa
 
-// Analytic area anti-aliasing.
-//
-// This is currently dead code if msaa is enabled, but it would be fairly straightforward
-// to wire this so it's a dynamic choice (even per-path).
-//
-// FIXME: This should return an array when https://github.com/gfx-rs/naga/issues/1930 is fixed.
 fn fill_path(fill: CmdFill, xy: vec2<f32>, result: ptr<function, array<f32, PIXELS_PER_THREAD>>) {
     let n_segs = fill.size_and_rule >> 1u;
     let even_odd = (fill.size_and_rule & 1u) != 0u;
@@ -1257,13 +952,11 @@ fn fill_path(fill: CmdFill, xy: vec2<f32>, result: ptr<function, array<f32, PIXE
         }
     }
     if even_odd {
-        // even-odd winding rule
         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
             let a = area[i];
             area[i] = abs(a - 2.0 * round(0.5 * a));
         }
     } else {
-        // non-zero winding rule
         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
             area[i] = min(abs(area[i]), 1.0);
         }
@@ -1273,13 +966,8 @@ fn fill_path(fill: CmdFill, xy: vec2<f32>, result: ptr<function, array<f32, PIXE
 
 #endif
 
-// Effect ids at or above this run their pointwise chain INLINE in fine (effects-in-fine); ids below
-// are barrier/post-fine markers fine only steps over. The driver assigns inline ids from this base.
 const EFFECT_INLINE_BASE: u32 = 100u;
 
-// sRGB<->linear for premultiplied colours — the background blur composites in LINEAR light (matching
-// batch.rs `premul_srgb_to_lin`/`premul_lin_to_srgb`), so a fine BLUR arm must too or its high-contrast
-// edges drift from the batched blur.
 fn fx_srgb_to_lin(c: f32) -> f32 {
     if (c <= 0.04045) { return c / 12.92; }
     return pow((c + 0.055) / 1.055, 2.4);
@@ -1299,20 +987,12 @@ fn fx_premul_lin_to_srgb(s: vec4<f32>) -> vec4<f32> {
     return vec4<f32>(vec3<f32>(fx_lin_to_srgb(st.r), fx_lin_to_srgb(st.g), fx_lin_to_srgb(st.b)) * a, s.a);
 }
 
-// ============================================================================================
-// Effects-in-fine: field programs, unit bodies, and the CMD_EFFECT mark executors. One mark = one
-// descriptor = [bits, program, 6-vec4 unit uniform]; `main` loads the descriptor and calls ONE of
-// the executors below per pixel. Field/unit math mirrors the batched oracle byte-for-byte.
-// The frost SCATTER jitter — a byte-for-byte port of the batched lens `HASH_PRELUDE` (units.rs);
-// the multiplier and hash2 offsets must match it exactly or the 12 scatter taps land elsewhere.
 fn fx_scatter_hash(p: vec2<f32>) -> f32 { return fract(sin(dot(p, vec2<f32>(127.1, 311.7))) * 43758.5453); }
 fn fx_scatter_hash2(p: vec2<f32>) -> vec2<f32> {
     return vec2<f32>(fx_scatter_hash(p), fx_scatter_hash(p + vec2<f32>(73.7, 157.3))) * 2.0 - 1.0;
 }
+
 // ==== BEGIN GENERATED: field programs ====
-// Generated by render_core::vello::fine_field — the operator library and every program
-// below are data (field.rs / units.rs / effect_graph.rs). Edit those, then re-bless with
-// `WV_BLESS_FINE_FIELD=1 cargo test -p render_core --lib vello::fine_field`; never edit here.
 
 fn fx_sdfRoundedBox(p: vec2<f32>, halfSize: vec2<f32>, r: f32) -> f32 {
     let d = abs(p) - halfSize + vec2<f32>(r);
@@ -1427,8 +1107,6 @@ fn fx_fieldDistance_sampled(fc: vec2<f32>, decode: f32) -> f32 {
 fn fx_fieldDistance_lens(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
     return fx_sdfRoundedBox(p, u[1].xy, min(u[1].z, min(u[1].xy.x, u[1].xy.y)));
 }
-// The analytic lens field at a device pixel centre: (displacement.xy, specular, mask),
-// assembled from the ramp/refraction/coverage operators over the rounded-box distance.
 fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
@@ -1458,8 +1136,6 @@ fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>
     let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
     return vec4<f32>(dpx.x, dpx.y, specular, mask);
 }
-// The fractal-noise displacement field, evaluated in the frame the field record anchors
-// (the grain rides the shape). Magnitude `u[0].z`, grain `u[0].w`.
 fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
@@ -1472,8 +1148,6 @@ fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f
 fn fx_fieldDistance_radial(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
     return length(p) - max(u[1].x, 1.0);
 }
-// The radial ramp field: mask and specular fall linearly from 1 at the centre to 0 at
-// radius `u[1].x` — the background field-tint's gradient.
 fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
@@ -1488,9 +1162,6 @@ fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f3
     let mask = n1;
     return vec4<f32>(vec2<f32>(0.0).x, vec2<f32>(0.0).y, specular, mask);
 }
-// Field program dispatch over the math tag (slot 1); anything else measures no field. The
-// field's distance SOURCE and coordinate anchor come from operand record 3, never from the
-// program.
 fn fx_computeField(d: FxDesc, fc: vec2<f32>) -> vec4<f32> {
     let anchor = d.rec[6].yz;
     let sampled = d.rec[6].x == 2.0;
@@ -1500,9 +1171,6 @@ fn fx_computeField(d: FxDesc, fc: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
 // ==== END GENERATED: field programs ====
-// The pointwise unit tail over one pixel: SHADE adds the field's specular, TINT lays a straight
-// colour at the value's alpha, MASKMIX mixes against the pre-effect backdrop by the field's mask.
-// (ERASE rides the spread composite's coverage term, never this function.)
 fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, orig: vec4<f32>, field: vec4<f32>, u: array<vec4<f32>, 6>) -> vec4<f32> {
     var value = value0;
     if (shade) {
@@ -1530,17 +1198,6 @@ fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, o
     return value;
 }
 
-
-// Execute one CMD_EFFECT mark over the tile, if it is inline and in this dispatch's window. THE
-// MARKER-WINDOW CONTRACT: a mark carries its scheduler ROUND (word +3); every command's pass is
-// decided per tile — a command draws in the window covering the round of the last marker before it
-// on THIS tile, so total passes scale with effect DEPTH, not count. A mark keying on its own round
-// (see `fx_keys_on_round`) runs where its materialised inputs are bound; a plain pointwise runs in
-// the segment it closes. An id below EFFECT_INLINE_BASE is a boundary-only marker (a post-fine
-// effect) and just splits the walk. A mark whose OUTPUT record (record 4) names a lease installs
-// its origin as the tile's scratch-store shift. Coverage in `area` is STATE shared across windows (a fill is never
-// window-gated — see CMD_FILL in `main`), so an atomic boundary and a fused composite both mask by
-// the silhouette the last fill left.
 fn fx_run_mark(
     cmd_ix: u32,
     seg_current: u32,
@@ -1562,12 +1219,6 @@ fn fx_run_mark(
     region_route = d.rec[10];
     region_clamp = d.rec[11];
 #endif
-    // A zero-bit mark is a pure FENCE: it claims the store origin for its window's rasterized
-    // draws and touches no pixel itself. A second in-window fence on this tile FLUSHES first —
-    // store the register tile to the previous fence's lease, reset it transparent — so one window
-    // rasterizes any number of overlapping fenced silhouettes. An unstamped OUTPUT record (a lease
-    // that failed to place) falls back to the dispatch default origin (the OOB sentinel in a
-    // rasterize window), dropping the stores instead of clobbering the previous lease.
     if (d.bits == 0u) {
         if (fence_live) {
             fx_store_tile(xy, rgba);
@@ -1583,12 +1234,6 @@ fn fx_run_mark(
         fence_live = true;
         return;
     }
-    // A FLUSH-flagged materialize mark (rec[4].w — set by the planner on front-merged marks, whose
-    // value is complete in the register when the next producer arrives) claims the store origin
-    // exactly like a fence does: a second one on this tile in one window stores the register tile
-    // to the previous mark's lease and re-seeds the register to the window's entry state, so one
-    // window materializes any number of overlapping chains' drafts. Un-flagged marks keep their
-    // register flow verbatim (glass chains thread values between marks by design).
     let atomic_ctl = ptcl[cmd_ix + 5u];
     if (d.rec[8].x != 0.0) {
         if (d.rec[8].w != 0.0 && fence_live) {
@@ -1622,8 +1267,6 @@ fn fx_run_mark(
     }
 }
 
-// A CMD_EFFECT mark's descriptor: the unit's bit word, its field program, and the 6-vec4 unit
-// uniform, read from `effect_params` at the mark's float offset.
 struct FxDesc {
     bits: u32,
     program: u32,
@@ -1644,33 +1287,17 @@ fn fx_load_desc(base: u32) -> FxDesc {
     }
     return d;
 }
-// Whether a mark runs in the window of its OWN scheduled round (a unit reading a materialised
-// surface: a WARP/BLUR head, a SPREAD or VALUE_OVER composite, or anything on the input
-// permutation) rather than the z-segment it closes (a plain backdrop pointwise, which reads the
-// running accumulator). A VALUE_OVER mark's value is a co-located source bound only by its own
-// round's dispatch — keyed on segment it would re-run in an earlier window with no input bound and
-// double-composite that window's register.
 fn fx_keys_on_round(base: u32) -> bool {
 #ifdef have_input
     return true;
 #else
-    // A ZERO-bit desc is a rasterize fence: it exists only to claim its own round's window and
-    // stamp the store origin for that window's draws, so it must key on its round.
     let b = u32(effect_params[base]);
     if b == 0u || (b & (96u | 128u | 16384u)) != 0u {
         return true;
     }
-    // A mark that OWNS A LEASE (a stamped output record) materialises in its own round's window —
-    // in every permutation. Keyed on segment it can collide with a FOREIGN round's window on tiles
-    // whose segment count happens to match (the count is z- and framing-dependent); there its value
-    // path may be permutation-compiled out, but the rec[4] install still runs and hijacks the
-    // window's scratch-store origin, landing that window's whole store at the wrong lease offset.
     return effect_params[base + 58u] != 0.0;
 #endif
 }
-// One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
-// input scratch (a frost tail's shade over the scattered surface), a WARP head samples the displaced
-// backdrop, anything else transforms the running value pointwise. The boundary composite is main's.
 fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<f32> {
     let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
     var v = prev;
@@ -1692,15 +1319,6 @@ fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<
     return v;
 }
 #ifdef load_base
-// One separable-blur axis pass at one pixel: taps along u[0].xy with sigma u[0].z, from the draft
-// (V pass), the input scratch (a frost H over the warp), or the backdrop (a background H). A cropped
-// scratch shifts taps by its u[1].zw origin. An out-of-bounds tap is the page colour for a backdrop
-// blur and transparent for a silhouette blur (bit 2048); an sRGB blur (bit 1024) sums raw texels,
-// a linear one converts around the kernel. The result is stored sRGB either way.
-// u[0].w is the planner-stamped tap stride (1 = every texel, the exact kernel): large sigmas walk
-// the same radius in strided steps, the Gaussian evaluated at each strided offset and renormalized
-// by wsum — a coarser quadrature of the same kernel, not a different blur. The range is trimmed to
-// a stride multiple so the taps stay symmetric around the centre.
 fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     let u = d.u;
     let bits = d.bits;
@@ -1721,16 +1339,9 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var wsum = 0.0;
     let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
-    // A cropped input carries its producer's DEVICE rect in the record params (corners in tile
-    // units, x*1024+y). The full-viewport draft it replaces was stored on EVERY tile — unmarked
-    // tiles held the window's base — so a tap outside the rect reads `base_in` (the same chain
-    // root those tiles stored), and only a tap outside the viewport falls to the blur's OOB
-    // policy. The atlas itself is never consulted for bounds: a neighbouring lease is not content.
     let blo = u32(d.rec[0].w);
     let bhi = u32(d.rec[2].w);
     let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
-    // The high corner is tile-ceiled but the stores were viewport-gated: past the viewport a
-    // slot's texels belong to an earlier tenant, so the rect clamps to the frame.
     let dev_hi = min(
         vec2<i32>(i32((bhi >> 10u) & 1023u) * 16, i32(bhi & 1023u) * 16),
         vec2<i32>(i32(config.frame_width), i32(config.frame_height)),
@@ -1757,12 +1368,8 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         if (bhi != 0u) {
             let in_rect = sp.x >= dev_lo.x && sp.y >= dev_lo.y && sp.x < dev_hi.x && sp.y < dev_hi.y;
             if (shadow_edge) {
-                // A coverage chain's draft holds the silhouette's window: beyond its rect the
-                // silhouette is transparent, which is exactly this blur's OOB colour.
                 inb = in_rect;
             } else {
-                // A backdrop chain's draft stored its window base on every unmarked tile: beyond
-                // the rect the tap reads the same base directly; past the viewport, the page.
                 if (!in_rect) {
                     rawtap = base_ld(sp);
                 }
@@ -1770,12 +1377,6 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
                     && sp.x < i32(config.frame_width) && sp.y < i32(config.frame_height);
             }
         }
-        // A backdrop chain's tap past the frame edge-extends (the viewport crops a document that
-        // continues past it — blending the page colour in painted a pale band along every edge a
-        // lens hangs off); a coverage chain keeps transparent (the silhouette really ends) —
-        // UNLESS the mark carries a region route: then the content continues off-frame in a
-        // materialized lease (a layer blur's own body rows) and the tap resolves there. A shadow
-        // silhouette pass carries no route (its record stays zero), so its fade is untouched.
 #ifdef region_reads
         if (shadow_edge && !inb && fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {
             rawtap = fx_region_tap(vec2<f32>(f32(sp.x), f32(sp.y)));
@@ -1811,10 +1412,6 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     }
     return select(fx_premul_lin_to_srgb(acc / wsum), acc / wsum, srgb_blur);
 }
-// The text-inner flood fold at one pixel (bit 4096, runs in the inner's V pass): recover the
-// unoffset glyph coverage by sampling the offset silhouette in `base_in` shifted by u[2].xy (u[1]
-// is the blur's scratch-origin slot), and fold the tinted erase by the blurred punch into one
-// coverage the band later reads as SCRATCH_COV.
 fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
     let fdims = vec2<i32>(textureDimensions(base_in));
@@ -1824,21 +1421,10 @@ fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f
 }
 #endif
 #ifdef have_input
-// The frost scatter at one pixel (bit 256): a 12-tap jittered read of the input scratch (shifted
-// to its lease frame by record 0's window), jitter radius frost (u[4].z) × scale (u[4].x); zero
-// frost degenerates to one bilinear read. Taps clamp to the lens box + a rim margin: the scratch
-// is only WRITTEN over the mark's reach tiles, so an unclamped tap past them reads the lease's
-// previous tenant — phantom content, visible whenever frost × scale outruns the reach slack (high
-// zoom). The margin stays under the reach's own +20, and the mask confines the display to the
-// lens, so clamping costs nothing visually.
 fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     let frost = d.u[4].z;
     let scl = d.u[4].x;
     let win = d.rec[0].yz;
-    // The jitter hash is seeded in LENS-LOCAL coordinates (pixel relative to the lens box's
-    // top-left), not screen pixels: a screen-seeded pattern re-rolls under every pan/zoom, so
-    // the frost visibly swims over the content as the view moves — and it is what the batched
-    // executor's cell-local `fc` already does.
     let fc = px + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
     if (frost <= 0.01) {
         return fx_bilin_input(px - win);
@@ -1852,10 +1438,6 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
-        // A tap past the frame resolves through the mark's region route when one is stamped —
-        // the planner routes a scatter at its INPUT's band instance (the region-space blurred
-        // surface), so escaped grain taps read chain-correct content. The serve test runs on
-        // the lens-box-clamped DEVICE position, before the viewport pin the scratch read needs.
         let pb = clamp(px + off, lens_c - lens_h, lens_c + lens_h);
 #ifdef region_reads
         if (fx_region_serves(pb)) {
@@ -1868,10 +1450,6 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     return sacc / 12.0;
 }
 #endif
-// The SPREAD composite (bit 128): lay the straight shadow colour u[3] source-over the accumulator.
-// Coverage is the blurred silhouette alpha for a soft drop (BLUR set), a precomputed scratch
-// coverage for a text band / sharp drop (SCRATCH_COV), the flood minus the punch for an inner band
-// (ERASE, folding the colour's alpha into the erase term), else the rasterised coverage.
 fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f32> {
     var scov = cov;
     if (d.rec[4].x == 2.0) {
@@ -1882,15 +1460,6 @@ fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f3
     let a = d.u[3].a * scov;
     return vec4<f32>(d.u[3].xyz * a, a) + acc * (1.0 - a);
 }
-// One FUSED (ctl 0) mark over one pixel, returning the new accumulator value. The operand records
-// after the header carry each input's source: record 0 the value the arm transforms (source 2 =
-// the input register at its window, displaced by the field when a WARP is present; else the
-// backdrop), record 1 the reference (`orig`) binary pointwise units compare against, record 2 the
-// composite's coverage (source 2 = the value's own alpha), record 3 the field's distance (source 2
-// = a baked SDF; else generated at the record's anchor). Heads with their own read path override
-// the value (a BLUR taps its axis pass at record 0's window, a SCATTER jitters the input). Then
-// the text flood folds, the pointwise tail runs, and the result composites by mode: VALUE_OVER,
-// COLOUR_OVER, RAW (cov 1, the next link reads the full field), else the coverage-masked mix.
 fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> vec4<f32> {
     let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
     let src_value = d.rec[0].x;
@@ -1913,12 +1482,6 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
     if (d.bits & 4096u) != 0u {
         value = fx_flood_value(d.u, px, value.a);
     }
-    // A RAW-only arm (no head, no chain source) is a COPY: one bilinear tap of `base_in` at the
-    // record-0 window offset, written through. A store window binds staging as base and lands a
-    // lease in the atlas; a transport mark's tap rides its route record instead (out-of-frame
-    // positions resolve through fx_region_serves inside fx_bilin). u[1], when non-degenerate, is
-    // the copy's pixel rect: the mark bins per tile, so a partial edge tile keeps the register
-    // (the window's replayed content) outside the rect instead of bleeding the tap across it.
     if (d.bits & 512u) != 0u && (d.bits & (32u | 64u | 256u | 4096u)) == 0u && src_value != 2.0 {
         let clo = d.u[1].xy;
         let chi = d.u[1].zw;
@@ -1960,11 +1523,6 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
 }
 
 #ifdef rw_accum
-// The in-place (`rw_accum`) early-out: walk one tile's PTCL tags once and report whether ANY paint
-// command falls inside this dispatch's window — coverage-only commands (CMD_FILL/CMD_SOLID) change
-// nothing without a following paint, so they don't count. A tile with no work returns before
-// touching a pixel; the accumulator already holds the right bytes. The walk must mirror the
-// interpreter's tag sizes EXACTLY, or a param is read as a tag and the decision corrupts.
 fn fx_window_has_work(tile_ix: u32) -> bool {
     var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 3u;
     if win_lo > 0u {
@@ -1984,10 +1542,6 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             if win_hi != SEG_ALL && round >= win_hi {
                 break;
             }
-            // The mark ITSELF is work when its key (own round, or the tile's current segment for
-            // an inline mark) falls inside the window — mirror of `fx_run_mark`'s gate. Without
-            // this, a tile whose only in-window content is a composite mark is skipped and the
-            // effect never lands.
             let effect_id = ptcl[scan_ix + 1u];
             let inline_base = ptcl[scan_ix + 4u];
             let inline_key = select(scan_seg, round, fx_keys_on_round(inline_base));
@@ -2035,12 +1589,6 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
 }
 #endif
 
-// Store the tile's accumulator PREMULTIPLIED — everything that consumes a fine output (the
-// compositor blit/present, every effect pass, the phased base reload) treats the texel as
-// premultiplied; an un-premultiplied store here was the ~1px phased seam (a low-coverage edge
-// became `(colour, a≈0)`). `output` may be a reach-cropped scratch: the device coord shifts into
-// its frame by this tile's active origin (the mark's OUTPUT record); a thread outside the scratch
-// extent lands OOB and WGSL drops the store, so an uncropped tile is unaffected.
 fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
     let xy_uint = vec2<u32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
@@ -2055,7 +1603,6 @@ fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_
     }
 }
 
-// The X size should be 16 / PIXELS_PER_THREAD
 @compute @workgroup_size(4, 16)
 fn main(
     @builtin(global_invocation_id) global_id: vec3<u32>,
@@ -2063,24 +1610,15 @@ fn main(
     @builtin(workgroup_id) wg_id: vec3<u32>,
 ) {
     if ptcl[0] == ~0u {
-        // An earlier stage has failed, don't try to render.
-        // We use ptcl[0] for this so we don't use up a binding for bump.
         return;
     }
     active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
-    // Sparse window dispatch: `sparse_n != 0` means the grid is a compact LIST of active tiles —
-    // one workgroup per entry, its tile coordinate read from `effect_params[sparse_base + wg_id.x]`
-    // (packed `y<<16 | x`, biased by 0x40000000 so the f32 bit pattern is always a normal float).
-    // The planner emits the list from the window's marker reach quads, so a tile outside every
-    // effect's reach never launches. `sparse_n == 0` keeps the full-viewport grid.
     win_lo = config.seg_lo;
     win_hi = config.seg_target;
     var tile_xy = wg_id.xy;
     if (config.sparse_n != 0u) {
         let raw = bitcast<u32>(effect_params[config.sparse_base + wg_id.x]);
         tile_xy = vec2(raw & 0xffffu, (raw >> 16u) & 0x1fffu);
-        // A MERGED window's entry (bit 29) carries this tile's own range in the parallel block
-        // right after the tile words: lo in bits 0..12, hi in 12..24, 0xfff = open end.
         if ((raw & 0x20000000u) != 0u) {
             let rw = bitcast<u32>(effect_params[config.sparse_base + config.sparse_n + wg_id.x]);
             win_lo = rw & 0xfffu;
@@ -2107,21 +1645,13 @@ fn main(
     }
 #else
 #ifdef load_base
-    // Phase > 0: start from the previous phase's output (its un-premultiplied pixels), re-premultiplied
-    // so the source-over accumulation below is unchanged. This is what lets a later fine phase draw
-    // *over* the earlier one within one render, instead of clearing.
     let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-        // Load the previous phase's output (stored premultiplied, see the store below) straight into
-        // the premultiplied accumulator — no conversion, since the base is already in the same space
-        // the source-over blend works in.
         let b = base_ld(base_xy + vec2(i32(i), 0));
         rgba[i] = b;
     }
 #else
 #ifdef draft_clear
-    // A rasterize window: the output is a transparent draft lease the fenced silhouette draws
-    // paint into — never the base color.
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         rgba[i] = vec4(0.0);
     }
@@ -2138,10 +1668,6 @@ fn main(
     var area: array<f32, PIXELS_PER_THREAD>;
     var cmd_ix = tile_ix * PTCL_INITIAL_ALLOC;
     let blend_offset = ptcl[cmd_ix];
-    // Header words 2/3 are the HEAD LINKS: the first marker's group/marker offsets. A window that
-    // starts past segment 0 jumps straight there — the plain-draw prefix below every effect is
-    // never decoded — landing on the group (the mark's own CmdFill) only when that mark's round
-    // reaches the window, on the bare marker otherwise so a gated mark's fill is skipped too.
     let fx_head_group = ptcl[cmd_ix + 1u];
     let fx_head_marker = ptcl[cmd_ix + 2u];
     cmd_ix += 3u;
@@ -2153,7 +1679,6 @@ fn main(
         cmd_ix = select(fx_head_marker, fx_head_group, ptcl[pm + 3u] >= win_lo);
     }
     var seg_current = 0u;
-    // main interpretation loop
     while true {
         let tag = ptcl[cmd_ix];
         if tag == CMD_END {
@@ -2169,11 +1694,6 @@ fn main(
             let fx_link_group = ptcl[cmd_ix + 6u];
             let fx_link_marker = ptcl[cmd_ix + 7u];
             cmd_ix += 8u;
-            // The whole segment this marker opens sits below the window: every command in it is a
-            // gated no-op, so jump to the next marker instead of decoding and filling it. The next
-            // mark's fill matters only if that mark can be live — its round reaches the window (its
-            // other possible key, the segment it closes, is this skipped one) — so peek the round
-            // (through a page jump if the group paged mid-emit) and land on the group only then.
             if seg_current < win_lo && fx_link_group != 0u {
                 var pm = fx_link_marker;
                 if ptcl[pm] == CMD_JUMP {
@@ -2249,10 +1769,6 @@ fn main(
                     let bg = unpack4x8unorm(bg_rgba);
                     let fg = rgba[i] * area[i] * end_clip.alpha;
                     if end_clip.blend == LUMINANCE_MASK_LAYER {
-                        // TODO: Does this case apply more generally?
-                        // See https://github.com/linebender/vello/issues/1061
-                        // TODO: How do we handle anti-aliased edges here?
-                        // This is really an imaging model question
                         if area[i] == 0f {
                             rgba[i] = bg;
                             continue;
@@ -2271,13 +1787,9 @@ fn main(
             }
             case CMD_BLUR_RECT: {
                 if seg_active {
-                /// Approximation for the convolution of a gaussian filter with a rounded rectangle.
-                ///
-                /// See https://raphlinus.github.io/graphics/2020/04/21/blurred-rounded-rects.html
 
                 let blur = read_blur_rect(cmd_ix);
 
-                // Avoid division by 0
                 let std_dev = max(blur.std_dev, 1e-5);
                 let inv_std_dev = 1.0 / std_dev;
                 
@@ -2289,7 +1801,6 @@ fn main(
                 let exponent = 2.0 * r1 / r0;
                 let inv_exponent = 1.0 / exponent;
                 
-                // Pull in long end (make less eccentric).
                 let delta = 1.25 * std_dev * (exp(-pow(0.5 * inv_std_dev * blur.width, 2.0)) - exp(-pow(0.5 * inv_std_dev * blur.height, 2.0)));
                 let width = blur.width + min(delta, 0.0);
                 let height = blur.height - max(delta, 0.0);
@@ -2299,7 +1810,6 @@ fn main(
                 let blur_rgba = unpack4x8unorm(blur.rgba_color);
 
                 for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                    // Transform fragment location to local 'uv' space of the rounded rectangle.
                     let my_xy = vec2(xy.x + f32(i), xy.y);
                     let local_xy = blur.matrx.xy * my_xy.x + blur.matrx.zw * my_xy.y + blur.xlat;
                     let x = local_xy.x;
@@ -2367,7 +1877,7 @@ fn main(
                         is_valid = t >= 0.0 && x != 0.0;
                     } else if radius > 1.0 {
                         t = sqrt(xx + yy) - x * r1_recip;
-                    } else { // radius < 1.0
+                    } else {
                         let a = xx - yy;
                         t = less_scale * sqrt(a) - x * r1_recip;
                         is_valid = a >= 0.0 && t >= 0.0;
@@ -2393,22 +1903,15 @@ fn main(
                     let local_xy = sweep.matrx.xy * my_xy.x + sweep.matrx.zw * my_xy.y + sweep.xlat;
                     let x = local_xy.x;
                     let y = local_xy.y;
-                    // xy_to_unit_angle from Skia:
-                    // See <https://github.com/google/skia/blob/30bba741989865c157c7a997a0caebe94921276b/src/opts/SkRasterPipeline_opts.h#L5859>
                     let xabs = abs(x);
                     let yabs = abs(y);
                     let slope = min(xabs, yabs) / max(xabs, yabs);
                     let s = slope * slope;
-                    // again, from Skia:
-                    // Use a 7th degree polynomial to approximate atan.
-                    // This was generated using sollya.gforge.inria.fr.
-                    // A float optimized polynomial was generated using the following command.
-                    // P1 = fpminimax((1/(2*Pi))*atan(x),[|1,3,5,7|],[|24...|],[2^(-40),1],relative);
                     var phi = slope * (0.15912117063999176025390625f + s * (-5.185396969318389892578125e-2f + s * (2.476101927459239959716796875e-2f + s * (-7.0547382347285747528076171875e-3f))));
                     phi = select(phi, 1.0 / 4.0 - phi, xabs < yabs);
                     phi = select(phi, 1.0 / 2.0 - phi, x < 0.0);
                     phi = select(phi, 1.0 - phi, y < 0.0);
-                    phi = select(phi, 0.0, phi != phi); // check for NaN
+                    phi = select(phi, 0.0, phi != phi);
                     phi = (phi - sweep.t0) * scale;
                     let t = extend_mode_normalized(phi, sweep.extend_mode);
                     let ramp_x = i32(round(t * f32(GRADIENT_WIDTH - 1)));
@@ -2426,17 +1929,13 @@ fn main(
                 switch image.quality {
                     case IMAGE_QUALITY_LOW: {
                         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                            // We only need to load from the textures if the value will be used.
                             if area[i] != 0.0 {
-                                // Use pixel centers (+0.5) rather than pixel corners for correct sampling
                                 let my_xy = vec2(xy.x + f32(i) + 0.5, xy.y + 0.5);
                                 var atlas_uv = image.matrx.xy * my_xy.x + image.matrx.zw * my_xy.y + image.xlat;
                                 atlas_uv.x = extend_mode(atlas_uv.x, image.x_extend_mode, image.extents.x);
                                 atlas_uv.y = extend_mode(atlas_uv.y, image.y_extend_mode, image.extents.y);
                                 atlas_uv = atlas_uv + image.atlas_offset;
-                                // TODO: If the image couldn't be added to the atlas (i.e. was too big), this isn't robust
                                 let atlas_uv_clamped = clamp(atlas_uv, image.atlas_offset, atlas_max);
-                                // Nearest neighbor sampling
                                 let fg_rgba = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(atlas_uv_clamped), 0), image.alpha_type);
                                 let fg_i = pixel_format(fg_rgba * area[i] * image.alpha, image.format);
                                 rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
@@ -2445,25 +1944,19 @@ fn main(
                     }
                     case IMAGE_QUALITY_MEDIUM, default: {
                         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                            // We only need to load from the textures if the value will be used.
                             if area[i] != 0.0 {
-                                // Use pixel centers (+0.5) rather than pixel corners for correct sampling
                                 let my_xy = vec2(xy.x + f32(i) + 0.5, xy.y + 0.5);
                                 var atlas_uv = image.matrx.xy * my_xy.x + image.matrx.zw * my_xy.y + image.xlat;
                                 atlas_uv.x = extend_mode(atlas_uv.x, image.x_extend_mode, image.extents.x);
                                 atlas_uv.y = extend_mode(atlas_uv.y, image.y_extend_mode, image.extents.y);
                                 atlas_uv = atlas_uv + image.atlas_offset - vec2(0.5);
-                                // TODO: If the image couldn't be added to the atlas (i.e. was too big), this isn't robust
                                 let atlas_uv_clamped = clamp(atlas_uv, image.atlas_offset, atlas_max);
-                                // We know that the floor and ceil are within the atlas area because atlas_max and
-                                // atlas_offset are integers
                                 let uv_quad = vec4(floor(atlas_uv_clamped), ceil(atlas_uv_clamped));
                                 let uv_frac = fract(atlas_uv);
                                 let a = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.xy), 0), image.alpha_type);
                                 let b = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.xw), 0), image.alpha_type);
                                 let c = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.zy), 0), image.alpha_type);
                                 let d = maybe_premul_alpha(textureLoad(image_atlas, vec2<i32>(uv_quad.zw), 0), image.alpha_type);
-                                // Bilinear sampling
                                 let fg_rgba = mix(mix(a, b, uv_frac.y), mix(c, d, uv_frac.y), uv_frac.x);
                                 let fg_i = pixel_format(fg_rgba * area[i] * image.alpha, image.format);
                                 rgba[i] = rgba[i] * (1.0 - fg_i.a) + fg_i;
@@ -2473,7 +1966,6 @@ fn main(
                     case IMAGE_QUALITY_HIGH: {
                         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
                             if area[i] != 0.0 {
-                                // Use pixel centers (+0.5) rather than pixel corners for correct sampling
                                 let my_xy = vec2(xy.x + f32(i) + 0.5, xy.y + 0.5);
                                 var atlas_uv = image.matrx.xy * my_xy.x + image.matrx.zw * my_xy.y + image.xlat;
                                 atlas_uv.x = extend_mode(atlas_uv.x, image.x_extend_mode, image.extents.x);
