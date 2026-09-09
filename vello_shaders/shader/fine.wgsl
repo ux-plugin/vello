@@ -98,59 +98,48 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 
 #ifdef region_reads
 // The region atlas: every interest region's materialized lease, mapped one-to-one from the rented
-// grid band. Bound read-only in every backdrop-tapping dispatch; the running arm's route records
-// say which rect of it serves this reader and at what density.
+// grid band. Bound read-only in every backdrop-tapping dispatch (region windows write a staging
+// texture the sink blits back, never this binding); the running arm's OVERFLOW record says where
+// its out-of-frame taps resolve and at what density.
 #ifdef have_input
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
-@group(0) @binding(12)
-var region_chain: texture_2d<f32>;
 #else
 #ifdef have_draft
 @group(0) @binding(11)
 var region_atlas: texture_2d<f32>;
-@group(0) @binding(12)
-var region_chain: texture_2d<f32>;
 #else
 @group(0) @binding(10)
 var region_atlas: texture_2d<f32>;
-@group(0) @binding(11)
-var region_chain: texture_2d<f32>;
 #endif
 #endif
 
-// Whether the running arm's region serves device point `p` — a tap past the frame that lands in
-// the region's source rect resolves to materialized content instead of the edge-extend clamp.
+// Whether the running arm serves point `p`: a route is stamped (record 5, installed per mark),
+// the point is out-of-frame (frame-content taps keep the live accumulator; band positions are
+// out-of-frame by construction, so piece arms always route), and the mapped position lands in the
+// serving lease — a tap escaping in a direction the lease does not cover keeps the edge-extend
+// clamp instead of reading through the wrong window.
 fn fx_region_serves(p: vec2<f32>) -> bool {
-    let slack = abs(region_route.w);
-    return slack != 0.0
-        && (p.x < 0.0 || p.y < 0.0
-            || p.x >= f32(config.frame_width) || p.y >= f32(config.frame_height))
-        && p.x >= region_rect.x - slack && p.y >= region_rect.y - slack
-        && p.x < region_rect.z + slack && p.y < region_rect.w + slack;
+    if (region_route.x == 0.0
+        || (p.x >= 0.0 && p.y >= 0.0
+            && p.x < f32(config.frame_width) && p.y < f32(config.frame_height))) {
+        return false;
+    }
+    let a = p * region_route.w + region_route.yz;
+    return a.x >= region_clamp.x && a.y >= region_clamp.y
+        && a.x <= region_clamp.z && a.y <= region_clamp.w;
 }
 
-// One region tap at device point `p`: map through the route (atlas origin + density), clamp inside
-// the lease so a boundary tap never reads a neighbouring region, and bilinearly interpolate the
-// stored premul texels (the same raw-unorm convention as fx_bilin).
+// One region tap at point `p`: the route's affine (`atlas = p * k + offset`), clamped to the
+// lease's own texel rect so a tap straying past the serve window edge-extends at the lease
+// instead of reading a shelf neighbour (hi is inclusive-minus-one, so the bilinear +1 texel
+// contributes with weight zero at the edge). Interpolates the stored premul texels (the same
+// raw-unorm convention as fx_bilin).
 fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
-    let k = region_route.z;
-    let lo = region_route.xy;
-    let hi = lo + (region_rect.zw - region_rect.xy) * k - vec2<f32>(1.0, 1.0);
-    let pc = clamp(p, region_rect.xy, region_rect.zw - vec2<f32>(1.0, 1.0));
-    let a = clamp(lo + (pc - region_rect.xy) * k, lo, hi);
+    let a = clamp(p * region_route.w + region_route.yz, region_clamp.xy, region_clamp.zw);
     let fl = floor(a);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = a - fl;
-    // A negative slack word selects the CHAIN atlas — region-space intermediates (an H' blur's
-    // lease), which live in their own texture so producing them can read the values atlas.
-    if (region_route.w < 0.0) {
-        let c00 = textureLoad(region_chain, i0, 0);
-        let c10 = textureLoad(region_chain, i0 + vec2<i32>(1, 0), 0);
-        let c01 = textureLoad(region_chain, i0 + vec2<i32>(0, 1), 0);
-        let c11 = textureLoad(region_chain, i0 + vec2<i32>(1, 1), 0);
-        return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
-    }
     let c00 = textureLoad(region_atlas, i0, 0);
     let c10 = textureLoad(region_atlas, i0 + vec2<i32>(1, 0), 0);
     let c01 = textureLoad(region_atlas, i0 + vec2<i32>(0, 1), 0);
@@ -251,11 +240,15 @@ fn fx_bilin_input(pos: vec2<f32>) -> vec4<f32> {
 // reach-disjoint shapes in one dispatch each carry their own origin on their own tiles.
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
 #ifdef region_reads
-// The running arm's REGION ROUTE (records 5/6): the serving interest region's device source rect
-// and its lease's [atlas origin, density k, flag]. Zero flag = no region — escaped backdrop taps
-// keep the edge-extend clamp. Set per mark in fx_run_mark, exactly like the store origin above.
-var<private> region_rect: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+// The running arm's OVERFLOW route (record 5): [SRC_REGION flag, offset x, offset y, k] — the
+// affine mapping an out-of-frame tap into its serving lease. Zero flag = no serving; escaped
+// backdrop taps keep the edge-extend clamp. Set per mark in fx_run_mark, exactly like the store
+// origin above.
 var<private> region_route: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+// The route's extension row (record 5's second vec4): the lease's texel rect in the atlas,
+// [lo_x, lo_y, hi_x, hi_y] with hi inclusive-minus-one — the clamp keeping a straying tap
+// edge-extended at its own lease instead of reading a shelf neighbour.
+var<private> region_clamp: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 #endif
 
 
@@ -1499,11 +1492,11 @@ fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f3
 // field's distance SOURCE and coordinate anchor come from operand record 3, never from the
 // program.
 fn fx_computeField(d: FxDesc, fc: vec2<f32>) -> vec4<f32> {
-    let anchor = d.rec[3].yz;
-    let sampled = d.rec[3].x == 2.0;
-    if (d.program == 1u) { return fx_computeField_lens(d.u, fc, anchor, sampled, d.rec[3].w); }
-    if (d.program == 2u) { return fx_computeField_texture(d.u, fc, anchor, sampled, d.rec[3].w); }
-    if (d.program == 3u) { return fx_computeField_radial(d.u, fc, anchor, sampled, d.rec[3].w); }
+    let anchor = d.rec[6].yz;
+    let sampled = d.rec[6].x == 2.0;
+    if (d.program == 1u) { return fx_computeField_lens(d.u, fc, anchor, sampled, d.rec[6].w); }
+    if (d.program == 2u) { return fx_computeField_texture(d.u, fc, anchor, sampled, d.rec[6].w); }
+    if (d.program == 3u) { return fx_computeField_radial(d.u, fc, anchor, sampled, d.rec[6].w); }
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
 // ==== END GENERATED: field programs ====
@@ -1566,8 +1559,8 @@ fn fx_run_mark(
     }
     let d = fx_load_desc(inline_base);
 #ifdef region_reads
-    region_rect = d.rec[5];
-    region_route = d.rec[6];
+    region_route = d.rec[10];
+    region_clamp = d.rec[11];
 #endif
     // A zero-bit mark is a pure FENCE: it claims the store origin for its window's rasterized
     // draws and touches no pixel itself. A second in-window fence on this tile FLUSHES first —
@@ -1582,8 +1575,8 @@ fn fx_run_mark(
                 (*rgba)[i] = vec4(0.0);
             }
         }
-        if (d.rec[4].x != 0.0) {
-            active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
+        if (d.rec[8].x != 0.0) {
+            active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
         } else {
             active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
         }
@@ -1597,8 +1590,8 @@ fn fx_run_mark(
     // window materializes any number of overlapping chains' drafts. Un-flagged marks keep their
     // register flow verbatim (glass chains thread values between marks by design).
     let atomic_ctl = ptcl[cmd_ix + 5u];
-    if (d.rec[4].x != 0.0) {
-        if (d.rec[4].w != 0.0 && fence_live) {
+    if (d.rec[8].x != 0.0) {
+        if (d.rec[8].w != 0.0 && fence_live) {
             fx_store_tile(xy, rgba);
             for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
 #ifdef load_base
@@ -1608,8 +1601,8 @@ fn fx_run_mark(
 #endif
             }
         }
-        active_scratch_out = vec2<i32>(i32(d.rec[4].y), i32(d.rec[4].z));
-        if (d.rec[4].w != 0.0) {
+        active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
+        if (d.rec[8].w != 0.0) {
             fence_live = true;
         }
     }
@@ -1635,7 +1628,7 @@ struct FxDesc {
     bits: u32,
     program: u32,
     u: array<vec4<f32>, 6>,
-    rec: array<vec4<f32>, 7>,
+    rec: array<vec4<f32>, 12>,
 }
 fn fx_load_desc(base: u32) -> FxDesc {
     var d: FxDesc;
@@ -1645,7 +1638,7 @@ fn fx_load_desc(base: u32) -> FxDesc {
         let o = base + 2u + k * 4u;
         d.u[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
-    for (var k = 0u; k < 7u; k = k + 1u) {
+    for (var k = 0u; k < 12u; k = k + 1u) {
         let o = base + 26u + k * 4u;
         d.rec[k] = vec4<f32>(effect_params[o], effect_params[o + 1u], effect_params[o + 2u], effect_params[o + 3u]);
     }
@@ -1672,7 +1665,7 @@ fn fx_keys_on_round(base: u32) -> bool {
     // whose segment count happens to match (the count is z- and framing-dependent); there its value
     // path may be permutation-compiled out, but the rec[4] install still runs and hijacks the
     // window's scratch-store origin, landing that window's whole store at the wrong lease offset.
-    return effect_params[base + 42u] != 0.0;
+    return effect_params[base + 58u] != 0.0;
 #endif
 }
 // One ATOMIC mark (ctl bit 0) over one pixel's chain register: ctl bit 4 seeds the chain from the
@@ -1734,7 +1727,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     // root those tiles stored), and only a tap outside the viewport falls to the blur's OOB
     // policy. The atlas itself is never consulted for bounds: a neighbouring lease is not content.
     let blo = u32(d.rec[0].w);
-    let bhi = u32(d.rec[1].w);
+    let bhi = u32(d.rec[2].w);
     let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
     // The high corner is tile-ceiled but the stores were viewport-gated: past the viewport a
     // slot's texels belong to an earlier tenant, so the rect clamps to the frame.
@@ -1881,7 +1874,7 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
 // (ERASE, folding the colour's alpha into the erase term), else the rasterised coverage.
 fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f32> {
     var scov = cov;
-    if (d.rec[2].x == 2.0) {
+    if (d.rec[4].x == 2.0) {
         scov = value_a;
     } else if ((d.bits & 2u) != 0u) {
         scov = cov * (1.0 - d.u[3].a * value_a);
@@ -1901,7 +1894,7 @@ fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f3
 fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> vec4<f32> {
     let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
     let src_value = d.rec[0].x;
-    let src_orig = d.rec[1].x;
+    let src_orig = d.rec[2].x;
     let win_value = d.rec[0].yz;
     var value = acc;
     var orig = acc;
@@ -1933,7 +1926,7 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
         }
         value = fx_bilin_input(px - win_value + disp);
         if src_orig == 2.0 {
-            orig = fx_bilin_input(px - d.rec[1].yz);
+            orig = fx_bilin_input(px - d.rec[2].yz);
         } else {
             orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
         }

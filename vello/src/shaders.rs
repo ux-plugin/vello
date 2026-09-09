@@ -276,9 +276,9 @@ pub(crate) fn full_shaders(
     ];
     // `fine_area_load_draft`: `fine_area_load` plus a second sampled input `draft_in` at binding 10 —
     // a separable blur's V pass reads its H pass's UNMASKED result from here while `base_in` still
-    // holds the original backdrop, so the silhouette mask applies exactly once. Bindings 11/12 are
-    // the region values + chain atlases (`region_reads`), so escaped taps route on this
-    // permutation too — a layer blur's chain rides it.
+    // holds the original backdrop, so the silhouette mask applies exactly once. Binding 11 is the
+    // region atlas (`region_reads`), so escaped taps route on this permutation too — a layer
+    // blur's chain rides it.
     let fine_resources_load_draft = [
         Uniform,
         BufReadOnly,
@@ -289,7 +289,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
-        ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
@@ -390,7 +389,6 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_rwu_two = [
         Uniform,
@@ -403,7 +401,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
     ];
@@ -419,7 +416,6 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_loadu_two = [
         Uniform,
@@ -432,7 +428,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
     ];

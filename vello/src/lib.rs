@@ -798,22 +798,19 @@ impl Renderer {
         base: &TextureView,
         draft: &TextureView,
         region: &TextureView,
-        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let base_image = session.new_out_image();
         let draft_image = session.new_out_image();
         let region_image = session.new_out_image();
-        let chain_image = session.new_out_image();
         let recording =
-            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, region_image, chain_image, out_image);
+            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, region_image, out_image);
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(draft_image, draft),
             ExternalResource::Image(region_image, region),
-            ExternalResource::Image(chain_image, chain),
         ];
         self.engine.run_recording_into_deferred(
             device,
@@ -844,22 +841,19 @@ impl Renderer {
         base: &TextureView,
         input: &TextureView,
         region: &TextureView,
-        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let base_image = session.new_out_image();
         let input_image = session.new_out_image();
         let region_image = session.new_out_image();
-        let chain_image = session.new_out_image();
         let recording =
-            render::record_fine_segment_input(session, &self.shaders, seg_lo, seg_target, base_image, input_image, region_image, chain_image, out_image);
+            render::record_fine_segment_input(session, &self.shaders, seg_lo, seg_target, base_image, input_image, region_image, out_image);
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(input_image, input),
             ExternalResource::Image(region_image, region),
-            ExternalResource::Image(chain_image, chain),
         ];
         self.engine.run_recording_into_deferred(
             device,
@@ -971,6 +965,14 @@ impl Renderer {
 
     /// Refresh snapshot rects from the accumulator as one batched compute copy (deferred with the
     /// phased fine dispatches when dispatch batching is on).
+    /// Flush every deferred fine dispatch into `encoder` now. Phased dispatches batch into one
+    /// compute pass at the next flush boundary; a raw encoder command (a lease write-back or
+    /// transport `copy_texture_to_texture`) that must observe their writes calls this first, or it
+    /// records ahead of the work it depends on.
+    pub fn phased_flush_dispatches(&mut self, encoder: &mut wgpu::CommandEncoder) {
+        self.engine.flush_dispatches(encoder);
+    }
+
     pub fn phased_snap_copy_into(
         &mut self,
         session: &mut render::PhasedSession,
@@ -1016,14 +1018,12 @@ impl Renderer {
         snap: &TextureView,
         slot10: Option<(bool, &TextureView)>,
         region: &TextureView,
-        chain: &TextureView,
         target: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_packed_image();
         let snap_image = session.new_packed_image();
         let slot_image = slot10.map(|(d, _)| (d, session.new_out_image()));
         let region_image = session.new_out_image();
-        let chain_image = session.new_out_image();
         let recording = render::record_fine_segment_rwu(
             session,
             &self.shaders,
@@ -1032,14 +1032,12 @@ impl Renderer {
             snap_image,
             slot_image,
             region_image,
-            chain_image,
             out_image,
         );
         let mut external_resources = vec![
             ExternalResource::Image(out_image, target),
             ExternalResource::Image(snap_image, snap),
             ExternalResource::Image(region_image, region),
-            ExternalResource::Image(chain_image, chain),
         ];
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
@@ -1072,14 +1070,12 @@ impl Renderer {
         snap: &TextureView,
         slot10: Option<(bool, &TextureView)>,
         region: &TextureView,
-        chain: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_out_image();
         let snap_image = session.new_packed_image();
         let slot_image = slot10.map(|(d, _)| (d, session.new_out_image()));
         let region_image = session.new_out_image();
-        let chain_image = session.new_out_image();
         let recording = render::record_fine_segment_loadu(
             session,
             &self.shaders,
@@ -1088,14 +1084,12 @@ impl Renderer {
             snap_image,
             slot_image,
             region_image,
-            chain_image,
             out_image,
         );
         let mut external_resources = vec![
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(snap_image, snap),
             ExternalResource::Image(region_image, region),
-            ExternalResource::Image(chain_image, chain),
         ];
         if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
             external_resources.push(ExternalResource::Image(img, view));
