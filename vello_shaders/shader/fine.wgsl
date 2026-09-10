@@ -56,11 +56,6 @@ fn stg_local(p: vec2<i32>) -> vec2<i32> {
     return vec2(p.x, p.y % STG_LAYER_PX);
 }
 
-fn stg_dims() -> vec2<i32> {
-    let d = vec2<i32>(textureDimensions(output));
-    return vec2(d.x, d.y * i32(textureNumLayers(output)));
-}
-
 @group(0) @binding(6)
 var gradients: texture_2d<f32>;
 
@@ -222,7 +217,7 @@ fn fx_orig_scale(d: FxDesc) -> f32 {
 fn fx_bilin_input(pos: vec2<f32>, win: vec2<f32>, r: vec4<f32>, s: f32) -> vec4<f32> {
     let p = pos * s - win - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
 #ifdef staging_rw
-    let dmax = vec2<f32>(stg_dims()) - vec2<f32>(1.0, 1.0);
+    let dmax = vec2<f32>(textureDimensions(output)) - vec2<f32>(1.0, 1.0);
 #else
     let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
 #endif
@@ -1455,7 +1450,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         let sp = ipx + axis * i32(round(f32(tt) / tap_s));
 #ifdef stg_taps
         let tc = base_l + axis * tt - scratch_in_i;
-        var dims = stg_dims();
+        var dims = vec2<i32>(textureDimensions(output));
         if (d.rec[1].z > d.rec[1].x) {
             dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
         }
@@ -1536,7 +1531,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
 fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
 #ifdef staging_rw
-    let fdims = stg_dims();
+    let fdims = vec2<i32>(textureDimensions(output));
 #else
     let fdims = vec2<i32>(textureDimensions(base_in));
 #endif
