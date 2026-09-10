@@ -46,6 +46,21 @@ var output: texture_storage_2d_array<rgba8unorm, write>;
 #endif
 #endif
 
+const STG_LAYER_PX: i32 = 8192;
+
+fn stg_layer(p: vec2<i32>) -> i32 {
+    return p.y / STG_LAYER_PX;
+}
+
+fn stg_local(p: vec2<i32>) -> vec2<i32> {
+    return vec2(p.x, p.y % STG_LAYER_PX);
+}
+
+fn stg_dims() -> vec2<i32> {
+    let d = vec2<i32>(textureDimensions(output));
+    return vec2(d.x, d.y * i32(textureNumLayers(output)));
+}
+
 @group(0) @binding(6)
 var gradients: texture_2d<f32>;
 
@@ -57,7 +72,7 @@ var<storage> effect_params: array<f32>;
 
 #ifdef staging_rw
 fn stg_ld(p: vec2<i32>) -> vec4<f32> {
-    return unpack4x8unorm(textureLoad(output, p, 0).x);
+    return unpack4x8unorm(textureLoad(output, stg_local(p), stg_layer(p)).x);
 }
 #endif
 
@@ -207,7 +222,7 @@ fn fx_orig_scale(d: FxDesc) -> f32 {
 fn fx_bilin_input(pos: vec2<f32>, win: vec2<f32>, r: vec4<f32>, s: f32) -> vec4<f32> {
     let p = pos * s - win - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
 #ifdef staging_rw
-    let dmax = vec2<f32>(textureDimensions(output)) - vec2<f32>(1.0, 1.0);
+    let dmax = vec2<f32>(stg_dims()) - vec2<f32>(1.0, 1.0);
 #else
     let dmax = vec2<f32>(textureDimensions(input_in)) - vec2<f32>(1.0, 1.0);
 #endif
@@ -1440,7 +1455,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         let sp = ipx + axis * i32(round(f32(tt) / tap_s));
 #ifdef stg_taps
         let tc = base_l + axis * tt - scratch_in_i;
-        var dims = vec2<i32>(textureDimensions(output));
+        var dims = stg_dims();
         if (d.rec[1].z > d.rec[1].x) {
             dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
         }
@@ -1521,7 +1536,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
 fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
 #ifdef staging_rw
-    let fdims = vec2<i32>(textureDimensions(output));
+    let fdims = stg_dims();
 #else
     let fdims = vec2<i32>(textureDimensions(base_in));
 #endif
@@ -1722,9 +1737,9 @@ fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_
                 coords = coords / ostride;
             }
 #ifdef acc_u32
-            textureStore(output, vec2<i32>(coords) - active_scratch_out, 0, vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
+            textureStore(output, stg_local(vec2<i32>(coords) - active_scratch_out), stg_layer(vec2<i32>(coords) - active_scratch_out), vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
 #else
-            textureStore(output, vec2<i32>(coords) - active_scratch_out, 0, (*rgba)[i]);
+            textureStore(output, stg_local(vec2<i32>(coords) - active_scratch_out), stg_layer(vec2<i32>(coords) - active_scratch_out), (*rgba)[i]);
 #endif
         }
     }
@@ -1766,9 +1781,9 @@ fn main(
     let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
 #ifdef acc_u32
-        rgba[i] = unpack4x8unorm(textureLoad(output, base_xy + vec2(i32(i), 0), 0).x);
+        rgba[i] = unpack4x8unorm(textureLoad(output, stg_local(base_xy + vec2(i32(i), 0)), stg_layer(base_xy + vec2(i32(i), 0))).x);
 #else
-        rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0), 0);
+        rgba[i] = textureLoad(output, stg_local(base_xy + vec2(i32(i), 0)), stg_layer(base_xy + vec2(i32(i), 0)));
 #endif
     }
 #else
