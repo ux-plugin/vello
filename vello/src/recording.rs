@@ -105,6 +105,11 @@ pub enum BindType {
     /// A storage image with read-write access — requires the device to support it for the format
     /// (`rgba8unorm` needs adapter-specific format features / the browser's `texture-formats-tier2`).
     ImageReadWrite(ImageFormat),
+    /// A layered storage image (`texture_storage_2d_array`); the bound view must be `D2Array`.
+    ImageArray(ImageFormat),
+    /// A layered storage image with read-write access; same format requirements as
+    /// [`Self::ImageReadWrite`], bound as a `D2Array` view.
+    ImageArrayReadWrite(ImageFormat),
     // TODO: Uniform, Sampler, maybe others
 }
 

@@ -35,14 +35,14 @@ var<storage, read_write> blend_spill: array<u32>;
 
 #ifdef acc_u32
 @group(0) @binding(5)
-var output: texture_storage_2d<r32uint, read_write>;
+var output: texture_storage_2d_array<r32uint, read_write>;
 #else
 #ifdef rw_accum
 @group(0) @binding(5)
-var output: texture_storage_2d<rgba8unorm, read_write>;
+var output: texture_storage_2d_array<rgba8unorm, read_write>;
 #else
 @group(0) @binding(5)
-var output: texture_storage_2d<rgba8unorm, write>;
+var output: texture_storage_2d_array<rgba8unorm, write>;
 #endif
 #endif
 
@@ -57,7 +57,7 @@ var<storage> effect_params: array<f32>;
 
 #ifdef staging_rw
 fn stg_ld(p: vec2<i32>) -> vec4<f32> {
-    return unpack4x8unorm(textureLoad(output, p).x);
+    return unpack4x8unorm(textureLoad(output, p, 0).x);
 }
 #endif
 
@@ -1722,9 +1722,9 @@ fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_
                 coords = coords / ostride;
             }
 #ifdef acc_u32
-            textureStore(output, vec2<i32>(coords) - active_scratch_out, vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
+            textureStore(output, vec2<i32>(coords) - active_scratch_out, 0, vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
 #else
-            textureStore(output, vec2<i32>(coords) - active_scratch_out, (*rgba)[i]);
+            textureStore(output, vec2<i32>(coords) - active_scratch_out, 0, (*rgba)[i]);
 #endif
         }
     }
@@ -1766,9 +1766,9 @@ fn main(
     let base_xy = vec2<i32>(xy);
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
 #ifdef acc_u32
-        rgba[i] = unpack4x8unorm(textureLoad(output, base_xy + vec2(i32(i), 0)).x);
+        rgba[i] = unpack4x8unorm(textureLoad(output, base_xy + vec2(i32(i), 0), 0).x);
 #else
-        rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0));
+        rgba[i] = textureLoad(output, base_xy + vec2(i32(i), 0), 0);
 #endif
     }
 #else

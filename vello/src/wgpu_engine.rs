@@ -1051,7 +1051,20 @@ impl WgpuEngine {
                     },
                     count: None,
                 },
-                BindType::Image(format) | BindType::ImageRead(format) | BindType::ImageReadWrite(format) => {
+                BindType::Image(format)
+                | BindType::ImageRead(format)
+                | BindType::ImageReadWrite(format)
+                | BindType::ImageArray(format)
+                | BindType::ImageArrayReadWrite(format) => {
+                    let layered = matches!(
+                        bind_type,
+                        BindType::ImageArray(_) | BindType::ImageArrayReadWrite(_)
+                    );
+                    let dimension = if layered {
+                        TextureViewDimension::D2Array
+                    } else {
+                        TextureViewDimension::D2
+                    };
                     wgpu::BindGroupLayoutEntry {
                         binding: i as u32,
                         visibility,
@@ -1062,18 +1075,21 @@ impl WgpuEngine {
                                 } else {
                                     wgpu::TextureSampleType::Float { filterable: true }
                                 },
-                                view_dimension: TextureViewDimension::D2,
+                                view_dimension: dimension,
                                 multisampled: false,
                             }
                         } else {
                             wgpu::BindingType::StorageTexture {
-                                access: if bind_type == BindType::ImageReadWrite(format) {
+                                access: if matches!(
+                                    bind_type,
+                                    BindType::ImageReadWrite(_) | BindType::ImageArrayReadWrite(_)
+                                ) {
                                     wgpu::StorageTextureAccess::ReadWrite
                                 } else {
                                     wgpu::StorageTextureAccess::WriteOnly
                                 },
                                 format: format.to_wgpu(),
-                                view_dimension: TextureViewDimension::D2,
+                                view_dimension: dimension,
                             }
                         },
                         count: None,
