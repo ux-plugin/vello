@@ -1410,10 +1410,12 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     let bits = d.bits;
     let sigma = max(u[0].z, 0.5);
     let stride = max(i32(u[0].w), 1);
-    var radius = i32(ceil(3.0 * sigma));
+    let tap_s = select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
+    let sigma_s = max(sigma * tap_s, 0.5);
+    var radius = i32(ceil(3.0 * sigma_s));
     radius = radius - (radius % stride);
     let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
-    let inv2s2 = 1.0 / (2.0 * sigma * sigma);
+    let inv2s2 = 1.0 / (2.0 * sigma_s * sigma_s);
     let srgb_blur = u[2].z != 0.0;
     let shadow_edge = u[2].w != 0.0;
     let bgraw = unpack4x8unorm(config.base_color);
@@ -1425,7 +1427,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var wsum = 0.0;
     let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
-    let tap_s = select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
+    let base_l = vec2<i32>(floor(vec2<f32>(ipx) * tap_s));
     let blo = u32(d.rec[0].w);
     let bhi = u32(d.rec[2].w);
     let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
@@ -1435,9 +1437,9 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     );
     for (var tt = -radius; tt <= radius; tt = tt + stride) {
         let w = exp(-f32(tt * tt) * inv2s2);
-        let sp = ipx + axis * tt;
+        let sp = ipx + axis * i32(round(f32(tt) / tap_s));
 #ifdef stg_taps
-        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
+        let tc = base_l + axis * tt - scratch_in_i;
         var dims = vec2<i32>(textureDimensions(output));
         if (d.rec[1].z > d.rec[1].x) {
             dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
@@ -1445,12 +1447,12 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         var rawtap = stg_ld(tc);
 #else
 #ifdef have_draft
-        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
+        let tc = base_l + axis * tt - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(draft_in));
         var rawtap = draft_ld(tc);
 #else
 #ifdef have_input
-        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
+        let tc = base_l + axis * tt - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(input_in));
         var rawtap = input_ld(tc);
 #else
