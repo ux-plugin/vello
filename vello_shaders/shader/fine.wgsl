@@ -196,8 +196,16 @@ fn draft_ld(p: vec2<i32>) -> vec4<f32> {
 #endif
 
 #ifdef fx_value_reads
-fn fx_bilin_input(pos: vec2<f32>, r: vec4<f32>) -> vec4<f32> {
-    let p = pos - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
+fn fx_in_scale(d: FxDesc) -> f32 {
+    return select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
+}
+
+fn fx_orig_scale(d: FxDesc) -> f32 {
+    return select(1.0, d.rec[9].z, d.rec[9].z > 0.0);
+}
+
+fn fx_bilin_input(pos: vec2<f32>, win: vec2<f32>, r: vec4<f32>, s: f32) -> vec4<f32> {
+    let p = pos * s - win - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
 #ifdef staging_rw
     let dmax = vec2<f32>(textureDimensions(output)) - vec2<f32>(1.0, 1.0);
 #else
@@ -230,6 +238,7 @@ fn fx_bilin_input(pos: vec2<f32>, r: vec4<f32>) -> vec4<f32> {
 #endif
 
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
+var<private> active_out_scale: f32 = 1.0;
 #ifdef region_reads
 var<private> region_route: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 var<private> region_clamp: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
@@ -1297,8 +1306,10 @@ fn fx_run_mark(
         }
         if (d.rec[8].x != 0.0) {
             active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
+            active_out_scale = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
         } else {
             active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
+            active_out_scale = 1.0;
         }
         fence_live = true;
         return;
@@ -1316,6 +1327,7 @@ fn fx_run_mark(
             }
         }
         active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
+        active_out_scale = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
         if (d.rec[8].w != 0.0) {
             fence_live = true;
         }
@@ -1329,8 +1341,13 @@ fn fx_run_mark(
             }
         }
     } else {
+        let fs = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
+        let fstride = i32(1.0 / fs + 0.5);
         for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
             let px = xy + vec2<f32>(f32(i), 0.0);
+            if (fs < 1.0 && ((i32(px.x) % fstride) != 0 || (i32(px.y) % fstride) != 0)) {
+                continue;
+            }
             (*rgba)[i] = fx_fused_value(d, px, (*rgba)[i], (*area)[i]);
         }
     }
@@ -1372,7 +1389,7 @@ fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<
     var v = prev;
 #ifdef fx_value_reads
     if (ctl & 4u) != 0u {
-        v = fx_bilin_input(px - d.rec[0].yz, d.rec[1]);
+        v = fx_bilin_input(px, d.rec[0].yz, d.rec[1], fx_in_scale(d));
     }
 #endif
 #ifdef load_base
@@ -1408,6 +1425,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var wsum = 0.0;
     let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
+    let tap_s = select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
     let blo = u32(d.rec[0].w);
     let bhi = u32(d.rec[2].w);
     let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
@@ -1419,7 +1437,7 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         let w = exp(-f32(tt * tt) * inv2s2);
         let sp = ipx + axis * tt;
 #ifdef stg_taps
-        let tc = sp - scratch_in_i;
+        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
         var dims = vec2<i32>(textureDimensions(output));
         if (d.rec[1].z > d.rec[1].x) {
             dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
@@ -1427,12 +1445,12 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         var rawtap = stg_ld(tc);
 #else
 #ifdef have_draft
-        let tc = sp - scratch_in_i;
+        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(draft_in));
         var rawtap = draft_ld(tc);
 #else
 #ifdef have_input
-        let tc = sp - scratch_in_i;
+        let tc = vec2<i32>(floor(vec2<f32>(sp) * tap_s)) - scratch_in_i;
         let dims = vec2<i32>(textureDimensions(input_in));
         var rawtap = input_ld(tc);
 #else
@@ -1521,7 +1539,7 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
     let win = d.rec[0].yz;
     let fc = px + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
     if (frost <= 0.01) {
-        return fx_bilin_input(px - win, d.rec[1]);
+        return fx_bilin_input(px, win, d.rec[1], fx_in_scale(d));
     }
     let lens_c = d.u[0].zw;
     let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
@@ -1539,7 +1557,7 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
             continue;
         }
 #endif
-        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi) - win, d.rec[1]);
+        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi), win, d.rec[1], fx_in_scale(d));
     }
     return sacc / 12.0;
 }
@@ -1595,9 +1613,9 @@ fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> ve
         if (d.bits & 32u) != 0u {
             disp = fld.xy;
         }
-        value = fx_bilin_input(px - win_value + disp, d.rec[1]);
+        value = fx_bilin_input(px + disp, win_value, d.rec[1], fx_in_scale(d));
         if src_orig == 2.0 {
-            orig = fx_bilin_input(px - d.rec[2].yz, d.rec[3]);
+            orig = fx_bilin_input(px, d.rec[2].yz, d.rec[3], fx_orig_scale(d));
         } else {
 #ifdef load_base
             orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
@@ -1687,9 +1705,20 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
 
 fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
     let xy_uint = vec2<u32>(xy);
+    let os = active_out_scale;
+    let ostride = u32(1.0 / os + 0.5);
+    if (os < 1.0 && xy_uint.y % ostride != 0u) {
+        return;
+    }
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-        let coords = xy_uint + vec2(i, 0u);
+        var coords = xy_uint + vec2(i, 0u);
+        if (os < 1.0 && coords.x % ostride != 0u) {
+            continue;
+        }
         if coords.x < config.target_width && coords.y < config.target_height {
+            if (os < 1.0) {
+                coords = coords / ostride;
+            }
 #ifdef acc_u32
             textureStore(output, vec2<i32>(coords) - active_scratch_out, vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
 #else
@@ -1709,6 +1738,7 @@ fn main(
         return;
     }
     active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
+    active_out_scale = 1.0;
     win_lo = config.seg_lo;
     win_hi = config.seg_target;
     var tile_xy = wg_id.xy;
