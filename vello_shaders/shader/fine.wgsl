@@ -89,22 +89,28 @@ fn base_ld(p: vec2<i32>) -> vec4<f32> {
 }
 
 #ifdef region_reads
+#ifdef staging_rw
+fn region_ld(p: vec2<i32>) -> vec4<f32> {
+    let q = p + vec2(0, STG_LAYER_PX);
+    return unpack4x8unorm(textureLoad(output, stg_local(q), stg_layer(q)).x);
+}
+#else
 #ifdef have_input
 @group(0) @binding(11)
-var region_atlas: texture_2d<f32>;
+var region_atlas: texture_2d<u32>;
 #else
 #ifdef have_draft
-#ifdef staging_rw
-@group(0) @binding(10)
-var region_atlas: texture_2d<f32>;
-#else
 @group(0) @binding(11)
-var region_atlas: texture_2d<f32>;
-#endif
+var region_atlas: texture_2d<u32>;
 #else
 @group(0) @binding(10)
-var region_atlas: texture_2d<f32>;
+var region_atlas: texture_2d<u32>;
 #endif
+#endif
+
+fn region_ld(p: vec2<i32>) -> vec4<f32> {
+    return unpack4x8unorm(textureLoad(region_atlas, p, 0).x);
+}
 #endif
 
 fn fx_region_serves(p: vec2<f32>) -> bool {
@@ -123,10 +129,10 @@ fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
     let fl = floor(a);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = a - fl;
-    let c00 = textureLoad(region_atlas, i0, 0);
-    let c10 = textureLoad(region_atlas, i0 + vec2<i32>(1, 0), 0);
-    let c01 = textureLoad(region_atlas, i0 + vec2<i32>(0, 1), 0);
-    let c11 = textureLoad(region_atlas, i0 + vec2<i32>(1, 1), 0);
+    let c00 = region_ld(i0);
+    let c10 = region_ld(i0 + vec2<i32>(1, 0));
+    let c01 = region_ld(i0 + vec2<i32>(0, 1));
+    let c11 = region_ld(i0 + vec2<i32>(1, 1));
     return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
 }
 #endif

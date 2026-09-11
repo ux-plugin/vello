@@ -1206,29 +1206,6 @@ pub(crate) fn record_fine_segment_loadu(
     recording
 }
 
-/// The region STORE window (`fine_area_loadu_store`): reads the packed staging store as `base_in`
-/// and writes the region atlas — no route-atlas binding, since the atlas is the output.
-#[cfg(feature = "wgpu")]
-pub(crate) fn record_fine_segment_loadu_store(
-    session: &mut PhasedSession,
-    shaders: &FullShaders,
-    seg_lo: u32,
-    seg_target: u32,
-    base: ImageProxy,
-    out_image: ImageProxy,
-) -> Recording {
-    let shader = shaders.fine_area_loadu_store.expect("region stores need fine_area_loadu_store");
-    let mut recording = Recording::default();
-    let (config_buf, fine_wg) = seg_config(session, &mut recording, seg_lo, seg_target);
-    recording.dispatch(
-        shader,
-        fine_wg,
-        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
-    );
-    recording.free_resource(config_buf);
-    recording
-}
-
 /// A RASTERIZE window writing the packed staging store (`fine_area_stg`): transparent init, the
 /// fenced draws' stores land packed at their OUTPUT-record leases.
 #[cfg(feature = "wgpu")]
@@ -1262,7 +1239,6 @@ pub(crate) fn record_fine_segment_stg_load(
     seg_target: u32,
     base: ImageProxy,
     sdf: Option<ImageProxy>,
-    region: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let mut recording = Recording::default();
@@ -1273,7 +1249,7 @@ pub(crate) fn record_fine_segment_stg_load(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(region)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
             );
         }
         Some(sdf) => {
@@ -1282,7 +1258,7 @@ pub(crate) fn record_fine_segment_stg_load(
             recording.dispatch(
                 shader,
                 fine_wg,
-                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(sdf), ResourceProxy::Image(region)],
+                [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(sdf)],
             );
         }
     }
@@ -1301,7 +1277,6 @@ pub(crate) fn record_fine_segment_stg_chain(
     seg_target: u32,
     is_draft: bool,
     base: ImageProxy,
-    region: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let shader = if is_draft {
@@ -1314,7 +1289,7 @@ pub(crate) fn record_fine_segment_stg_chain(
     recording.dispatch(
         shader,
         fine_wg,
-        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base), ResourceProxy::Image(region)],
+        [config_buf, session.segments_buf, session.ptcl_buf, session.info_bin_data_buf, session.blend_spill_buf, ResourceProxy::Image(out_image), session.gradient_image, session.image_atlas, session.effect_params_buf, ResourceProxy::Image(base)],
     );
     recording.free_resource(config_buf);
     recording

@@ -82,7 +82,6 @@ pub struct FullShaders {
     /// `fine_area_loadu` without `region_reads`: the region STORE window — reads the packed
     /// staging store as `base_in` and writes the region atlas, so the atlas must not also be
     /// bound as the route atlas.
-    pub fine_area_loadu_store: Option<ShaderId>,
     /// `fine_area_loadu` + `have_input`.
     pub fine_area_loadu_input: Option<ShaderId>,
     /// `fine_area_loadu` + `have_draft`.
@@ -312,7 +311,7 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
 
     let aa_support = &options.antialiasing_support;
@@ -409,7 +408,7 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
     let fine_resources_rwu_two = [
         Uniform,
@@ -423,7 +422,7 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
     let fine_resources_loadu = [
         Uniform,
@@ -436,7 +435,7 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
     let fine_resources_loadu_two = [
         Uniform,
@@ -450,7 +449,7 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
     let fine_resources_draft = [
         Uniform,
@@ -491,27 +490,13 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
+        ImageRead(ImageFormat::R32Uint),
     ];
     let fine_area_rwu_input_pk = area
         .then(|| add_shader!(fine_area_rwu_input_pk, fine_resources_rwu_two_pk, CpuShaderType::Missing));
     let fine_area_rwu_draft_pk = area
         .then(|| add_shader!(fine_area_rwu_draft_pk, fine_resources_rwu_two_pk, CpuShaderType::Missing));
     let fine_area_loadu = area.then(|| add_shader!(fine_area_loadu, fine_resources_loadu, CpuShaderType::Missing));
-    let fine_resources_loadu_store = [
-        Uniform,
-        BufReadOnly,
-        BufReadOnly,
-        BufReadOnly,
-        Buffer,
-        ImageArray(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
-        BufReadOnly,
-        ImageRead(ImageFormat::R32Uint),
-    ];
-    let fine_area_loadu_store = area
-        .then(|| add_shader!(fine_area_loadu_store, fine_resources_loadu_store, CpuShaderType::Missing));
     let fine_area_loadu_input =
         area.then(|| add_shader!(fine_area_loadu_input, fine_resources_loadu_two, CpuShaderType::Missing));
     let fine_area_loadu_draft =
@@ -538,7 +523,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_stg_load_sdf = [
         Uniform,
@@ -552,7 +536,6 @@ pub(crate) fn full_shaders(
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
         ImageRead(ImageFormat::Rgba8),
-        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_resources_stg_chain = [
         Uniform,
@@ -565,7 +548,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
         ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::Rgba8),
     ];
     let fine_area_stg =
         area.then(|| add_shader!(fine_area_stg, fine_resources_stg, CpuShaderType::Missing));
@@ -630,7 +612,6 @@ pub(crate) fn full_shaders(
         fine_area_rwu_input_pk,
         fine_area_rwu_draft_pk,
         fine_area_loadu,
-        fine_area_loadu_store,
         fine_area_loadu_input,
         fine_area_loadu_draft,
         fine_area_stg,
