@@ -155,6 +155,14 @@ impl PhasedSession {
         self.cpu_config.gpu.sparse_n = n;
     }
 
+    /// Place the `base` slot for the NEXT fine dispatch inside the store: the rect at `at` holds
+    /// the frame-space region `[org, org + ext)`. Consumed by that dispatch and reset.
+    pub fn set_base_rect(&mut self, org: [u32; 2], ext: [u32; 2], at: [u32; 2]) {
+        self.cpu_config.gpu.base_org = org;
+        self.cpu_config.gpu.base_ext = ext;
+        self.cpu_config.gpu.base_at = at;
+    }
+
     /// A fresh `R32Uint` (packed-rgba8) image proxy sized to the frame — the in-place accumulator
     /// or its round-boundary snapshot.
     pub(crate) fn new_packed_image(&self) -> ImageProxy {
@@ -433,6 +441,9 @@ pub(crate) fn record_fine_packed(
     session.cpu_config.gpu.scratch_in = [0; 2];
     session.cpu_config.gpu.sparse_base = 0;
     session.cpu_config.gpu.sparse_n = 0;
+    session.cpu_config.gpu.base_org = [0; 2];
+    session.cpu_config.gpu.base_ext = [0; 2];
+    session.cpu_config.gpu.base_at = [0; 2];
     let fine_wg = if seg_cfg.sparse_n != 0 {
         (seg_cfg.sparse_n, 1, 1)
     } else {

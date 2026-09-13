@@ -199,6 +199,12 @@ pub struct ConfigUniform {
     pub fine_mode: u32,
     /// Pad to a 16-byte multiple (WebGPU uniform requirement).
     pub frame_pad: u32,
+    /// The `base` slot as a rect of the store (`fine_mode` BASE_STORE): the store rect at
+    /// `base_at` holds the frame-space region `[base_org, base_org + base_ext)`.
+    pub base_org: [u32; 2],
+    pub base_ext: [u32; 2],
+    pub base_at: [u32; 2],
+    pub base_pad: [u32; 2],
 }
 
 /// CPU side setup and configuration.
@@ -252,6 +258,10 @@ impl RenderConfig {
                 frame_height: height,
                 fine_mode: 0,
                 frame_pad: 0,
+                base_org: [0; 2],
+                base_ext: [0; 2],
+                base_at: [0; 2],
+                base_pad: [0; 2],
                 layout: *layout,
             },
             workgroup_counts,

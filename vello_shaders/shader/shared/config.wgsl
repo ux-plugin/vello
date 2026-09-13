@@ -79,6 +79,16 @@ struct Config {
     fine_mode: u32,
     // Pad to a 16-byte multiple (WebGPU uniform requirement).
     frame_pad1: u32,
+    // The base slot as a rect of the store (MODE_BASE_STORE): the store rect at base_at holds the
+    // frame-space region [base_org, base_org + base_ext).
+    base_org_x: u32,
+    base_org_y: u32,
+    base_ext_x: u32,
+    base_ext_y: u32,
+    base_at_x: u32,
+    base_at_y: u32,
+    base_pad0: u32,
+    base_pad1: u32,
 }
 
 // Sentinel `seg_target` value meaning "render all segments in one pass" (the non-segmented default).

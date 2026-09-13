@@ -82,6 +82,7 @@ const MODE_STG_TAPS: u32 = 32u;
 const MODE_KEYS_ROUND: u32 = 64u;
 const MODE_KEEP_COV: u32 = 128u;
 const MODE_VALUE_READS: u32 = 256u;
+const MODE_BASE_STORE: u32 = 512u;
 
 fn mode_has(bit: u32) -> bool {
     return (config.fine_mode & bit) != 0u;
@@ -92,7 +93,26 @@ fn stg_ld(p: vec2<i32>) -> vec4<f32> {
 }
 
 fn base_ld(p: vec2<i32>) -> vec4<f32> {
+    if (mode_has(MODE_BASE_STORE)) {
+        let q = p - vec2<i32>(i32(config.base_org_x), i32(config.base_org_y))
+            + vec2<i32>(i32(config.base_at_x), i32(config.base_at_y));
+        return stg_ld(q);
+    }
     return unpack4x8unorm(textureLoad(base_in, p, 0).x);
+}
+
+fn base_lo() -> vec2<i32> {
+    if (mode_has(MODE_BASE_STORE)) {
+        return vec2<i32>(i32(config.base_org_x), i32(config.base_org_y));
+    }
+    return vec2<i32>(0, 0);
+}
+
+fn base_hi() -> vec2<i32> {
+    if (mode_has(MODE_BASE_STORE)) {
+        return vec2<i32>(i32(config.base_org_x + config.base_ext_x), i32(config.base_org_y + config.base_ext_y));
+    }
+    return vec2<i32>(textureDimensions(base_in));
 }
 
 fn input_ld(p: vec2<i32>) -> vec4<f32> {
@@ -148,8 +168,8 @@ fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
     if (fx_region_serves(pos)) {
         return fx_region_tap(pos);
     }
-    let dmax = vec2<f32>(textureDimensions(base_in)) - vec2<f32>(1.0, 1.0);
-    let cp = clamp(pos, vec2<f32>(0.0, 0.0), dmax);
+    let dmax = vec2<f32>(base_hi()) - vec2<f32>(1.0, 1.0);
+    let cp = clamp(pos, vec2<f32>(base_lo()), dmax);
     let fl = floor(cp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = cp - fl;
@@ -1387,8 +1407,8 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
         let w = exp(-f32(tt * tt) * inv2s2);
         let sp = ipx + axis * i32(round(f32(tt) / tap_s));
         var tc = sp;
-        var dims = vec2<i32>(textureDimensions(base_in));
-        var tlo = vec2<i32>(0, 0);
+        var dims = base_hi();
+        var tlo = base_lo();
         var rawtap: vec4<f32>;
         if (mode_has(MODE_STG_TAPS)) {
             tc = base_l + axis * tt - scratch_in_i;
@@ -1444,11 +1464,13 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
 }
 fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
     let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
-    var fdims = vec2<i32>(textureDimensions(base_in));
+    var flo = base_lo();
+    var fdims = base_hi();
     if (mode_has(MODE_STAGING)) {
+        flo = vec2<i32>(0, 0);
         fdims = vec2<i32>(textureDimensions(output));
     }
-    let finb = fpx.x >= 0 && fpx.y >= 0 && fpx.x < fdims.x && fpx.y < fdims.y;
+    let finb = fpx.x >= flo.x && fpx.y >= flo.y && fpx.x < fdims.x && fpx.y < fdims.y;
     var flood = 0.0;
     if (finb) {
         if (mode_has(MODE_STAGING)) {
