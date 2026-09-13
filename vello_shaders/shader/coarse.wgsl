@@ -213,6 +213,11 @@ fn main(
     // clip state
     var clip_zero_depth = 0u;
     var clip_depth = 0u;
+    // One bit per depth: this tile lies wholly inside that clip and the layer is a plain clip, so
+    // both of its commands are dropped. A layer isolates — content inside it cannot see the
+    // backdrop, which silently disables blend modes — and a clip that covers the whole tile has
+    // nothing to isolate. Depths past the mask keep their commands.
+    var clip_all_mask = 0u;
 
     var partition_ix = 0u;
     var rd_ix = 0u;
@@ -454,8 +459,13 @@ fn main(
                     case DRAWTAG_BEGIN_CLIP: {
                         let even_odd = (draw_flags & DRAW_INFO_FLAGS_FILL_RULE_BIT) != 0u;
                         let backdrop_clear = select(tile.backdrop, abs(tile.backdrop) & 1, even_odd) == 0;
+                        let covers_tile = tile.segment_count_or_ix == 0u && !backdrop_clear;
+                        let plain_clip = scene[dd] == ((128u << 8u) | 3u)
+                            && bitcast<f32>(scene[dd + 1u]) == 1.0;
                         if tile.segment_count_or_ix == 0u && backdrop_clear {
                             clip_zero_depth = clip_depth + 1u;
+                        } else if covers_tile && plain_clip && clip_depth < 32u {
+                            clip_all_mask |= 1u << clip_depth;
                         } else {
                             write_begin_clip();
                             render_blend_depth += 1u;
@@ -465,11 +475,15 @@ fn main(
                     }
                     case DRAWTAG_END_CLIP: {
                         clip_depth -= 1u;
-                        write_path(tile, tile_ix, draw_flags);
-                        let blend = scene[dd];
-                        let alpha = bitcast<f32>(scene[dd + 1u]);
-                        write_end_clip(CmdEndClip(blend, alpha));
-                        render_blend_depth -= 1u;
+                        if clip_depth < 32u && (clip_all_mask & (1u << clip_depth)) != 0u {
+                            clip_all_mask &= ~(1u << clip_depth);
+                        } else {
+                            write_path(tile, tile_ix, draw_flags);
+                            let blend = scene[dd];
+                            let alpha = bitcast<f32>(scene[dd + 1u]);
+                            write_end_clip(CmdEndClip(blend, alpha));
+                            render_blend_depth -= 1u;
+                        }
                     }
                     default: {}
                 }
