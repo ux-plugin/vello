@@ -661,8 +661,8 @@ impl Renderer {
 
     /// Dispatch the effects `fine` for one window `[seg_lo, seg_target)` of the shared PTCL into
     /// `encoder`, writing the packed store `out` in place. `mode` is the dispatch's mode word (see
-    /// `render::record_fine_packed`); `base`/`input` are the r32uint sampled slots the mode names,
-    /// `region` the lease atlas — pass the caller's dummy for an unbound slot. Valid between a
+    /// `render::record_fine_packed`); `base`/`input` are the r32uint sampled slots the mode names —
+    /// pass the caller's dummy for an unbound slot. Valid between a
     /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`] pair, after
     /// [`Self::phased_frontend_full_into`].
     #[expect(clippy::too_many_arguments, reason = "one dispatch, one binding set")]
@@ -677,13 +677,11 @@ impl Renderer {
         mode: u32,
         base: &TextureView,
         input: &TextureView,
-        region: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_packed_image();
         let base_image = session.new_packed_image();
         let input_image = session.new_packed_image();
-        let region_image = session.new_packed_image();
         let recording = render::record_fine_packed(
             session,
             &self.shaders,
@@ -692,14 +690,12 @@ impl Renderer {
             mode,
             base_image,
             input_image,
-            region_image,
             out_image,
         );
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
             ExternalResource::Image(input_image, input),
-            ExternalResource::Image(region_image, region),
         ];
         self.engine.run_recording_into_deferred(
             device,

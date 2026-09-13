@@ -417,8 +417,8 @@ pub(crate) fn record_frontend_full(session: &mut PhasedSession, shaders: &FullSh
 /// `fine_packed` permutation over the packed store `out` (r32uint, read-write). `mode` is the
 /// dispatch's [`FINE_MODE`] word: how the tile's register is seeded, which of `base`/`input` are
 /// bound, whether value and tap reads ride the store itself, and how marks key their window.
-/// `base`, `input` and `region` are r32uint sampled images — a 1×1 dummy when the mode says a slot
-/// is unbound. The per-dispatch scratch origins and sparse list are consumed here.
+/// `base` and `input` are r32uint sampled images — a 1×1 dummy when the mode says a slot is
+/// unbound. The per-dispatch scratch origins and sparse list are consumed here.
 #[cfg(feature = "wgpu")]
 pub(crate) fn record_fine_packed(
     session: &mut PhasedSession,
@@ -428,7 +428,6 @@ pub(crate) fn record_fine_packed(
     mode: u32,
     base: ImageProxy,
     input: ImageProxy,
-    region: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let shader = shaders.fine_packed.expect("the effects path needs the fine_packed shader");
@@ -466,7 +465,6 @@ pub(crate) fn record_fine_packed(
             session.effect_params_buf,
             ResourceProxy::Image(base),
             ResourceProxy::Image(input),
-            ResourceProxy::Image(region),
         ],
     );
     recording.free_resource(config_buf);

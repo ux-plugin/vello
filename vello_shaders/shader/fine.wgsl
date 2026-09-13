@@ -67,9 +67,6 @@ var base_in: texture_2d<u32>;
 @group(0) @binding(10)
 var input_in: texture_2d<u32>;
 
-@group(0) @binding(11)
-var region_atlas: texture_2d<u32>;
-
 const MODE_INIT_MASK: u32 = 3u;
 const MODE_INIT_COLOUR: u32 = 0u;
 const MODE_INIT_CLEAR: u32 = 1u;
@@ -133,41 +130,7 @@ fn value_dims() -> vec2<i32> {
     return vec2<i32>(textureDimensions(input_in));
 }
 
-fn region_ld(p: vec2<i32>) -> vec4<f32> {
-    if (mode_has(MODE_STAGING)) {
-        let q = p + vec2(0, STG_LAYER_PX);
-        return unpack4x8unorm(textureLoad(output, stg_local(q), stg_layer(q)).x);
-    }
-    return unpack4x8unorm(textureLoad(region_atlas, p, 0).x);
-}
-
-fn fx_region_serves(p: vec2<f32>) -> bool {
-    if (region_route.x == 0.0
-        || (p.x >= 0.0 && p.y >= 0.0
-            && p.x < f32(config.frame_width) && p.y < f32(config.frame_height))) {
-        return false;
-    }
-    let a = p * region_route.w + region_route.yz;
-    return a.x >= region_clamp.x && a.y >= region_clamp.y
-        && a.x <= region_clamp.z && a.y <= region_clamp.w;
-}
-
-fn fx_region_tap(p: vec2<f32>) -> vec4<f32> {
-    let a = clamp(p * region_route.w + region_route.yz, region_clamp.xy, region_clamp.zw);
-    let fl = floor(a);
-    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = a - fl;
-    let c00 = region_ld(i0);
-    let c10 = region_ld(i0 + vec2<i32>(1, 0));
-    let c01 = region_ld(i0 + vec2<i32>(0, 1));
-    let c11 = region_ld(i0 + vec2<i32>(1, 1));
-    return mix(mix(c00, c10, f.x), mix(c01, c11, f.x), f.y);
-}
-
 fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
-    if (fx_region_serves(pos)) {
-        return fx_region_tap(pos);
-    }
     let dmax = vec2<f32>(base_hi()) - vec2<f32>(1.0, 1.0);
     let cp = clamp(pos, vec2<f32>(base_lo()), dmax);
     let fl = floor(cp);
@@ -222,8 +185,6 @@ fn fx_bilin_input(pos: vec2<f32>, win: vec2<f32>, r: vec4<f32>, s: f32) -> vec4<
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-var<private> region_route: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
-var<private> region_clamp: vec4<f32> = vec4<f32>(0.0, 0.0, 0.0, 0.0);
 #endif
 
 var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
@@ -1267,8 +1228,6 @@ fn fx_run_mark(
         return;
     }
     let d = fx_load_desc(inline_base);
-    region_route = d.rec[10];
-    region_clamp = d.rec[11];
     if (d.bits == 0u) {
         if (fence_live) {
             fx_store_tile(xy, rgba);
@@ -1438,21 +1397,13 @@ fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
                     && sp.x < i32(config.frame_width) && sp.y < i32(config.frame_height);
             }
         }
-        if (shadow_edge && !inb && fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {
-            rawtap = fx_region_tap(vec2<f32>(f32(sp.x), f32(sp.y)));
-            inb = true;
-        }
         if (!shadow_edge && !inb) {
-            if (fx_region_serves(vec2<f32>(f32(sp.x), f32(sp.y)))) {
-                rawtap = fx_region_tap(vec2<f32>(f32(sp.x), f32(sp.y)));
-            } else {
-                let cl = clamp(
-                    sp,
-                    vec2<i32>(0, 0),
-                    vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
-                );
-                rawtap = base_ld(cl);
-            }
+            let cl = clamp(
+                sp,
+                vec2<i32>(0, 0),
+                vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
+            );
+            rawtap = base_ld(cl);
             inb = true;
         }
         let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
@@ -1499,10 +1450,6 @@ fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
         let pb = clamp(px + off, lens_c - lens_h, lens_c + lens_h);
-        if (fx_region_serves(pb)) {
-            sacc = sacc + fx_region_tap(pb);
-            continue;
-        }
         sacc = sacc + fx_bilin_input(clamp(pb, lo, hi), win, d.rec[1], fx_in_scale(d));
     }
     return sacc / 12.0;
