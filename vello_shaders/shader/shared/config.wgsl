@@ -75,8 +75,9 @@ struct Config {
     // no regions are rented, leaving every clamp byte-identical.
     frame_width: u32,
     frame_height: u32,
+    // The effects fine dispatch's mode word (fine.wgsl `MODE_*`); zero for a standard render.
+    fine_mode: u32,
     // Pad to a 16-byte multiple (WebGPU uniform requirement).
-    frame_pad0: u32,
     frame_pad1: u32,
 }
 

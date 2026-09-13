@@ -3,24 +3,6 @@ pathtag_scan
 + pathtag_scan_small: small
 fine
 + fine_area
-+ fine_area_load: load_base
-+ fine_area_load_draft: load_base have_draft region_reads
-+ fine_area_load_input: load_base have_input fx_value_reads region_reads
-+ fine_area_rw: rw_accum
-+ fine_area_u: acc_u32
-+ fine_area_draft: draft_clear
-+ fine_area_rwu: rw_accum acc_u32 load_base base_u32 region_reads
-+ fine_area_rwu_input: rw_accum acc_u32 load_base base_u32 have_input fx_value_reads region_reads
-+ fine_area_rwu_draft: rw_accum acc_u32 load_base base_u32 have_draft region_reads
-+ fine_area_loadu: load_base base_u32 region_reads
-+ fine_area_loadu_input: load_base base_u32 have_input fx_value_reads region_reads
-+ fine_area_loadu_draft: load_base base_u32 have_draft region_reads
-+ fine_area_stg: draft_clear acc_u32 staging_rw fx_value_reads
-+ fine_area_rwu_input_pk: rw_accum acc_u32 load_base base_u32 have_input input_u32 fx_value_reads region_reads
-+ fine_area_rwu_draft_pk: rw_accum acc_u32 load_base base_u32 have_draft input_u32 region_reads
-+ fine_area_stg_load: acc_u32 staging_rw load_base base_u32 fx_value_reads region_reads
-+ fine_area_stg_load_sdf: acc_u32 staging_rw load_base base_u32 have_input fx_value_reads region_reads
-+ fine_area_stg_chain: acc_u32 staging_rw load_base base_u32 stg_taps fx_value_reads region_reads
-+ fine_area_stg_chain_draft: acc_u32 staging_rw load_base base_u32 stg_taps have_draft fx_value_reads region_reads
++ fine_packed: packed
 + fine_msaa8: msaa msaa8
 + fine_msaa16: msaa msaa16

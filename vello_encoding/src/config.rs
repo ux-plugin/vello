@@ -193,8 +193,12 @@ pub struct ConfigUniform {
     /// bound against these instead. Defaults to `target_*` (no regions), keeping clamps identical.
     pub frame_width: u32,
     pub frame_height: u32,
+    /// The effects `fine` dispatch's mode word — how the tile register is seeded, which sampled slots
+    /// are bound, whether value/tap reads ride the store, how marks key their window. Read only by
+    /// the `packed` permutation; zero for a standard render.
+    pub fine_mode: u32,
     /// Pad to a 16-byte multiple (WebGPU uniform requirement).
-    pub frame_pad: [u32; 2],
+    pub frame_pad: u32,
 }
 
 /// CPU side setup and configuration.
@@ -246,7 +250,8 @@ impl RenderConfig {
                 sparse_n: 0,
                 frame_width: width,
                 frame_height: height,
-                frame_pad: [0; 2],
+                fine_mode: 0,
+                frame_pad: 0,
                 layout: *layout,
             },
             workgroup_counts,

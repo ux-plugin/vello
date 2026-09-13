@@ -595,60 +595,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Whole-viewport **phased** render into a caller-owned encoder: the whole scene's front-end runs
-    /// once, then one coarse+fine phase per `(draw_start, draw_end)` range in `phases`, all sharing the
-    /// one setup and landing in one recording. Phase 0 clears to `params.base_color`; each later phase
-    /// composites over the previous phase's output. The final phase writes `texture`.
-    ///
-    /// This is the single-`render_full` collapse of a gather frame: instead of one full pipeline setup
-    /// per gather z-phase, the geometry is set up once and each phase is a restricted coarse+fine pass.
-    /// The caller submits the encoder (as with [`Self::render_to_texture_into`]).
-    ///
-    /// `targets` supplies one texture per phase (same order as `phases`). Every phase output must be a
-    /// caller-owned texture — vello only allocates internal images as sampled textures, but a phase's
-    /// output is a fine storage-write target AND the next phase's `base_in` sampled input, so each needs
-    /// `STORAGE_BINDING | TEXTURE_BINDING`. The frame result is `targets[phases.len() - 1]`.
-    pub fn render_phased_into(
-        &mut self,
-        device: &Device,
-        queue: &Queue,
-        scene: &Scene,
-        targets: &[&TextureView],
-        params: &RenderParams,
-        phases: &[(u32, u32)],
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<()> {
-        assert_eq!(targets.len(), phases.len(), "render_phased_into needs one target per phase");
-        let (recording, out_images) = render::render_encoding_phased(
-            scene.encoding(),
-            &mut self.resolver,
-            &self.shaders,
-            &mut self.image_atlas,
-            params,
-            phases,
-        );
-        let external_resources: Vec<ExternalResource<'_>> = out_images
-            .iter()
-            .zip(targets.iter())
-            .map(|(img, view)| ExternalResource::Image(*img, view))
-            .collect();
-        self.engine.run_recording_into(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "render_phased_into",
-        )?;
-        Ok(())
-    }
-
     /// Begin a **persistent** phased render (see [`PhasedSession`]). Resolves the scene, allocates
     /// every shared buffer, and records the draw-range-independent geometry front-end into `encoder`.
-    /// Follow with one [`Self::phased_phase_into`] per phase — the caller may record its own GPU work
+    /// Follow with [`Self::phased_frontend_full_into`] and one [`Self::phased_fine_into`] per window — the caller may record its own GPU work
     /// (a gather's blur) into the same encoder between phases — then [`Self::phased_finish_into`].
     ///
     /// Unlike [`Self::render_phased_into`], which records every phase up front (so nothing can run
@@ -685,44 +634,8 @@ impl Renderer {
         Ok(session)
     }
 
-    /// Record and run ONE phase (draw range `[draw_start, draw_end)`) into `encoder`. `base` — the
-    /// previous phase's output, possibly after the caller's own effect passes — is loaded and
-    /// composited over; `None` clears to the base color (phase 0). The phase writes `out`. Both `base`
-    /// and `out` are caller-owned textures needing `STORAGE_BINDING | TEXTURE_BINDING`.
-    pub fn phased_phase_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        draw_start: u32,
-        draw_end: u32,
-        base: Option<&TextureView>,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let base_image = base.map(|_| session.new_out_image());
-        let recording = render::record_phase(session, &self.shaders, draw_start, draw_end, base_image, out_image);
-        let mut external_resources = vec![ExternalResource::Image(out_image, out)];
-        if let (Some(img), Some(view)) = (base_image, base) {
-            external_resources.push(ExternalResource::Image(img, view));
-        }
-        self.engine.run_recording_into(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_phase_into",
-        )?;
-        Ok(())
-    }
-
     /// Record the whole scene's front-end + tiling + coarse ONCE (front-end-once), building the shared
-    /// PTCL that [`Self::phased_fine_segment_into`] then walks per segment. Call once, after
+    /// PTCL that [`Self::phased_fine_into`] then walks per window. Call once, after
     /// [`Self::phased_begin_into`] and before the first segment. Records into `encoder` (no submit).
     pub fn phased_frontend_full_into(
         &mut self,
@@ -746,12 +659,14 @@ impl Renderer {
         Ok(())
     }
 
-    /// Dispatch `fine` for ONE segment (`seg_target`) of the shared PTCL into `encoder`, writing `out`.
-    /// `base` (`Some`) is the previous segment's output — after the caller's effect passes — loaded and
-    /// composited over; `None` clears to the base color (segment 0). Both `base` and `out` are
-    /// caller-owned `STORAGE_BINDING | TEXTURE_BINDING` textures. Valid between a
-    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`] pair, after [`Self::phased_frontend_full_into`].
-    pub fn phased_fine_segment_into(
+    /// Dispatch the effects `fine` for one window `[seg_lo, seg_target)` of the shared PTCL into
+    /// `encoder`, writing the packed store `out` in place. `mode` is the dispatch's mode word (see
+    /// `render::record_fine_packed`); `base`/`input` are the r32uint sampled slots the mode names,
+    /// `region` the lease atlas — pass the caller's dummy for an unbound slot. Valid between a
+    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`] pair, after
+    /// [`Self::phased_frontend_full_into`].
+    #[expect(clippy::too_many_arguments, reason = "one dispatch, one binding set")]
+    pub fn phased_fine_into(
         &mut self,
         session: &mut render::PhasedSession,
         device: &Device,
@@ -759,96 +674,27 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         seg_lo: u32,
         seg_target: u32,
-        base: Option<&TextureView>,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let base_image = base.map(|_| session.new_out_image());
-        let recording = render::record_fine_segment(session, &self.shaders, seg_lo, seg_target, base_image, out_image);
-        let mut external_resources = vec![ExternalResource::Image(out_image, out)];
-        if let (Some(img), Some(view)) = (base_image, base) {
-            external_resources.push(ExternalResource::Image(img, view));
-        }
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch the `fine_area_load_draft` permutation for one window `[seg_lo, seg_target)`: like
-    /// [`Self::phased_fine_segment_into`] with a base, plus a second sampled input `draft` at binding
-    /// 10 — a separable blur's V pass, which reads its blur taps from `draft` (its H pass's unmasked
-    /// result) and its margin from `base` (the original backdrop).
-    pub fn phased_fine_segment_draft_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        base: &TextureView,
-        draft: &TextureView,
-        region: &TextureView,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let base_image = session.new_out_image();
-        let draft_image = session.new_out_image();
-        let region_image = session.new_out_image();
-        let recording =
-            render::record_fine_segment_draft(session, &self.shaders, seg_lo, seg_target, base_image, draft_image, region_image, out_image);
-        let external_resources = [
-            ExternalResource::Image(out_image, out),
-            ExternalResource::Image(base_image, base),
-            ExternalResource::Image(draft_image, draft),
-            ExternalResource::Image(region_image, region),
-        ];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_draft_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch the `fine_area_load_input` permutation for one window `[seg_lo, seg_target)`: like
-    /// [`Self::phased_fine_segment_draft_into`] but binding 10 is the chained gather's PRIMARY input
-    /// `input` (the previous link's materialised surface) rather than a blur draft. `base` still holds
-    /// the original backdrop.
-    pub fn phased_fine_segment_input_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
+        mode: u32,
         base: &TextureView,
         input: &TextureView,
         region: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let base_image = session.new_out_image();
-        let input_image = session.new_out_image();
-        let region_image = session.new_out_image();
-        let recording =
-            render::record_fine_segment_input(session, &self.shaders, seg_lo, seg_target, base_image, input_image, region_image, out_image);
+        let out_image = session.new_packed_image();
+        let base_image = session.new_packed_image();
+        let input_image = session.new_packed_image();
+        let region_image = session.new_packed_image();
+        let recording = render::record_fine_packed(
+            session,
+            &self.shaders,
+            seg_lo,
+            seg_target,
+            mode,
+            base_image,
+            input_image,
+            region_image,
+            out_image,
+        );
         let external_resources = [
             ExternalResource::Image(out_image, out),
             ExternalResource::Image(base_image, base),
@@ -864,219 +710,7 @@ impl Renderer {
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
             #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_input_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch the READ-WRITE fine permutation for one tile-round window `[seg_lo, seg_target)`:
-    /// the accumulator `target` is updated IN PLACE through one rgba8unorm read-write storage
-    /// binding — no base texture, no ping-pong — and a tile with no work in the window returns
-    /// before touching a pixel. The caller clears `target` before the first window (this mode never
-    /// clears) and must run only on a device with rgba8unorm read-write storage. `target` needs
-    /// `STORAGE_BINDING`; the same texture can carry `RENDER_ATTACHMENT | TEXTURE_BINDING` for the
-    /// effect stamps and crops between windows. Valid between
-    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`], after [`Self::phased_frontend_full_into`].
-    pub fn phased_fine_segment_rw_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        target: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let recording = render::record_fine_segment_rw(session, &self.shaders, seg_lo, seg_target, out_image);
-        let external_resources = [ExternalResource::Image(out_image, target)];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_rw_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch the SEED window over the packed accumulator (`fine_area_u`): clears to the base
-    /// color and writes the r32uint `target` (STORAGE_BINDING). See
-    /// [`Self::phased_fine_segment_rwu_into`] for the in-place windows that follow.
-    pub fn phased_fine_segment_seed_u_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        target: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_packed_image();
-        let recording = render::record_fine_segment_seed_u(session, &self.shaders, seg_lo, seg_target, out_image);
-        let external_resources = [ExternalResource::Image(out_image, target)];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_seed_u_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch a RASTERIZE window (`fine_area_draft`): transparent init, the window's fenced
-    /// draws paint the rgba8 draft `out`.
-    pub fn phased_fine_segment_draftonly_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let recording = render::record_fine_segment_draftonly(session, &self.shaders, seg_lo, seg_target, out_image);
-        let external_resources = [ExternalResource::Image(out_image, out)];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_draftonly_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch a RASTERIZE window into the packed staging store (`fine_area_stg`).
-    pub fn phased_fine_segment_stg_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_packed_image();
-        let recording = render::record_fine_segment_stg(session, &self.shaders, seg_lo, seg_target, out_image);
-        let external_resources = [ExternalResource::Image(out_image, out)];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_stg_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch a backdrop MATERIALIZE window into the packed staging store (`fine_area_stg_load*`):
-    /// `base` is the packed accumulator read directly, `sdf` an optional sampled field texture.
-    pub fn phased_fine_segment_stg_load_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        base: &TextureView,
-        sdf: Option<&TextureView>,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_packed_image();
-        let base_img = session.new_packed_image();
-        let sdf_img = sdf.map(|_| session.new_out_image());
-        let recording = render::record_fine_segment_stg_load(
-            session,
-            &self.shaders,
-            seg_lo,
-            seg_target,
-            base_img,
-            sdf_img,
-            out_image,
-        );
-        let mut external_resources = vec![
-            ExternalResource::Image(out_image, out),
-            ExternalResource::Image(base_img, base),
-        ];
-        if let (Some(img), Some(view)) = (sdf_img, sdf) {
-            external_resources.push(ExternalResource::Image(img, view));
-        }
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_stg_load_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch a CHAIN materialize window (`fine_area_stg_chain*`): taps and value ride the
-    /// packed staging store; `base` is the packed accumulator, read-only.
-    pub fn phased_fine_segment_stg_chain_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        is_draft: bool,
-        base: &TextureView,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_packed_image();
-        let base_img = session.new_packed_image();
-        let recording = render::record_fine_segment_stg_chain(
-            session,
-            &self.shaders,
-            seg_lo,
-            seg_target,
-            is_draft,
-            base_img,
-            out_image,
-        );
-        let external_resources = [
-            ExternalResource::Image(out_image, out),
-            ExternalResource::Image(base_img, base),
-        ];
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_stg_chain_into",
+            "phased_fine_into",
         )?;
         Ok(())
     }
@@ -1111,114 +745,6 @@ impl Renderer {
             #[cfg(feature = "wgpu-profiler")]
             "phased_snap_copy_into",
         )
-    }
-
-    /// Dispatch an in-place COMPOSITE window over the packed accumulator (`fine_area_rwu*`):
-    /// `target` (r32uint, STORAGE_BINDING) is read-modified-written per own pixel; `snap` (r32uint,
-    /// TEXTURE_BINDING) is the round's backdrop snapshot; `slot10` is `Some((is_draft, packed, view))`
-    /// for a chained input or blur draft at binding 10 — `packed` selects the r32uint (`_pk`)
-    /// permutations.
-    pub fn phased_fine_segment_rwu_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        snap: &TextureView,
-        slot10: Option<(bool, bool, &TextureView)>,
-        region: &TextureView,
-        target: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_packed_image();
-        let snap_image = session.new_packed_image();
-        let slot_image = slot10.map(|(d, pk, _)| {
-            (d, pk, if pk { session.new_packed_image() } else { session.new_out_image() })
-        });
-        let region_image = session.new_out_image();
-        let recording = render::record_fine_segment_rwu(
-            session,
-            &self.shaders,
-            seg_lo,
-            seg_target,
-            snap_image,
-            slot_image,
-            region_image,
-            out_image,
-        );
-        let mut external_resources = vec![
-            ExternalResource::Image(out_image, target),
-            ExternalResource::Image(snap_image, snap),
-            ExternalResource::Image(region_image, region),
-        ];
-        if let (Some((_, _, img)), Some((_, _, view))) = (slot_image, slot10) {
-            external_resources.push(ExternalResource::Image(img, view));
-        }
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_rwu_into",
-        )?;
-        Ok(())
-    }
-
-    /// Dispatch a MATERIALIZE window whose backdrop is the packed snapshot (`fine_area_loadu*`):
-    /// `out` is the rgba8 draft, `snap` the r32uint snapshot, `slot10` as in
-    /// [`Self::phased_fine_segment_rwu_into`].
-    pub fn phased_fine_segment_loadu_into(
-        &mut self,
-        session: &mut render::PhasedSession,
-        device: &Device,
-        queue: &Queue,
-        encoder: &mut wgpu::CommandEncoder,
-        seg_lo: u32,
-        seg_target: u32,
-        snap: &TextureView,
-        slot10: Option<(bool, &TextureView)>,
-        region: &TextureView,
-        out: &TextureView,
-    ) -> Result<()> {
-        let out_image = session.new_out_image();
-        let snap_image = session.new_packed_image();
-        let slot_image = slot10.map(|(d, _)| (d, session.new_out_image()));
-        let region_image = session.new_out_image();
-        let recording = render::record_fine_segment_loadu(
-            session,
-            &self.shaders,
-            seg_lo,
-            seg_target,
-            snap_image,
-            slot_image,
-            region_image,
-            out_image,
-        );
-        let mut external_resources = vec![
-            ExternalResource::Image(out_image, out),
-            ExternalResource::Image(snap_image, snap),
-            ExternalResource::Image(region_image, region),
-        ];
-        if let (Some((_, img)), Some((_, view))) = (slot_image, slot10) {
-            external_resources.push(ExternalResource::Image(img, view));
-        }
-        self.engine.run_recording_into_deferred(
-            device,
-            queue,
-            &recording,
-            &external_resources,
-            encoder,
-            #[cfg(feature = "wgpu-profiler")]
-            &mut self.profiler,
-            #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_segment_loadu_into",
-        )?;
-        Ok(())
     }
 
     /// DEBUG: raw engine buffer read by resource id (diagnostics only).
