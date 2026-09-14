@@ -61,136 +61,126 @@ var image_atlas: texture_2d<f32>;
 var<storage> effect_params: array<f32>;
 
 #ifdef packed
-@group(0) @binding(9)
-var base_in: texture_2d<u32>;
+const SRC_NONE: f32 = 0.0;
+const SRC_STORE: f32 = 1.0;
+const SRC_REGS: f32 = 2.0;
+const SRC_AREA: f32 = 3.0;
+const SPARSE_ROW: u32 = 65535u;
 
-@group(0) @binding(10)
-var input_in: texture_2d<u32>;
-
-const MODE_INIT_MASK: u32 = 3u;
-const MODE_INIT_COLOUR: u32 = 0u;
-const MODE_INIT_CLEAR: u32 = 1u;
-const MODE_INIT_BASE: u32 = 2u;
-const MODE_INIT_OUTPUT: u32 = 3u;
-const MODE_BASE: u32 = 4u;
-const MODE_INPUT: u32 = 8u;
-const MODE_STAGING: u32 = 16u;
-const MODE_STG_TAPS: u32 = 32u;
-const MODE_KEYS_ROUND: u32 = 64u;
-const MODE_KEEP_COV: u32 = 128u;
-const MODE_VALUE_READS: u32 = 256u;
-const MODE_BASE_STORE: u32 = 512u;
-
-fn mode_has(bit: u32) -> bool {
-    return (config.fine_mode & bit) != 0u;
+struct FxDesc {
+    bits: u32,
+    program: u32,
+    u: array<vec4<f32>, 6>,
+    rec: array<vec4<f32>, 12>,
 }
 
-fn stg_ld(p: vec2<i32>) -> vec4<f32> {
-    return unpack4x8unorm(textureLoad(output, stg_local(p), stg_layer(p)).x);
+/// One operand record: `[source, x0, y0, x1]` then `[y1, dx, dy, decode]`. `lo..hi` is a store
+/// rect whose rows carry the page offset; `shift` displaces the read in frame space.
+struct Rec {
+    source: f32,
+    lo: vec2<i32>,
+    hi: vec2<i32>,
+    shift: vec2<f32>,
+    decode: f32,
 }
 
-fn base_ld(p: vec2<i32>) -> vec4<f32> {
-    if (mode_has(MODE_BASE_STORE)) {
-        let q = p - vec2<i32>(i32(config.base_org_x), i32(config.base_org_y))
-            + vec2<i32>(i32(config.base_at_x), i32(config.base_at_y));
-        return stg_ld(q);
+fn rec_of(d: FxDesc, k: u32) -> Rec {
+    let a = d.rec[2u * k];
+    let b = d.rec[2u * k + 1u];
+    var r: Rec;
+    r.source = a.x;
+    r.lo = vec2<i32>(i32(a.y), i32(a.z));
+    r.hi = vec2<i32>(i32(a.w), i32(b.x));
+    r.shift = b.yz;
+    r.decode = b.w;
+    return r;
+}
+
+/// The first row of the page holding store row `y`; `config.frame_height` is the page pitch.
+fn page_rows(y: i32) -> i32 {
+    return (y / i32(config.frame_height)) * i32(config.frame_height);
+}
+
+/// The frame position of store pixel `p` for an arm writing record 4's rect.
+fn fx_frame_pos(d: FxDesc, p: vec2<f32>) -> vec2<f32> {
+    let out = rec_of(d, 4u);
+    return vec2<f32>(p.x, p.y - f32(page_rows(out.lo.y)));
+}
+
+/// Frame position `fp` on record `r`'s page, displaced by the record's shift.
+fn rec_pos(r: Rec, fp: vec2<f32>) -> vec2<f32> {
+    return fp - r.shift + vec2<f32>(0.0, f32(page_rows(r.lo.y)));
+}
+
+fn rec_ipos(r: Rec, fp: vec2<f32>) -> vec2<i32> {
+    let q = rec_pos(r, fp);
+    return vec2<i32>(i32(floor(q.x)), i32(floor(q.y)));
+}
+
+fn st_ld(q: vec2<i32>) -> vec4<f32> {
+    return unpack4x8unorm(textureLoad(output, stg_local(q), stg_layer(q)).x);
+}
+
+fn st_ld_f32(q: vec2<i32>) -> f32 {
+    return bitcast<f32>(textureLoad(output, stg_local(q), stg_layer(q)).x);
+}
+
+/// Nearest read of `r` at store pixel `q`; a pixel outside the rect reads its clamped edge, or
+/// zero when `transparent`.
+fn rec_ld(r: Rec, q: vec2<i32>, transparent: bool) -> vec4<f32> {
+    let c = clamp(q, r.lo, r.hi - vec2<i32>(1, 1));
+    if (transparent && any(c != q)) {
+        return vec4<f32>(0.0, 0.0, 0.0, 0.0);
     }
-    return unpack4x8unorm(textureLoad(base_in, p, 0).x);
+    return st_ld(c);
 }
 
-fn base_lo() -> vec2<i32> {
-    if (mode_has(MODE_BASE_STORE)) {
-        return vec2<i32>(i32(config.base_org_x), i32(config.base_org_y));
-    }
-    return vec2<i32>(0, 0);
-}
-
-fn base_hi() -> vec2<i32> {
-    if (mode_has(MODE_BASE_STORE)) {
-        return vec2<i32>(i32(config.base_org_x + config.base_ext_x), i32(config.base_org_y + config.base_ext_y));
-    }
-    return vec2<i32>(textureDimensions(base_in));
-}
-
-fn input_ld(p: vec2<i32>) -> vec4<f32> {
-    return unpack4x8unorm(textureLoad(input_in, p, 0).x);
-}
-
-fn value_ld(p: vec2<i32>) -> vec4<f32> {
-    if (mode_has(MODE_STAGING)) {
-        return stg_ld(p);
-    }
-    return input_ld(p);
-}
-
-fn value_dims() -> vec2<i32> {
-    if (mode_has(MODE_STAGING)) {
-        return vec2<i32>(textureDimensions(output));
-    }
-    return vec2<i32>(textureDimensions(input_in));
-}
-
-fn fx_bilin(pos: vec2<f32>) -> vec4<f32> {
-    let dmax = vec2<f32>(base_hi()) - vec2<f32>(1.0, 1.0);
-    let cp = clamp(pos, vec2<f32>(base_lo()), dmax);
+/// Bilinear read of `r` at continuous store position `q`; taps outside the rect read its clamped
+/// edge, or zero when `transparent`.
+fn rec_bilin(r: Rec, q: vec2<f32>, transparent: bool) -> vec4<f32> {
+    let ihi = r.hi - vec2<i32>(1, 1);
+    let cp = select(clamp(q, vec2<f32>(r.lo), vec2<f32>(ihi)), q, transparent);
     let fl = floor(cp);
     let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
     let f = cp - fl;
-    let s00 = base_ld(i0);
-    let s10 = base_ld(min(i0 + vec2<i32>(1, 0), vec2<i32>(dmax)));
-    let s01 = base_ld(min(i0 + vec2<i32>(0, 1), vec2<i32>(dmax)));
-    let s11 = base_ld(min(i0 + vec2<i32>(1, 1), vec2<i32>(dmax)));
+    let s00 = rec_ld(r, i0, transparent);
+    let s10 = rec_ld(r, i0 + vec2<i32>(1, 0), transparent);
+    let s01 = rec_ld(r, i0 + vec2<i32>(0, 1), transparent);
+    let s11 = rec_ld(r, i0 + vec2<i32>(1, 1), transparent);
     return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
 }
 
-fn fx_warp_sample(px: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32) -> vec4<f32> {
-    let bp = px + disp;
+/// The sampled distance of record 3 at frame position `fc`: f32 bits, bilinear, decoded.
+fn fx_sdf_at(d: FxDesc, fc: vec2<f32>) -> f32 {
+    let r = rec_of(d, 3u);
+    let q = rec_pos(r, fc - vec2<f32>(0.5, 0.5));
+    let ihi = r.hi - vec2<i32>(1, 1);
+    let cp = clamp(q, vec2<f32>(r.lo), vec2<f32>(ihi));
+    let fl = floor(cp);
+    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
+    let f = cp - fl;
+    let s00 = st_ld_f32(i0);
+    let s10 = st_ld_f32(min(i0 + vec2<i32>(1, 0), ihi));
+    let s01 = st_ld_f32(min(i0 + vec2<i32>(0, 1), ihi));
+    let s11 = st_ld_f32(min(i0 + vec2<i32>(1, 1), ihi));
+    let texel = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
+    return (texel - 0.5) * r.decode;
+}
+
+fn fx_warp_sample(v: Rec, fp: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amount: f32, transparent: bool) -> vec4<f32> {
+    let bp = fp + disp;
     let dlen = length(disp);
     let castr = smoothstep(0.0, 5.0 * ca_scale, dlen);
     var cadir = vec2<f32>(0.0, 0.0);
     if (dlen > 0.01 * ca_scale) { cadir = disp / dlen; }
     let cashift = cadir * ca_amount * castr;
-    let cr = fx_bilin(bp - cashift);
-    let cg = fx_bilin(bp);
-    let cb = fx_bilin(bp + cashift);
+    let cr = rec_bilin(v, rec_pos(v, bp - cashift), transparent);
+    let cg = rec_bilin(v, rec_pos(v, bp), transparent);
+    let cb = rec_bilin(v, rec_pos(v, bp + cashift), transparent);
     return vec4<f32>(cr.r, cg.g, cb.b, cg.a);
 }
-
-fn fx_in_scale(d: FxDesc) -> f32 {
-    return select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
-}
-
-fn fx_orig_scale(d: FxDesc) -> f32 {
-    return select(1.0, d.rec[9].z, d.rec[9].z > 0.0);
-}
-
-fn fx_bilin_input(pos: vec2<f32>, win: vec2<f32>, r: vec4<f32>, s: f32) -> vec4<f32> {
-    let p = pos * s - win - vec2<f32>(f32(config.scratch_in_x), f32(config.scratch_in_y));
-    let dmax = vec2<f32>(value_dims()) - vec2<f32>(1.0, 1.0);
-    var lo = vec2<f32>(0.0, 0.0);
-    var hi = dmax;
-    if (r.z > r.x) {
-        lo = max(lo, r.xy);
-        hi = min(hi, r.zw - vec2<f32>(1.0, 1.0));
-    }
-    let cp = clamp(p, lo, hi);
-    let fl = floor(cp);
-    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = cp - fl;
-    let ihi = vec2<i32>(i32(hi.x), i32(hi.y));
-    let s00 = value_ld(i0);
-    let s10 = value_ld(min(i0 + vec2<i32>(1, 0), ihi));
-    let s01 = value_ld(min(i0 + vec2<i32>(0, 1), ihi));
-    let s11 = value_ld(min(i0 + vec2<i32>(1, 1), ihi));
-    return mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
-}
-
 #endif
 
-var<private> active_scratch_out: vec2<i32> = vec2<i32>(0, 0);
-var<private> active_out_scale: f32 = 1.0;
-
-var<private> fence_live: bool = false;
 var<private> win_lo: u32 = 0u;
 var<private> win_hi: u32 = 0u;
 
@@ -1108,28 +1098,16 @@ fn _fbm(p: vec2<f32>, seed: f32) -> f32 {
 fn fractalNoise(p: vec2<f32>) -> vec4<f32> {
     return vec4<f32>(_fbm(p, 0.0), _fbm(p, 37.0), _fbm(p, 71.0), _fbm(p, 113.0));
 }
-fn fx_fieldDistance_sampled(fc: vec2<f32>, decode: f32) -> f32 {
-    let fp = fc - vec2<f32>(0.5, 0.5);
-    let fl = floor(fp);
-    let i0 = vec2<i32>(i32(fl.x), i32(fl.y));
-    let f = fp - fl;
-    let s00 = bitcast<f32>(textureLoad(input_in, i0, 0).x);
-    let s10 = bitcast<f32>(textureLoad(input_in, i0 + vec2<i32>(1, 0), 0).x);
-    let s01 = bitcast<f32>(textureLoad(input_in, i0 + vec2<i32>(0, 1), 0).x);
-    let s11 = bitcast<f32>(textureLoad(input_in, i0 + vec2<i32>(1, 1), 0).x);
-    let texel = mix(mix(s00, s10, f.x), mix(s01, s11, f.x), f.y);
-    return (texel - 0.5) * decode;
-}
 
 fn fx_fieldDistance_lens(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
     return fx_sdfRoundedBox(p, u[1].xy, min(u[1].z, min(u[1].xy.x, u[1].xy.y)));
 }
-fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
+fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, sampled_d: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
     var n0 = fx_fieldDistance_lens(u, localPos);
     if (sampled) {
-        n0 = fx_fieldDistance_sampled(fc, decode);
+        n0 = sampled_d;
     }
     if (n0 > 0.0) { return vec4<f32>(0.0, 0.0, 0.0, 0.0); }
     let n1 = fx_ramp(n0, min(u[2].x, min(u[1].xy.x, u[1].xy.y)));
@@ -1151,7 +1129,7 @@ fn fx_computeField_lens(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>
     let specular = fx_specular(edgeT, bezel, u[2].w, dir, scale);
     return vec4<f32>(dpx.x, dpx.y, specular, mask);
 }
-fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
+fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, sampled_d: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
     let n0 = fractalNoise(localPos / max(u[0].w, 1.0));
@@ -1163,12 +1141,12 @@ fn fx_computeField_texture(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f
 fn fx_fieldDistance_radial(u: array<vec4<f32>, 6>, p: vec2<f32>) -> f32 {
     return length(p) - max(u[1].x, 1.0);
 }
-fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, decode: f32) -> vec4<f32> {
+fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f32>, sampled: bool, sampled_d: f32) -> vec4<f32> {
     let scale = u[4].x;
     let localPos = fc - anchor;
     var n0 = fx_fieldDistance_radial(u, localPos);
     if (sampled) {
-        n0 = fx_fieldDistance_sampled(fc, decode);
+        n0 = sampled_d;
     }
     let n1 = fx_ramp(n0, u[1].x);
     let specular = n1;
@@ -1176,11 +1154,12 @@ fn fx_computeField_radial(u: array<vec4<f32>, 6>, fc: vec2<f32>, anchor: vec2<f3
     return vec4<f32>(vec2<f32>(0.0).x, vec2<f32>(0.0).y, specular, mask);
 }
 fn fx_computeField(d: FxDesc, fc: vec2<f32>) -> vec4<f32> {
-    let anchor = d.rec[6].yz;
-    let sampled = d.rec[6].x == 2.0 && mode_has(MODE_INPUT);
-    if (d.program == 1u) { return fx_computeField_lens(d.u, fc, anchor, sampled, d.rec[6].w); }
-    if (d.program == 2u) { return fx_computeField_texture(d.u, fc, anchor, sampled, d.rec[6].w); }
-    if (d.program == 3u) { return fx_computeField_radial(d.u, fc, anchor, sampled, d.rec[6].w); }
+    let anchor = d.rec[10].xy;
+    let sampled = d.rec[6].x == SRC_STORE;
+    let sampled_d = select(0.0, fx_sdf_at(d, fc), sampled);
+    if (d.program == 1u) { return fx_computeField_lens(d.u, fc, anchor, sampled, sampled_d); }
+    if (d.program == 2u) { return fx_computeField_texture(d.u, fc, anchor, sampled, sampled_d); }
+    if (d.program == 3u) { return fx_computeField_radial(d.u, fc, anchor, sampled, sampled_d); }
     return vec4<f32>(0.0, 0.0, 0.0, 1.0);
 }
 // ==== END GENERATED: field programs ====
@@ -1211,85 +1190,6 @@ fn fx_applyPointwise(bits: u32, shade: bool, maskmix: bool, value0: vec4<f32>, o
     return value;
 }
 
-fn fx_run_mark(
-    cmd_ix: u32,
-    seg_current: u32,
-    xy: vec2<f32>,
-    rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>,
-    chain: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>,
-    area: ptr<function, array<f32, PIXELS_PER_THREAD>>,
-) {
-    let round = ptcl[cmd_ix + 3u];
-    let effect_id = ptcl[cmd_ix + 1u];
-    let inline_base = ptcl[cmd_ix + 4u];
-    let inline_key = select(seg_current, round, fx_keys_on_round(inline_base));
-    if effect_id < EFFECT_INLINE_BASE || inline_key < win_lo
-        || (win_hi != SEG_ALL && inline_key >= win_hi) {
-        return;
-    }
-    let d = fx_load_desc(inline_base);
-    if (d.bits == 0u) {
-        if (fence_live) {
-            fx_store_tile(xy, rgba);
-            for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                (*rgba)[i] = vec4(0.0);
-            }
-        }
-        if (d.rec[8].x != 0.0) {
-            active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
-            active_out_scale = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
-        } else {
-            active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
-            active_out_scale = 1.0;
-        }
-        fence_live = true;
-        return;
-    }
-    let atomic_ctl = ptcl[cmd_ix + 5u];
-    if (d.rec[8].x != 0.0) {
-        if (d.rec[8].w != 0.0 && fence_live) {
-            fx_store_tile(xy, rgba);
-            for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-                if (mode_has(MODE_BASE)) {
-                    (*rgba)[i] = base_ld(vec2<i32>(i32(xy.x) + i32(i), i32(xy.y)));
-                } else {
-                    (*rgba)[i] = vec4(0.0);
-                }
-            }
-        }
-        active_scratch_out = vec2<i32>(i32(d.rec[8].y), i32(d.rec[8].z));
-        active_out_scale = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
-        if (d.rec[8].w != 0.0) {
-            fence_live = true;
-        }
-    }
-    if (atomic_ctl & 1u) != 0u {
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            let px = xy + vec2<f32>(f32(i), 0.0);
-            (*chain)[i] = fx_atomic_value(d, atomic_ctl, px, (*chain)[i]);
-            if (atomic_ctl & 2u) != 0u {
-                (*rgba)[i] = mix((*rgba)[i], (*chain)[i], (*area)[i]);
-            }
-        }
-    } else {
-        let fs = select(1.0, d.rec[9].x, d.rec[9].x > 0.0);
-        let fstride = i32(1.0 / fs + 0.5);
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            let px = xy + vec2<f32>(f32(i), 0.0);
-            if (fs < 1.0 && ((i32(px.x) % fstride) != 0 || (i32(px.y) % fstride) != 0)) {
-                continue;
-            }
-            (*rgba)[i] = fx_fused_value(d, px, (*rgba)[i], (*area)[i]);
-        }
-    }
-}
-
-struct FxDesc {
-    bits: u32,
-    program: u32,
-    u: array<vec4<f32>, 6>,
-    rec: array<vec4<f32>, 12>,
-}
 fn fx_load_desc(base: u32) -> FxDesc {
     var d: FxDesc;
     d.bits = u32(effect_params[base]);
@@ -1304,228 +1204,125 @@ fn fx_load_desc(base: u32) -> FxDesc {
     }
     return d;
 }
-fn fx_keys_on_round(base: u32) -> bool {
-    if (mode_has(MODE_KEYS_ROUND)) {
-        return true;
-    }
-    let b = u32(effect_params[base]);
-    if b == 0u || (b & (96u | 128u | 16384u)) != 0u {
-        return true;
-    }
-    return effect_params[base + 58u] != 0.0;
+
+fn fx_in_window(round: u32) -> bool {
+    return round >= win_lo && (win_hi == SEG_ALL || round < win_hi);
 }
-fn fx_atomic_value(d: FxDesc, ctl: u32, px: vec2<f32>, prev: vec4<f32>) -> vec4<f32> {
-    let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
-    var v = prev;
-    if (mode_has(MODE_VALUE_READS) && (ctl & 4u) != 0u) {
-        v = fx_bilin_input(px, d.rec[0].yz, d.rec[1], fx_in_scale(d));
-    }
-    if (mode_has(MODE_BASE)) {
-        if (d.bits & 32u) != 0u {
-            v = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
-        } else {
-            let orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
-            v = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, v, orig, fld, d.u);
-        }
-    } else {
-        v = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, v, vec4<f32>(0.0), fld, d.u);
-    }
-    return v;
-}
-fn fx_blur_value(d: FxDesc, ipx: vec2<i32>) -> vec4<f32> {
+
+/// One separable Gaussian axis over the value record at frame position `fp`.
+fn fx_blur_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
     let u = d.u;
-    let bits = d.bits;
     let sigma = max(u[0].z, 0.5);
     let stride = max(i32(u[0].w), 1);
-    let tap_s = select(1.0, d.rec[9].y, d.rec[9].y > 0.0);
-    let sigma_s = max(sigma * tap_s, 0.5);
-    var radius = i32(ceil(3.0 * sigma_s));
+    var radius = i32(ceil(3.0 * sigma));
     radius = radius - (radius % stride);
-    let axis = vec2<i32>(i32(u[0].x), i32(u[0].y));
-    let inv2s2 = 1.0 / (2.0 * sigma_s * sigma_s);
+    let axis = vec2<f32>(u[0].x, u[0].y);
+    let inv2s2 = 1.0 / (2.0 * sigma * sigma);
     let srgb_blur = u[2].z != 0.0;
-    let shadow_edge = u[2].w != 0.0;
-    let bgraw = unpack4x8unorm(config.base_color);
-    let bg = select(
-        select(fx_premul_srgb_to_lin(bgraw), bgraw, srgb_blur),
-        vec4<f32>(0.0, 0.0, 0.0, 0.0),
-        shadow_edge,
-    );
+    let transparent = u[2].w != 0.0;
     var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     var wsum = 0.0;
-    let scratch_in_i = vec2<i32>(i32(d.rec[0].y), i32(d.rec[0].z));
-    let base_l = vec2<i32>(floor(vec2<f32>(ipx) * tap_s));
-    let blo = u32(d.rec[0].w);
-    let bhi = u32(d.rec[2].w);
-    let dev_lo = vec2<i32>(i32((blo >> 10u) & 1023u) * 16, i32(blo & 1023u) * 16);
-    let dev_hi = min(
-        vec2<i32>(i32((bhi >> 10u) & 1023u) * 16, i32(bhi & 1023u) * 16),
-        vec2<i32>(i32(config.frame_width), i32(config.frame_height)),
-    );
     for (var tt = -radius; tt <= radius; tt = tt + stride) {
         let w = exp(-f32(tt * tt) * inv2s2);
-        let sp = ipx + axis * i32(round(f32(tt) / tap_s));
-        var tc = sp;
-        var dims = base_hi();
-        var tlo = base_lo();
-        var rawtap: vec4<f32>;
-        if (mode_has(MODE_STG_TAPS)) {
-            tc = base_l + axis * tt - scratch_in_i;
-            dims = vec2<i32>(textureDimensions(output));
-            if (d.rec[1].z > d.rec[1].x) {
-                dims = vec2<i32>(i32(d.rec[1].z), i32(d.rec[1].w));
-                tlo = vec2<i32>(i32(d.rec[1].x), i32(d.rec[1].y));
-            }
-            rawtap = stg_ld(tc);
-        } else if (mode_has(MODE_INPUT)) {
-            tc = base_l + axis * tt - scratch_in_i;
-            dims = vec2<i32>(textureDimensions(input_in));
-            rawtap = input_ld(tc);
-        } else {
-            rawtap = base_ld(tc);
-        }
-        var inb = tc.x >= tlo.x && tc.y >= tlo.y && tc.x < dims.x && tc.y < dims.y;
-        if (bhi != 0u) {
-            let in_rect = sp.x >= dev_lo.x && sp.y >= dev_lo.y && sp.x < dev_hi.x && sp.y < dev_hi.y;
-            if (shadow_edge) {
-                inb = in_rect;
-            } else {
-                if (!in_rect) {
-                    rawtap = base_ld(sp);
-                }
-                inb = sp.x >= 0 && sp.y >= 0
-                    && sp.x < i32(config.frame_width) && sp.y < i32(config.frame_height);
-            }
-        }
-        if (!shadow_edge && !inb) {
-            let cl = clamp(
-                sp,
-                vec2<i32>(0, 0),
-                vec2<i32>(i32(config.frame_width) - 1, i32(config.frame_height) - 1),
-            );
-            rawtap = base_ld(cl);
-            inb = true;
-        }
-        let tapc = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
-        let tap = select(bg, tapc, inb);
+        let rawtap = rec_ld(v, rec_ipos(v, fp + axis * f32(tt)), transparent);
+        let tap = select(fx_premul_srgb_to_lin(rawtap), rawtap, srgb_blur);
         acc = acc + w * tap;
         wsum = wsum + w;
     }
     return select(fx_premul_lin_to_srgb(acc / wsum), acc / wsum, srgb_blur);
 }
-fn fx_flood_value(u: array<vec4<f32>, 6>, px: vec2<f32>, punch_a: f32) -> vec4<f32> {
-    let fpx = vec2<i32>(i32(px.x + u[2].x), i32(px.y + u[2].y));
-    var flo = base_lo();
-    var fdims = base_hi();
-    if (mode_has(MODE_STAGING)) {
-        flo = vec2<i32>(0, 0);
-        fdims = vec2<i32>(textureDimensions(output));
-    }
-    let finb = fpx.x >= flo.x && fpx.y >= flo.y && fpx.x < fdims.x && fpx.y < fdims.y;
-    var flood = 0.0;
-    if (finb) {
-        if (mode_has(MODE_STAGING)) {
-            flood = stg_ld(fpx).a;
-        } else {
-            flood = base_ld(fpx).a;
-        }
-    }
-    return vec4<f32>(0.0, 0.0, 0.0, flood * (1.0 - u[3].w * punch_a));
-}
-fn fx_scatter_value(d: FxDesc, px: vec2<f32>) -> vec4<f32> {
+
+/// Twelve jittered reads of the value record around `fp`, confined to the lens box.
+fn fx_scatter_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
     let frost = d.u[4].z;
     let scl = d.u[4].x;
-    let win = d.rec[0].yz;
-    let fc = px + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
+    let fc = fp + vec2<f32>(0.5, 0.5) - (d.u[0].zw - d.u[1].xy);
     if (frost <= 0.01) {
-        return fx_bilin_input(px, win, d.rec[1], fx_in_scale(d));
+        return rec_bilin(v, rec_pos(v, fp), false);
     }
     let lens_c = d.u[0].zw;
     let lens_h = d.u[1].xy + vec2<f32>(16.0, 16.0);
-    let vp_hi = vec2<f32>(f32(config.frame_width), f32(config.frame_height)) - vec2<f32>(1.0, 1.0);
-    let lo = max(lens_c - lens_h, vec2<f32>(0.0, 0.0));
-    let hi = min(lens_c + lens_h, vp_hi);
     var sacc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
     for (var t = 0u; t < 12u; t = t + 1u) {
         let n = fx_scatter_hash2(fc + vec2<f32>(f32(t) * 7.3, f32(t) * 13.1));
         let off = n * frost * 6.0 * scl;
-        let pb = clamp(px + off, lens_c - lens_h, lens_c + lens_h);
-        sacc = sacc + fx_bilin_input(clamp(pb, lo, hi), win, d.rec[1], fx_in_scale(d));
+        let pb = clamp(fp + off, lens_c - lens_h, lens_c + lens_h);
+        sacc = sacc + rec_bilin(v, rec_pos(v, pb), false);
     }
     return sacc / 12.0;
 }
-fn fx_spread_value(d: FxDesc, acc: vec4<f32>, cov: f32, value_a: f32) -> vec4<f32> {
-    var scov = cov;
-    if (d.rec[4].x == 2.0) {
-        scov = value_a;
-    } else if ((d.bits & 2u) != 0u) {
-        scov = cov * (1.0 - d.u[3].a * value_a);
-    }
-    let a = d.u[3].a * scov;
-    return vec4<f32>(d.u[3].xyz * a, a) + acc * (1.0 - a);
-}
-fn fx_fused_value(d: FxDesc, px: vec2<f32>, acc: vec4<f32>, coverage: f32) -> vec4<f32> {
-    let fld = fx_computeField(d, px + vec2<f32>(0.5, 0.5));
-    let src_value = d.rec[0].x;
-    let src_orig = d.rec[2].x;
-    let win_value = d.rec[0].yz;
+
+/// One arm at one pixel: the value through its head, the reference and coverage as their records
+/// say, the pointwise tail, and the landing the compose bits select.
+fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32> {
+    let fld = fx_computeField(d, fp + vec2<f32>(0.5, 0.5));
+    let v = rec_of(d, 0u);
+    let o = rec_of(d, 1u);
+    let c = rec_of(d, 2u);
     var value = acc;
+    if (v.source == SRC_AREA) {
+        value = vec4<f32>(0.0, 0.0, 0.0, area);
+    } else if (v.source == SRC_STORE) {
+        if ((d.bits & 32u) != 0u) {
+            value = fx_warp_sample(v, fp, fld.xy, d.u[4].x, d.u[4].y, d.u[5].w != 0.0);
+        } else if ((d.bits & 64u) != 0u) {
+            value = fx_blur_value(d, v, fp);
+        } else if ((d.bits & 256u) != 0u) {
+            value = fx_scatter_value(d, v, fp);
+        } else {
+            value = rec_ld(v, rec_ipos(v, fp), true);
+        }
+    }
     var orig = acc;
-    var cov = coverage;
-    if (mode_has(MODE_BASE)) {
-        if (d.bits & 32u) != 0u && src_value != 2.0 {
-            value = fx_warp_sample(px, fld.xy, d.u[4].x, d.u[4].y);
-            orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
-        }
-        if (d.bits & 64u) != 0u {
-            value = fx_blur_value(d, vec2<i32>(i32(px.x), i32(px.y)));
-            if (!mode_has(MODE_KEEP_COV)) {
-                cov = 1.0;
-            }
-        }
-        if (d.bits & 4096u) != 0u {
-            value = fx_flood_value(d.u, px, value.a);
-        }
-        if (d.bits & 512u) != 0u && (d.bits & (32u | 64u | 256u | 4096u)) == 0u && src_value != 2.0 {
-            let clo = d.u[1].xy;
-            let chi = d.u[1].zw;
-            if (chi.x <= clo.x
-                || (px.x >= clo.x && px.y >= clo.y && px.x < chi.x && px.y < chi.y)) {
-                value = fx_bilin(px - win_value);
-            }
-        }
+    if (o.source == SRC_AREA) {
+        orig = vec4<f32>(0.0, 0.0, 0.0, area);
+    } else if (o.source == SRC_STORE) {
+        orig = rec_ld(o, rec_ipos(o, fp), true);
     }
-    if (mode_has(MODE_VALUE_READS)) {
-        if (d.bits & 256u) != 0u {
-            value = fx_scatter_value(d, px);
-            cov = 1.0;
-        }
-        if src_value == 2.0 && (d.bits & (64u | 256u)) == 0u {
-            var disp = vec2<f32>(0.0, 0.0);
-            if (d.bits & 32u) != 0u {
-                disp = fld.xy;
-            }
-            value = fx_bilin_input(px + disp, win_value, d.rec[1], fx_in_scale(d));
-            if src_orig == 2.0 {
-                orig = fx_bilin_input(px, d.rec[2].yz, d.rec[3], fx_orig_scale(d));
-            } else if (mode_has(MODE_BASE)) {
-                orig = base_ld(vec2<i32>(i32(px.x), i32(px.y)));
-            }
-        }
-    }
-    if (d.bits & 512u) != 0u {
-        cov = 1.0;
+    var cov = 1.0;
+    if (c.source == SRC_AREA) {
+        cov = area;
+    } else if (c.source == SRC_STORE) {
+        cov = rec_ld(c, rec_ipos(c, fp), true).a;
     }
     let eff = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, value, orig, fld, d.u);
-    if (d.bits & 16384u) != 0u {
+    if ((d.bits & 512u) != 0u) {
+        return eff;
+    }
+    if ((d.bits & 16384u) != 0u) {
         return eff + acc * (1.0 - eff.a);
     }
-    if (d.bits & 128u) != 0u {
-        return fx_spread_value(d, acc, cov, value.a);
+    if ((d.bits & 128u) != 0u) {
+        var scov = value.a;
+        if ((d.bits & 2u) != 0u) {
+            scov = value.a * (1.0 - d.u[3].a * orig.a);
+        }
+        let a = d.u[3].a * scov;
+        return vec4<f32>(d.u[3].xyz * a, a) + acc * (1.0 - a);
     }
     return mix(acc, eff, cov);
 }
 
+fn fx_run_mark(
+    cmd_ix: u32,
+    xy: vec2<f32>,
+    rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>,
+    area: ptr<function, array<f32, PIXELS_PER_THREAD>>,
+) {
+    let round = ptcl[cmd_ix + 3u];
+    let effect_id = ptcl[cmd_ix + 1u];
+    if (effect_id < EFFECT_INLINE_BASE || !fx_in_window(round)) {
+        return;
+    }
+    let d = fx_load_desc(ptcl[cmd_ix + 4u]);
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        let p = xy + vec2<f32>(f32(i), 0.0);
+        (*rgba)[i] = fx_arm_value(d, fx_frame_pos(d, p), (*rgba)[i], (*area)[i]);
+    }
+}
+
+/// Whether this tile has anything to paint or run in the window: a mark of the window's rounds,
+/// or a command after a marker whose round is in the window.
 fn fx_window_has_work(tile_ix: u32) -> bool {
     var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 3u;
     if win_lo > 0u {
@@ -1545,12 +1342,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             if win_hi != SEG_ALL && round >= win_hi {
                 break;
             }
-            let effect_id = ptcl[scan_ix + 1u];
-            let inline_base = ptcl[scan_ix + 4u];
-            let inline_key = select(scan_seg, round, fx_keys_on_round(inline_base));
-            if effect_id >= EFFECT_INLINE_BASE
-                && inline_key >= win_lo
-                && (win_hi == SEG_ALL || inline_key < win_hi) {
+            if ptcl[scan_ix + 1u] >= EFFECT_INLINE_BASE && fx_in_window(round) {
                 return true;
             }
             scan_seg = round;
@@ -1565,9 +1357,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             scan_ix = ptcl[scan_ix + 1u];
             continue;
         }
-        let in_window = scan_seg >= win_lo
-            && (win_hi == SEG_ALL || scan_seg < win_hi);
-        if in_window && t != CMD_FILL && t != CMD_SOLID {
+        if fx_in_window(scan_seg) && t != CMD_FILL && t != CMD_SOLID {
             return true;
         }
         switch t {
@@ -1594,24 +1384,13 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
 
 fn fx_store_tile(xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
     let xy_uint = vec2<u32>(xy);
-    let os = active_out_scale;
-    let ostride = u32(1.0 / os + 0.5);
-    if (os < 1.0 && xy_uint.y % ostride != 0u) {
-        return;
-    }
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-        var coords = xy_uint + vec2(i, 0u);
-        if (os < 1.0 && coords.x % ostride != 0u) {
-            continue;
-        }
+        let coords = xy_uint + vec2(i, 0u);
         if coords.x < config.target_width && coords.y < config.target_height {
-            if (os < 1.0) {
-                coords = coords / ostride;
-            }
 #ifdef packed
-            textureStore(output, stg_local(vec2<i32>(coords) - active_scratch_out), stg_layer(vec2<i32>(coords) - active_scratch_out), vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
+            textureStore(output, stg_local(vec2<i32>(coords)), stg_layer(vec2<i32>(coords)), vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
 #else
-            textureStore(output, stg_local(vec2<i32>(coords) - active_scratch_out), stg_layer(vec2<i32>(coords) - active_scratch_out), (*rgba)[i]);
+            textureStore(output, stg_local(vec2<i32>(coords)), stg_layer(vec2<i32>(coords)), (*rgba)[i]);
 #endif
         }
     }
@@ -1626,50 +1405,30 @@ fn main(
     if ptcl[0] == ~0u {
         return;
     }
-    active_scratch_out = vec2<i32>(i32(config.scratch_out_x), i32(config.scratch_out_y));
-    active_out_scale = 1.0;
     win_lo = config.seg_lo;
     win_hi = config.seg_target;
     var tile_xy = wg_id.xy;
+#ifdef packed
     if (config.sparse_n != 0u) {
-        let raw = bitcast<u32>(effect_params[config.sparse_base + wg_id.x]);
-        tile_xy = vec2(raw & 0xffffu, (raw >> 16u) & 0x1fffu);
-        if ((raw & 0x20000000u) != 0u) {
-            let rw = bitcast<u32>(effect_params[config.sparse_base + config.sparse_n + wg_id.x]);
-            win_lo = rw & 0xfffu;
-            let h = (rw >> 12u) & 0xfffu;
-            win_hi = select(h, SEG_ALL, h == 0xfffu);
+        let wg_lin = wg_id.y * SPARSE_ROW + wg_id.x;
+        if (wg_lin >= config.sparse_n) {
+            return;
         }
+        let raw = bitcast<u32>(effect_params[config.sparse_base + wg_lin]);
+        tile_xy = vec2(raw & 0xffffu, (raw >> 16u) & 0x1fffu);
     }
+#endif
     let tile_ix = tile_xy.y * config.width_in_tiles + tile_xy.x;
     let xy = vec2(f32(tile_xy.x * TILE_WIDTH + local_id.x * PIXELS_PER_THREAD), f32(tile_xy.y * TILE_HEIGHT + local_id.y));
     let local_xy = vec2(f32(local_id.x * PIXELS_PER_THREAD), f32(local_id.y));
     var rgba: array<vec4<f32>, PIXELS_PER_THREAD>;
-    var chain: array<vec4<f32>, PIXELS_PER_THREAD>;
 #ifdef packed
-    let init = config.fine_mode & MODE_INIT_MASK;
-    if (init == MODE_INIT_OUTPUT) {
-        if !fx_window_has_work(tile_ix) {
-            return;
-        }
-        let base_xy = vec2<i32>(xy);
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            rgba[i] = unpack4x8unorm(textureLoad(output, stg_local(base_xy + vec2(i32(i), 0)), stg_layer(base_xy + vec2(i32(i), 0))).x);
-        }
-    } else if (init == MODE_INIT_BASE) {
-        let base_xy = vec2<i32>(xy);
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            rgba[i] = base_ld(base_xy + vec2(i32(i), 0));
-        }
-    } else if (init == MODE_INIT_CLEAR) {
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            rgba[i] = vec4(0.0);
-        }
-    } else {
-        let base_color = unpack4x8unorm(config.base_color);
-        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
-            rgba[i] = base_color;
-        }
+    if !fx_window_has_work(tile_ix) {
+        return;
+    }
+    let base_xy = vec2<i32>(xy);
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        rgba[i] = st_ld(base_xy + vec2(i32(i), 0));
     }
 #else
     let base_color = unpack4x8unorm(config.base_color);
@@ -1701,7 +1460,7 @@ fn main(
         if tag == CMD_EFFECT {
             let round = ptcl[cmd_ix + 3u];
 #ifdef packed
-            fx_run_mark(cmd_ix, seg_current, xy, &rgba, &chain, &area);
+            fx_run_mark(cmd_ix, xy, &rgba, &area);
 #endif
             if win_hi != SEG_ALL && round >= win_hi {
                 break;

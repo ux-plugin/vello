@@ -38,7 +38,7 @@ pub struct FullShaders {
     pub path_tiling: ShaderId,
     pub fine_area: Option<ShaderId>,
     /// `fine_area` with `packed`: the effects `fine` — the r32uint store bound read-write as
-    /// `output`, `base_in` / `input_in` as r32uint sampled slots at 9/10, and
+    /// `output`, and
     /// the dispatch's mode word (`config.fine_mode`) deciding how the register seeds and where value
     /// and tap reads go. The one permutation every windowed dispatch runs.
     pub fine_packed: Option<ShaderId>,
@@ -235,8 +235,6 @@ pub(crate) fn full_shaders(
         ImageRead(ImageFormat::Rgba8),
         ImageRead(ImageFormat::Rgba8),
         BufReadOnly,
-        ImageRead(ImageFormat::R32Uint),
-        ImageRead(ImageFormat::R32Uint),
     ];
 
     let aa_support = &options.antialiasing_support;

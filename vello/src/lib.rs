@@ -151,13 +151,13 @@ pub use wgpu;
 
 pub use scene::{DrawGlyphs, Scene};
 
-/// The frame extent override for the next render: `(w << 32) | h`, or 0 for "frame == target".
-/// Set by the whole-viewport driver when interest-region rows are rented below the frame, so the
-/// tile grid (target) is taller than the accumulator (frame) and backdrop clamps must know both.
+/// The page pitch override for the next render: `(w << 32) | rows`, or 0 for "page == target".
+/// Set by the whole-viewport driver when the store stacks pages under the frame, so fine folds a
+/// store row back to its frame row by this stride.
 static FRAME_EXTENT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Declare the FRAME extent (the accumulator/backdrop rows) for subsequent renders whose target
-/// extent covers a taller tile grid. `(0, 0)` restores the default (frame == target).
+/// Declare the store's page pitch (`width` the frame's, `height` the rows per page) for
+/// subsequent renders. `(0, 0)` restores the default (page == target).
 pub fn set_frame(width: u32, height: u32) {
     FRAME_EXTENT.store(
         (u64::from(width) << 32) | u64::from(height),
@@ -659,12 +659,9 @@ impl Renderer {
         Ok(())
     }
 
-    /// Dispatch the effects `fine` for one window `[seg_lo, seg_target)` of the shared PTCL into
-    /// `encoder`, writing the packed store `out` in place. `mode` is the dispatch's mode word (see
-    /// `render::record_fine_packed`); `base`/`input` are the r32uint sampled slots the mode names —
-    /// pass the caller's dummy for an unbound slot. Valid between a
-    /// [`Self::phased_begin_into`]/[`Self::phased_finish_into`] pair, after
-    /// [`Self::phased_frontend_full_into`].
+    /// Record one effects fine dispatch for the window `[seg_lo, seg_target)` over `session`'s
+    /// PTCL into `encoder`, writing the packed store `out` in place (see
+    /// `render::record_fine_packed`).
     #[expect(clippy::too_many_arguments, reason = "one dispatch, one binding set")]
     pub fn phased_fine_into(
         &mut self,
@@ -674,29 +671,11 @@ impl Renderer {
         encoder: &mut wgpu::CommandEncoder,
         seg_lo: u32,
         seg_target: u32,
-        mode: u32,
-        base: &TextureView,
-        input: &TextureView,
         out: &TextureView,
     ) -> Result<()> {
         let out_image = session.new_packed_image();
-        let base_image = session.new_packed_image();
-        let input_image = session.new_packed_image();
-        let recording = render::record_fine_packed(
-            session,
-            &self.shaders,
-            seg_lo,
-            seg_target,
-            mode,
-            base_image,
-            input_image,
-            out_image,
-        );
-        let external_resources = [
-            ExternalResource::Image(out_image, out),
-            ExternalResource::Image(base_image, base),
-            ExternalResource::Image(input_image, input),
-        ];
+        let recording = render::record_fine_packed(session, &self.shaders, seg_lo, seg_target, out_image);
+        let external_resources = [ExternalResource::Image(out_image, out)];
         self.engine.run_recording_into_deferred(
             device,
             queue,

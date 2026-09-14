@@ -175,13 +175,6 @@ pub struct ConfigUniform {
     /// round wherever effects don't touch; the window guarantees exactly one dispatch renders each
     /// command, in an order pixel-equivalent to the full split. Default 0.
     pub seg_lo: u32,
-    /// Device-pixel origin of this dispatch's OUTPUT scratch (`scratch_out`) and its INPUT scratch
-    /// (`scratch_in`) sub-rects — the reach-crop offsets. A producer writes `output` at
-    /// `coords - scratch_out`; a consumer samples `draft_in`/`input_in` at `coords - scratch_in`. Both
-    /// default `[0, 0]` — a full-viewport surface, so an un-cropped dispatch is byte-identical to before.
-    /// `base_in` (the backdrop) is never cropped, so it needs no origin.
-    pub scratch_out: [u32; 2],
-    pub scratch_in: [u32; 2],
     /// Sparse window dispatch: when [`Self::sparse_n`] is non-zero, fine's grid is `(sparse_n, 1, 1)`
     /// workgroups and workgroup `i` reads its tile coordinate from
     /// `effect_params[sparse_base + i]` (`y<<16 | x`, biased by `0x40000000` so the f32 bit pattern
@@ -194,17 +187,8 @@ pub struct ConfigUniform {
     pub frame_width: u32,
     pub frame_height: u32,
     /// The effects `fine` dispatch's mode word — how the tile register is seeded, which sampled slots
-    /// are bound, whether value/tap reads ride the store, how marks key their window. Read only by
-    /// the `packed` permutation; zero for a standard render.
-    pub fine_mode: u32,
-    /// Pad to a 16-byte multiple (WebGPU uniform requirement).
-    pub frame_pad: u32,
-    /// The `base` slot as a rect of the store (`fine_mode` BASE_STORE): the store rect at
-    /// `base_at` holds the frame-space region `[base_org, base_org + base_ext)`.
-    pub base_org: [u32; 2],
-    pub base_ext: [u32; 2],
-    pub base_at: [u32; 2],
-    pub base_pad: [u32; 2],
+    pub frame_pad0: u32,
+    pub frame_pad1: u32,
 }
 
 /// CPU side setup and configuration.
@@ -250,18 +234,12 @@ impl RenderConfig {
                 // overrides this per dispatch.
                 seg_target: SEG_ALL,
                 seg_lo: 0,
-                scratch_out: [0; 2],
-                scratch_in: [0; 2],
                 sparse_base: 0,
                 sparse_n: 0,
                 frame_width: width,
                 frame_height: height,
-                fine_mode: 0,
-                frame_pad: 0,
-                base_org: [0; 2],
-                base_ext: [0; 2],
-                base_at: [0; 2],
-                base_pad: [0; 2],
+                frame_pad0: 0,
+                frame_pad1: 0,
                 layout: *layout,
             },
             workgroup_counts,

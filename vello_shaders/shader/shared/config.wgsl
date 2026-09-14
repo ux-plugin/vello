@@ -56,17 +56,10 @@ struct Config {
     // WebGPU requirement). Must be kept in sync with `ConfigUniform` in `vello_encoding/src/config.rs`.
     seg_target: u32,
     seg_lo: u32,
-    // Reach-crop offsets: device-pixel origin of this dispatch's OUTPUT scratch and INPUT scratch
-    // sub-rects. A producer writes `output` at `coords - scratch_out`; a consumer samples the
-    // draft/input at `coords - scratch_in`. Default (0,0) = full-viewport, byte-identical. Scalar u32s
-    // (not vec2) to match the tightly-packed `[u32; 2]` in ConfigUniform.
-    scratch_out_x: u32,
-    scratch_out_y: u32,
-    scratch_in_x: u32,
-    scratch_in_y: u32,
-    // Sparse window dispatch: when `sparse_n != 0`, fine's grid is `(sparse_n, 1, 1)` workgroups and
-    // workgroup i's tile coordinate is read from `effect_params[sparse_base + i]` (`y<<16 | x`,
-    // biased by 0x40000000 — see fine.wgsl `main`). Zero = full-viewport grid, byte-identical.
+    // Sparse window dispatch: when `sparse_n != 0`, fine's grid is `(min(n, 65535), ceil(n / 65535), 1)`
+    // workgroups and workgroup `(x, y)` reads tile word `y * 65535 + x` from
+    // `effect_params[sparse_base + ..]` (`y<<16 | x`, biased by 0x40000000 — see fine.wgsl `main`).
+    // Zero = the full grid.
     sparse_base: u32,
     sparse_n: u32,
     // The FRAME extent in pixels: the accumulator/backdrop rows. The target extent covers the whole
@@ -75,20 +68,9 @@ struct Config {
     // no regions are rented, leaving every clamp byte-identical.
     frame_width: u32,
     frame_height: u32,
-    // The effects fine dispatch's mode word (fine.wgsl `MODE_*`); zero for a standard render.
-    fine_mode: u32,
     // Pad to a 16-byte multiple (WebGPU uniform requirement).
+    frame_pad0: u32,
     frame_pad1: u32,
-    // The base slot as a rect of the store (MODE_BASE_STORE): the store rect at base_at holds the
-    // frame-space region [base_org, base_org + base_ext).
-    base_org_x: u32,
-    base_org_y: u32,
-    base_ext_x: u32,
-    base_ext_y: u32,
-    base_at_x: u32,
-    base_at_y: u32,
-    base_pad0: u32,
-    base_pad1: u32,
 }
 
 // Sentinel `seg_target` value meaning "render all segments in one pass" (the non-segmented default).

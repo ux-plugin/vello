@@ -137,31 +137,15 @@ pub struct PhasedSession {
 
 #[cfg(feature = "wgpu")]
 impl PhasedSession {
-    /// Set the reach-crop origins for the NEXT fine dispatch: `scratch_out` shifts where the producer
-    /// writes `output`, `scratch_in` where the consumer samples its scratch (`draft`/`input`). Each
-    /// `record_fine_packed` consumes them into its per-dispatch config and resets to `[0, 0]`, so a
-    /// full-viewport call needs no set. `[0, 0]` for a slot means that slot is not cropped.
-    pub fn set_scratch_origins(&mut self, scratch_out: [u32; 2], scratch_in: [u32; 2]) {
-        self.cpu_config.gpu.scratch_out = scratch_out;
-        self.cpu_config.gpu.scratch_in = scratch_in;
-    }
-
-    /// Set the sparse tile list for the NEXT fine dispatch: the grid becomes `(n, 1, 1)` workgroups
-    /// and workgroup `i` reads its tile coordinate from `effect_params[base + i]` (packed
-    /// `y<<16 | x`, biased by `0x40000000`). Each `record_fine_packed` consumes it into its
-    /// per-dispatch config and resets to zero, so a full-viewport call needs no set.
+    /// Set the sparse tile list for the NEXT fine dispatch: `n` tile words at `effect_params[base..]`
+    /// (packed `y<<16 | x`, biased by `0x40000000`), dispatched as a 2D grid of 65535-wide rows.
+    /// Each `record_fine_packed` consumes it into its per-dispatch config and resets to zero, so a
+    /// full-grid call needs no set.
     pub fn set_sparse(&mut self, base: u32, n: u32) {
         self.cpu_config.gpu.sparse_base = base;
         self.cpu_config.gpu.sparse_n = n;
     }
 
-    /// Place the `base` slot for the NEXT fine dispatch inside the store: the rect at `at` holds
-    /// the frame-space region `[org, org + ext)`. Consumed by that dispatch and reset.
-    pub fn set_base_rect(&mut self, org: [u32; 2], ext: [u32; 2], at: [u32; 2]) {
-        self.cpu_config.gpu.base_org = org;
-        self.cpu_config.gpu.base_ext = ext;
-        self.cpu_config.gpu.base_at = at;
-    }
 
     /// A fresh `R32Uint` (packed-rgba8) image proxy sized to the frame — the in-place accumulator
     /// or its round-boundary snapshot.
@@ -420,14 +404,17 @@ pub(crate) fn record_frontend_full(session: &mut PhasedSession, shaders: &FullSh
 /// `base` and `input` are r32uint sampled images — a 1×1 dummy when the mode says a slot is
 /// unbound. The per-dispatch scratch origins and sparse list are consumed here.
 #[cfg(feature = "wgpu")]
+/// Record one effects `fine` dispatch over the window `[seg_lo, seg_target)` of the session's
+/// PTCL, reading and writing the packed store `out_image` in place. Every operand an arm reads is
+/// a store rect named by its descriptor's records.
+/// Workgroups per row of a sparse fine dispatch: WebGPU's per-dimension limit.
+const SPARSE_ROW: u32 = 65535;
+
 pub(crate) fn record_fine_packed(
     session: &mut PhasedSession,
     shaders: &FullShaders,
     seg_lo: u32,
     seg_target: u32,
-    mode: u32,
-    base: ImageProxy,
-    input: ImageProxy,
     out_image: ImageProxy,
 ) -> Recording {
     let shader = shaders.fine_packed.expect("the effects path needs the fine_packed shader");
@@ -435,16 +422,10 @@ pub(crate) fn record_fine_packed(
     let mut seg_cfg = session.cpu_config.gpu;
     seg_cfg.seg_lo = seg_lo;
     seg_cfg.seg_target = seg_target;
-    seg_cfg.fine_mode = mode;
-    session.cpu_config.gpu.scratch_out = [0; 2];
-    session.cpu_config.gpu.scratch_in = [0; 2];
     session.cpu_config.gpu.sparse_base = 0;
     session.cpu_config.gpu.sparse_n = 0;
-    session.cpu_config.gpu.base_org = [0; 2];
-    session.cpu_config.gpu.base_ext = [0; 2];
-    session.cpu_config.gpu.base_at = [0; 2];
     let fine_wg = if seg_cfg.sparse_n != 0 {
-        (seg_cfg.sparse_n, 1, 1)
+        (seg_cfg.sparse_n.min(SPARSE_ROW), seg_cfg.sparse_n.div_ceil(SPARSE_ROW), 1)
     } else {
         session.cpu_config.workgroup_counts.fine
     };
@@ -463,8 +444,6 @@ pub(crate) fn record_fine_packed(
             session.gradient_image,
             session.image_atlas,
             session.effect_params_buf,
-            ResourceProxy::Image(base),
-            ResourceProxy::Image(input),
         ],
     );
     recording.free_resource(config_buf);
