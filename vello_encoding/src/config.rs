@@ -458,7 +458,7 @@ impl BufferSizes {
         // 16 * 16 (1 << 8) is one blend spill, so this allows for 4096 spills.
         let blend_spill = BufferSize::new(1 << 20);
         let n_tiles = workgroups.fine.0.saturating_mul(workgroups.fine.1);
-        let ptcl = BufferSize::new((1u32 << 23).max(n_tiles.saturating_mul(384)));
+        let ptcl = BufferSize::new(n_tiles.saturating_mul(64).saturating_add(1u32 << 23));
         Self {
             path_reduced,
             path_reduced2,

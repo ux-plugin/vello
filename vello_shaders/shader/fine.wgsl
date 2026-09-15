@@ -101,10 +101,11 @@ fn page_rows(y: i32) -> i32 {
     return (y / i32(config.frame_height)) * i32(config.frame_height);
 }
 
-/// The frame position of store pixel `p` for an arm writing record 4's rect.
+/// The frame position of store pixel `p` for an arm writing record 4's rect: the rect's page and
+/// placement (its shift) undone.
 fn fx_frame_pos(d: FxDesc, p: vec2<f32>) -> vec2<f32> {
     let out = rec_of(d, 4u);
-    return vec2<f32>(p.x, p.y - f32(page_rows(out.lo.y)));
+    return p - out.shift - vec2<f32>(0.0, f32(page_rows(out.lo.y)));
 }
 
 /// Frame position `fp` on record `r`'s page, displaced by the record's shift.
