@@ -9,8 +9,10 @@ use super::{
 };
 use bytemuck::{Pod, Zeroable};
 
-const TILE_WIDTH: u32 = 16;
-const TILE_HEIGHT: u32 = 16;
+/// Pixel columns per tile: the unit coarse bins into and one fine workgroup writes.
+pub const TILE_WIDTH: u32 = 16;
+/// Pixel rows per tile.
+pub const TILE_HEIGHT: u32 = 16;
 
 /// Sentinel [`ConfigUniform::seg_target`] value meaning "render all segments in one pass" — the
 /// normal, non-segmented render. Matches `SEG_ALL` in `shaders/shared/config.wgsl`.

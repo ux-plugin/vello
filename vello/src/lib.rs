@@ -172,7 +172,7 @@ pub(crate) fn apply_frame_extent(gpu: &mut vello_encoding::ConfigUniform) {
         gpu.frame_height = v as u32;
     }
 }
-pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord};
+pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord, TILE_HEIGHT, TILE_WIDTH};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
