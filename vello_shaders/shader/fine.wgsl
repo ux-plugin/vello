@@ -1253,6 +1253,27 @@ fn fx_scatter_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
     return sacc / 12.0;
 }
 
+/// The value record resampled to this arm's resolution at its pixel `fp`: `u[0].x` input texels per
+/// output texel — a box average of them when whole, bilinear otherwise; `u[0].y` reads past the
+/// record transparent rather than clamped.
+fn fx_scale_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
+    let ratio = d.u[0].x;
+    let transparent = d.u[0].y != 0.0;
+    let n = i32(round(ratio));
+    if (ratio > 1.0 && abs(ratio - f32(n)) < 1e-4 && n <= 8) {
+        let base = rec_ipos(v, fp * ratio);
+        var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+        for (var y = 0; y < n; y = y + 1) {
+            for (var x = 0; x < n; x = x + 1) {
+                acc = acc + rec_ld(v, base + vec2<i32>(x, y), transparent);
+            }
+        }
+        return acc / f32(n * n);
+    }
+    let q = rec_pos(v, (fp + vec2<f32>(0.5, 0.5)) * ratio - vec2<f32>(0.5, 0.5));
+    return rec_bilin(v, q, transparent);
+}
+
 /// One arm at one pixel: the value through its head, the reference and coverage as their records
 /// say, the pointwise tail, and the landing the compose bits select.
 fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32> {
@@ -1270,6 +1291,8 @@ fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32
             value = fx_blur_value(d, v, fp);
         } else if ((d.bits & 256u) != 0u) {
             value = fx_scatter_value(d, v, fp);
+        } else if ((d.bits & 8192u) != 0u) {
+            value = fx_scale_value(d, v, fp);
         } else {
             value = rec_ld(v, rec_ipos(v, fp), true);
         }
