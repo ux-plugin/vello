@@ -219,6 +219,22 @@ impl WgpuEngine {
         Some(bytemuck::cast_slice(&data).to_vec())
     }
 
+    /// Record a copy of the first `size` bytes of the materialized buffer behind `proxy_id` into
+    /// `dst` (`COPY_DST`). `false` when the proxy has no GPU buffer.
+    pub fn copy_buffer_into(
+        &self,
+        proxy_id: ResourceId,
+        encoder: &mut CommandEncoder,
+        dst: &Buffer,
+        size: u64,
+    ) -> bool {
+        let Some(MaterializedBuffer::Gpu(buf)) = self.bind_map.buf_map.get(&proxy_id).map(|b| &b.buffer) else {
+            return false;
+        };
+        encoder.copy_buffer_to_buffer(buf, 0, dst, 0, size);
+        true
+    }
+
     pub fn new(use_cpu: bool, pipeline_cache: Option<PipelineCache>) -> Self {
         Self {
             use_cpu,

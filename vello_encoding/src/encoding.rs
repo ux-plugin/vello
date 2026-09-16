@@ -5,8 +5,8 @@ use crate::DrawBeginClip;
 
 use super::{
     DrawBlurRoundedRect, DrawColor, DrawEffect, DrawImage, DrawLinearGradient, DrawRadialGradient,
-    DrawSweepGradient, DrawTag, Glyph, GlyphRun, NormalizedCoord, Patch, PathEncoder, PathTag,
-    Style, Transform,
+    DrawSweepGradient, DrawTag, Glyph, GlyphRun, NormalizedCoord, Patch, PathBox, PathEncoder,
+    PathTag, Style, Transform,
 };
 
 use peniko::color::{DynamicColor, palette};
@@ -40,6 +40,8 @@ pub struct Encoding {
     pub styles: Vec<Style>,
     /// Late bound resource data.
     pub resources: Resources,
+    /// One [`PathBox`] per encoded path, in path order: what each path's draw object can cover.
+    pub path_boxes: Vec<PathBox>,
     /// Number of encoded paths.
     pub n_paths: u32,
     /// Number of encoded path segments.
@@ -82,6 +84,7 @@ impl Encoding {
         self.styles.clear();
         self.draw_data.clear();
         self.draw_tags.clear();
+        self.path_boxes.clear();
         self.n_paths = 0;
         self.n_path_segments = 0;
         self.n_clips = 0;
@@ -156,6 +159,9 @@ impl Encoding {
         self.path_data.extend_from_slice(&other.path_data);
         self.draw_tags.extend_from_slice(&other.draw_tags);
         self.draw_data.extend_from_slice(&other.draw_data);
+        let transform_base = self.transforms.len() as u32;
+        self.path_boxes
+            .extend(other.path_boxes.iter().map(|b| PathBox { transform: b.transform + transform_base, ..*b }));
         self.n_paths += other.n_paths;
         self.n_path_segments += other.n_path_segments;
         self.n_clips += other.n_clips;
@@ -232,11 +238,16 @@ impl Encoding {
     /// Returns an encoder for encoding a path. If `is_fill` is true, all subpaths will
     /// be automatically closed.
     pub fn encode_path(&mut self, is_fill: bool) -> PathEncoder<'_> {
+        let transform = self.transforms.len().saturating_sub(1) as u32;
+        let pad = if is_fill { 0.0 } else { self.styles.last().map_or(0.0, |s| 2.0 * s.line_width) };
         PathEncoder::new(
             &mut self.path_tags,
             &mut self.path_data,
             &mut self.n_path_segments,
             &mut self.n_paths,
+            &mut self.path_boxes,
+            transform,
+            pad,
             is_fill,
         )
     }

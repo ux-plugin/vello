@@ -162,6 +162,8 @@ pub struct Resolver {
     image_cache: ImageCache,
     pending_images: Vec<PendingImage>,
     patches: Vec<ResolvedPatch>,
+    /// The device-space bounds of each glyph run the last resolve laid out (one draw object each).
+    run_bounds: Vec<[f32; 4]>,
 }
 
 impl Resolver {
@@ -178,6 +180,47 @@ impl Resolver {
         self.image_cache.mark_dirty(image);
     }
 
+    /// The device-space bounds of every draw object the last [`Self::resolve`] of `encoding`
+    /// laid out: one rect per scene path, and one per glyph run (its glyphs' union). Conservative:
+    /// the transformed control-point bounds, which contain the flattened outline.
+    pub fn draw_bounds(&self, encoding: &Encoding, out: &mut Vec<[f32; 4]>) {
+        out.clear();
+        for b in &encoding.path_boxes {
+            let t = encoding.transforms.get(b.transform as usize).copied().unwrap_or(Transform::IDENTITY);
+            out.push(b.transformed(&t));
+        }
+        out.extend_from_slice(&self.run_bounds);
+    }
+
+    /// Record each resolved glyph run's device bounds (the union of its glyphs' outlines under
+    /// the run's per-glyph transforms) while the glyph encodings are still held.
+    fn note_run_bounds(&mut self, encoding: &Encoding) {
+        self.run_bounds.clear();
+        for patch in &self.patches {
+            let ResolvedPatch::GlyphRun { index, glyphs, transform, scale, hint, .. } = patch else { continue };
+            let run = &encoding.resources.glyph_runs[*index];
+            let mut union = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+            for (glyph, outline) in encoding.resources.glyphs[run.glyphs.clone()].iter().zip(&self.glyphs[glyphs.clone()]) {
+                let mut xform = *transform
+                    * Transform { matrix: [1.0, 0.0, 0.0, -1.0], translation: [glyph.x * scale, glyph.y * scale] };
+                if let Some(g) = run.glyph_transform {
+                    xform = xform * g;
+                }
+                if *hint {
+                    xform.translation[1] = xform.translation[1].round();
+                }
+                for b in &outline.path_boxes {
+                    let t = xform * outline.transforms.get(b.transform as usize).copied().unwrap_or(Transform::IDENTITY);
+                    let r = b.transformed(&t);
+                    union = [union[0].min(r[0]), union[1].min(r[1]), union[2].max(r[2]), union[3].max(r[3])];
+                }
+            }
+            if union[0] < union[2] && union[1] < union[3] {
+                self.run_bounds.push(union);
+            }
+        }
+    }
+
     /// Resolves late bound resources and packs an encoding. Returns the packed
     /// layout and computed ramp data.
     pub fn resolve<'a>(
@@ -186,6 +229,7 @@ impl Resolver {
         packed: &mut Vec<u8>,
     ) -> (Layout, Ramps<'a>, Images<'a>) {
         let resources = &encoding.resources;
+        self.run_bounds.clear();
         if resources.patches.is_empty() {
             let layout = resolve_solid_paths_only(encoding, packed);
             return (layout, Ramps::default(), Images::default());
@@ -392,6 +436,7 @@ impl Resolver {
                 data.extend_from_slice(bytemuck::cast_slice(&stream[pos..]));
             }
         }
+        self.note_run_bounds(encoding);
         self.glyphs.clear();
         layout.n_draw_objects = layout.n_paths;
         assert_eq!(buffer_size, data.len());

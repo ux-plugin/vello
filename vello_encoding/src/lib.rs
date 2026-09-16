@@ -49,8 +49,9 @@ mod resolve;
 pub use binning::BinHeader;
 pub use clip::{Clip, ClipBbox, ClipBic, ClipElement};
 pub use config::{
-    BufferSize, BufferSizes, BumpAllocatorMemory, BumpAllocators, ConfigUniform, IndirectCount,
-    RenderConfig, SEG_ALL, TILE_HEIGHT, TILE_WIDTH, WorkgroupCounts, WorkgroupSize,
+    BufferSize, BufferSizes, BumpAllocatorMemory, BumpAllocators, BumpSizes, ConfigUniform,
+    IndirectCount, PoolEstimate, RenderConfig, SEG_ALL, TILE_HEIGHT, TILE_WIDTH, WorkgroupCounts,
+    WorkgroupSize,
 };
 pub use draw::{
     DRAW_INFO_FLAGS_FILL_RULE_BIT, DrawBbox, DrawBeginClip, DrawBlurRoundedRect, DrawColor,
@@ -63,8 +64,8 @@ pub use mask::{make_mask_lut, make_mask_lut_16};
 pub use math::Transform;
 pub use monoid::Monoid;
 pub use path::{
-    Cubic, LineSoup, Path, PathBbox, PathEncoder, PathMonoid, PathSegment, PathSegmentType,
-    PathTag, SegmentCount, Style, Tile,
+    Cubic, LineSoup, Path, PathBbox, PathBox, PathEncoder, PathMonoid, PathSegment,
+    PathSegmentType, PathTag, SegmentCount, Style, Tile,
 };
 pub use ramp_cache::Ramps;
 pub use resolve::{Layout, Patch, Resolver, resolve_solid_paths_only};

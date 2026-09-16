@@ -205,7 +205,13 @@ pub struct RenderConfig {
 }
 
 impl RenderConfig {
-    pub fn new(layout: &Layout, width: u32, height: u32, base_color: &peniko::Color) -> Self {
+    pub fn new(
+        layout: &Layout,
+        width: u32,
+        height: u32,
+        base_color: &peniko::Color,
+        floors: &BumpSizes,
+    ) -> Self {
         let new_width = width.next_multiple_of(TILE_WIDTH);
         let new_height = height.next_multiple_of(TILE_HEIGHT);
         let width_in_tiles = new_width / TILE_WIDTH;
@@ -213,7 +219,7 @@ impl RenderConfig {
         let n_path_tags = layout.path_tags_size();
         let workgroup_counts =
             WorkgroupCounts::new(layout, width_in_tiles, height_in_tiles, n_path_tags);
-        let buffer_sizes = BufferSizes::new(layout, &workgroup_counts);
+        let buffer_sizes = BufferSizes::new(layout, &workgroup_counts, floors);
         Self {
             gpu: ConfigUniform {
                 width_in_tiles,
@@ -413,8 +419,63 @@ pub struct BufferSizes {
     pub ptcl: BufferSize<u32>,
 }
 
+/// Floors for the bump-allocated pools, in elements; zero keeps vello's built-in size. The phased
+/// renderer raises the tile and bin floors from the scene's draw bounds before its front-end runs
+/// and raises whichever pool a frame overflowed before the next one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct BumpSizes {
+    /// Bin words past the draw info stream (the layout adds the info's own words).
+    pub bin_data: u32,
+    pub tiles: u32,
+    pub lines: u32,
+    pub seg_counts: u32,
+    pub segments: u32,
+    pub blend_spill: u32,
+    /// Words in the shared overflow pool past every tile's own initial allocation.
+    pub ptcl: u32,
+}
+
+/// What the tile and bin allocators need for a set of draw bounds over a `width × height`
+/// target, as those stages count it: each draw object takes one tile record per tile of its
+/// bounds clamped to the target, and one bin word per 16×16-tile bin of them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PoolEstimate {
+    pub tiles: u32,
+    pub bins: u32,
+}
+
+impl PoolEstimate {
+    #[must_use]
+    pub fn of(bounds: &[[f32; 4]], width: u32, height: u32) -> Self {
+        let width_in_tiles = width.div_ceil(TILE_WIDTH) as f32;
+        let height_in_tiles = height.div_ceil(TILE_HEIGHT) as f32;
+        let width_in_bins = (width_in_tiles / 16.0).ceil();
+        let height_in_bins = (height_in_tiles / 16.0).ceil();
+        let sx = 1.0 / TILE_WIDTH as f32;
+        let sy = 1.0 / TILE_HEIGHT as f32;
+        let mut tiles = 0u64;
+        let mut bins = 0u64;
+        for b in bounds {
+            if !(b[0] < b[2] && b[1] < b[3]) {
+                continue;
+            }
+            let x0 = (b[0] * sx).floor().clamp(0.0, width_in_tiles);
+            let y0 = (b[1] * sy).floor().clamp(0.0, height_in_tiles);
+            let x1 = (b[2] * sx).ceil().clamp(0.0, width_in_tiles);
+            let y1 = (b[3] * sy).ceil().clamp(0.0, height_in_tiles);
+            tiles += ((x1 - x0) * (y1 - y0)) as u64;
+            let bx0 = (x0 / 16.0).floor().clamp(0.0, width_in_bins);
+            let by0 = (y0 / 16.0).floor().clamp(0.0, height_in_bins);
+            let bx1 = (x1 / 16.0).ceil().clamp(0.0, width_in_bins);
+            let by1 = (y1 / 16.0).ceil().clamp(0.0, height_in_bins);
+            bins += ((bx1 - bx0) * (by1 - by0)) as u64;
+        }
+        Self { tiles: tiles.min(u32::MAX as u64) as u32, bins: bins.min(u32::MAX as u64) as u32 }
+    }
+}
+
 impl BufferSizes {
-    pub fn new(layout: &Layout, workgroups: &WorkgroupCounts) -> Self {
+    pub fn new(layout: &Layout, workgroups: &WorkgroupCounts, floors: &BumpSizes) -> Self {
         let n_paths = layout.n_paths;
         let n_draw_objects = layout.n_draw_objects;
         let n_clips = layout.n_clips;
@@ -452,15 +513,15 @@ impl BufferSizes {
         // The following buffer sizes have been hand picked to accommodate the vello test scenes as
         // well as paris-30k. These should instead get derived from the scene layout using
         // reasonable heuristics.
-        let bin_data = BufferSize::new(1 << 18);
-        let tiles = BufferSize::new(1 << 21);
-        let lines = BufferSize::new(1 << 21);
-        let seg_counts = BufferSize::new(1 << 21);
-        let segments = BufferSize::new(1 << 21);
+        let bin_data = BufferSize::new((1 << 18).max(layout.bin_data_start.saturating_add(floors.bin_data)));
+        let tiles = BufferSize::new((1 << 21).max(floors.tiles));
+        let lines = BufferSize::new((1 << 21).max(floors.lines));
+        let seg_counts = BufferSize::new((1 << 21).max(floors.seg_counts));
+        let segments = BufferSize::new((1 << 21).max(floors.segments));
         // 16 * 16 (1 << 8) is one blend spill, so this allows for 4096 spills.
-        let blend_spill = BufferSize::new(1 << 20);
+        let blend_spill = BufferSize::new((1 << 20).max(floors.blend_spill));
         let n_tiles = workgroups.fine.0.saturating_mul(workgroups.fine.1);
-        let ptcl = BufferSize::new(n_tiles.saturating_mul(64).saturating_add(1u32 << 23));
+        let ptcl = BufferSize::new(n_tiles.saturating_mul(64).saturating_add((1u32 << 23).max(floors.ptcl)));
         Self {
             path_reduced,
             path_reduced2,

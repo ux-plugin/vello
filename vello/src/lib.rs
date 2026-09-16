@@ -172,7 +172,7 @@ pub(crate) fn apply_frame_extent(gpu: &mut vello_encoding::ConfigUniform) {
         gpu.frame_height = v as u32;
     }
 }
-pub use vello_encoding::{FontEmbolden, Glyph, NormalizedCoord, TILE_HEIGHT, TILE_WIDTH};
+pub use vello_encoding::{BumpSizes, FontEmbolden, Glyph, NormalizedCoord, TILE_HEIGHT, TILE_WIDTH};
 
 use low_level::ShaderId;
 #[cfg(feature = "wgpu")]
@@ -603,6 +603,10 @@ impl Renderer {
     /// Unlike [`Self::render_phased_into`], which records every phase up front (so nothing can run
     /// between them), this drives the phases one at a time, sharing the one setup via vello's engine
     /// keeping the buffer proxies live across the calls. Area AA only. The caller submits `encoder`.
+    ///
+    /// `floors` are the pool sizes the caller insists on (a previous frame's overflow, grown);
+    /// the tile and bin pools are also raised to what the scene's draw bounds need.
+    #[expect(clippy::too_many_arguments, reason = "one session, one setup")]
     pub fn phased_begin_into(
         &mut self,
         device: &Device,
@@ -610,6 +614,7 @@ impl Renderer {
         scene: &Scene,
         params: &RenderParams,
         effect_params: &[u8],
+        floors: BumpSizes,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<render::PhasedSession> {
         let (session, recording) = render::begin_phased(
@@ -619,6 +624,7 @@ impl Renderer {
             &mut self.image_atlas,
             params,
             effect_params,
+            floors,
         );
         self.engine.run_recording_into(
             device,
@@ -661,7 +667,7 @@ impl Renderer {
 
     /// Record one effects fine dispatch for the window `[seg_lo, seg_target)` over `session`'s
     /// PTCL into `encoder`, writing the packed store `out` in place (see
-    /// `render::record_fine_packed`).
+    /// `render::record_fine_packed`). `label` names the dispatch in profiler builds.
     #[expect(clippy::too_many_arguments, reason = "one dispatch, one binding set")]
     pub fn phased_fine_into(
         &mut self,
@@ -672,10 +678,13 @@ impl Renderer {
         seg_lo: u32,
         seg_target: u32,
         out: &TextureView,
+        label: &'static str,
     ) -> Result<()> {
         let out_image = session.new_packed_image();
         let recording = render::record_fine_packed(session, &self.shaders, seg_lo, seg_target, out_image);
         let external_resources = [ExternalResource::Image(out_image, out)];
+        #[cfg(not(feature = "wgpu-profiler"))]
+        let _ = label;
         self.engine.run_recording_into_deferred(
             device,
             queue,
@@ -685,9 +694,21 @@ impl Renderer {
             #[cfg(feature = "wgpu-profiler")]
             &mut self.profiler,
             #[cfg(feature = "wgpu-profiler")]
-            "phased_fine_into",
+            label,
         )?;
         Ok(())
+    }
+
+    /// Record a copy of `session`'s bump allocators (the overflow flag and every pool's
+    /// watermark, eight `u32`s) into `dst`, to be read back after the submit. `false` when the
+    /// session's bump buffer is not materialized.
+    pub fn phased_bump_copy_into(
+        &self,
+        session: &render::PhasedSession,
+        encoder: &mut wgpu::CommandEncoder,
+        dst: &wgpu::Buffer,
+    ) -> bool {
+        self.engine.copy_buffer_into(session.debug_bump_proxy_id(), encoder, dst, 32)
     }
 
     /// Refresh snapshot rects from the accumulator as one batched compute copy (deferred with the

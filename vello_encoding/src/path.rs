@@ -422,12 +422,48 @@ pub struct Tile {
     pub segment_count_or_ix: u32,
 }
 
+/// The control-point bounds of one encoded path in its own space, inflated by the margin its
+/// style can reach past them (a stroke's width), with the index of the transform in effect when
+/// it was encoded. With the transform stream this bounds the device rect the path's draw object
+/// covers, which is what the tile and bin pools are sized from before the front-end runs.
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct PathBox {
+    pub x0: f32,
+    pub y0: f32,
+    pub x1: f32,
+    pub y1: f32,
+    pub transform: u32,
+}
+
+impl PathBox {
+    /// The device-space bounds of this box under `t`: the transformed corners' extremes.
+    #[must_use]
+    pub fn transformed(&self, t: &super::Transform) -> [f32; 4] {
+        let [a, b, c, d] = t.matrix;
+        let [e, f] = t.translation;
+        let mut out = [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY];
+        for (x, y) in [(self.x0, self.y0), (self.x1, self.y0), (self.x0, self.y1), (self.x1, self.y1)] {
+            let px = a * x + c * y + e;
+            let py = b * x + d * y + f;
+            out[0] = out[0].min(px);
+            out[1] = out[1].min(py);
+            out[2] = out[2].max(px);
+            out[3] = out[3].max(py);
+        }
+        out
+    }
+}
+
 /// Encoder for path segments.
 pub struct PathEncoder<'a> {
     tags: &'a mut Vec<PathTag>,
     data: &'a mut Vec<u32>,
     n_segments: &'a mut u32,
     n_paths: &'a mut u32,
+    boxes: &'a mut Vec<PathBox>,
+    transform: u32,
+    pad: f32,
+    bbox: [f32; 4],
     first_point: [f32; 2],
     first_start_tangent_end: [f32; 2],
     state: PathState,
@@ -478,11 +514,19 @@ impl<'a> PathEncoder<'a> {
     ///      it draws a start cap using the information encoded in the segment IF the subpath is
     ///      open (i.e. the marker is a quad-to). If the subpath is closed (i.e. the marker is a
     ///      line-to), the thread draws nothing.
+    ///
+    /// `boxes` receives the path's [`PathBox`] when it is finished with a path marker: its
+    /// control-point bounds inflated by `pad`, tagged with `transform` (the index of the transform
+    /// in effect).
+    #[expect(clippy::too_many_arguments, reason = "one encoder borrows every stream it writes")]
     pub fn new(
         tags: &'a mut Vec<PathTag>,
         data: &'a mut Vec<u32>,
         n_segments: &'a mut u32,
         n_paths: &'a mut u32,
+        boxes: &'a mut Vec<PathBox>,
+        transform: u32,
+        pad: f32,
         is_fill: bool,
     ) -> Self {
         Self {
@@ -490,11 +534,24 @@ impl<'a> PathEncoder<'a> {
             data,
             n_segments,
             n_paths,
+            boxes,
+            transform,
+            pad,
+            bbox: [f32::INFINITY, f32::INFINITY, f32::NEG_INFINITY, f32::NEG_INFINITY],
             first_point: [0.0, 0.0],
             first_start_tangent_end: [0.0, 0.0],
             state: PathState::Start,
             n_encoded_segments: 0,
             is_fill,
+        }
+    }
+
+    fn note(&mut self, pts: &[f32]) {
+        for p in pts.chunks_exact(2) {
+            self.bbox[0] = self.bbox[0].min(p[0]);
+            self.bbox[1] = self.bbox[1].min(p[1]);
+            self.bbox[2] = self.bbox[2].max(p[0]);
+            self.bbox[3] = self.bbox[3].max(p[1]);
         }
     }
 
@@ -504,6 +561,7 @@ impl<'a> PathEncoder<'a> {
             self.close();
         }
         let buf = [x, y];
+        self.note(&buf);
         let bytes = bytemuck::cast_slice(&buf);
         if self.state == PathState::MoveTo {
             let new_len = self.data.len() - 2;
@@ -544,6 +602,7 @@ impl<'a> PathEncoder<'a> {
             return;
         }
         let buf = [x, y];
+        self.note(&buf);
         let bytes = bytemuck::cast_slice(&buf);
         self.data.extend_from_slice(bytes);
         self.tags.push(PathTag::LINE_TO_F32);
@@ -572,6 +631,7 @@ impl<'a> PathEncoder<'a> {
             return;
         }
         let buf = [x1, y1, x2, y2];
+        self.note(&buf);
         let bytes = bytemuck::cast_slice(&buf);
         self.data.extend_from_slice(bytes);
         self.tags.push(PathTag::QUAD_TO_F32);
@@ -600,6 +660,7 @@ impl<'a> PathEncoder<'a> {
             return;
         }
         let buf = [x1, y1, x2, y2, x3, y3];
+        self.note(&buf);
         let bytes = bytemuck::cast_slice(&buf);
         self.data.extend_from_slice(bytes);
         self.tags.push(PathTag::CUBIC_TO_F32);
@@ -610,6 +671,7 @@ impl<'a> PathEncoder<'a> {
     /// Encodes an empty path (as placeholder for begin clip).
     pub(crate) fn empty_path(&mut self) {
         let coords = [0.0_f32, 0., 0., 0.];
+        self.note(&coords);
         let bytes = bytemuck::cast_slice(&coords);
         self.data.extend_from_slice(bytes);
         self.tags.push(PathTag::LINE_TO_F32);
@@ -703,6 +765,9 @@ impl<'a> PathEncoder<'a> {
             if insert_path_marker {
                 self.tags.push(PathTag::PATH);
                 *self.n_paths += 1;
+                let [x0, y0, x1, y1] = self.bbox;
+                let p = self.pad;
+                self.boxes.push(PathBox { x0: x0 - p, y0: y0 - p, x1: x1 + p, y1: y1 + p, transform: self.transform });
             }
         }
         self.n_encoded_segments

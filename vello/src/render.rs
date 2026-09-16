@@ -128,6 +128,10 @@ pub struct PhasedSession {
     seg_counts_buf: ResourceProxy,
     blend_spill_buf: ResourceProxy,
     effect_params_buf: ResourceProxy,
+    /// The pool floors this session was allocated with, the estimate folded in.
+    pub sizes: vello_encoding::BumpSizes,
+    /// What the draw bounds said the tile and bin allocators need.
+    pub estimate: vello_encoding::PoolEstimate,
     width: u32,
     height: u32,
     /// `draw_reduce`/`draw_leaf`/clip read `path_bbox` (produced by the per-phase `flatten`), so they
@@ -171,8 +175,9 @@ pub(crate) fn begin_phased(
     persistent_image_atlas: &mut Option<ImageProxy>,
     params: &RenderParams,
     effect_params: &[u8],
+    floors: vello_encoding::BumpSizes,
 ) -> (PhasedSession, Recording) {
-    use vello_encoding::RenderConfig;
+    use vello_encoding::{PoolEstimate, RenderConfig};
     assert!(
         matches!(params.antialiasing_method, AaConfig::Area),
         "begin_phased supports Area AA only"
@@ -208,7 +213,15 @@ pub(crate) fn begin_phased(
     }
     let image_atlas = ResourceProxy::Image(image_atlas);
 
-    let mut cpu_config = RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+    let mut bounds = Vec::new();
+    resolver.draw_bounds(encoding, &mut bounds);
+    let estimate = PoolEstimate::of(&bounds, params.width, params.height);
+    let headroom = |n: u32| n.saturating_add(n / 4).saturating_add(1024);
+    let mut sizes = floors;
+    sizes.tiles = sizes.tiles.max(headroom(estimate.tiles));
+    sizes.bin_data = sizes.bin_data.max(headroom(estimate.bins));
+    let mut cpu_config =
+        RenderConfig::new(&layout, params.width, params.height, &params.base_color, &sizes);
     crate::apply_frame_extent(&mut cpu_config.gpu);
     let buffer_sizes = &cpu_config.buffer_sizes;
     let wg_counts = &cpu_config.workgroup_counts;
@@ -312,6 +325,8 @@ pub(crate) fn begin_phased(
         seg_counts_buf,
         blend_spill_buf,
         effect_params_buf,
+        sizes,
+        estimate,
         width: params.width,
         height: params.height,
         did_draw_frontend: false,
@@ -624,8 +639,13 @@ impl Render {
         for image in images.images {
             recording.write_image(image_atlas, image.1, image.2, image.0.clone());
         }
-        let mut cpu_config =
-            RenderConfig::new(&layout, params.width, params.height, &params.base_color);
+        let mut cpu_config = RenderConfig::new(
+            &layout,
+            params.width,
+            params.height,
+            &params.base_color,
+            &vello_encoding::BumpSizes::default(),
+        );
         crate::apply_frame_extent(&mut cpu_config.gpu);
         // HACK: The coarse workgroup counts is the number of active bins.
         if (cpu_config.workgroup_counts.coarse.0
