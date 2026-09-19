@@ -182,8 +182,15 @@ fn fx_warp_sample(v: Rec, fp: vec2<f32>, disp: vec2<f32>, ca_scale: f32, ca_amou
 }
 #endif
 
-var<private> win_lo: u32 = 0u;
-var<private> win_hi: u32 = 0u;
+/// The dispatch's window of rounds, `[win_lo, win_hi)`, read from the uniform config where it is
+/// used rather than copied into a private variable: a private variable is non-uniform to the
+/// uniformity analysis, and the window steers the control flow a snapshot's barrier sits in.
+fn win_lo() -> u32 {
+    return config.seg_lo;
+}
+fn win_hi() -> u32 {
+    return config.seg_target;
+}
 
 #ifdef msaa
 
@@ -1207,7 +1214,7 @@ fn fx_load_desc(base: u32) -> FxDesc {
 }
 
 fn fx_in_window(round: u32) -> bool {
-    return round >= win_lo && (win_hi == SEG_ALL || round < win_hi);
+    return round >= win_lo() && (win_hi() == SEG_ALL || round < win_hi());
 }
 
 /// One separable Gaussian axis over the value record at frame position `fp`.
@@ -1410,7 +1417,7 @@ fn fx_run_mark(
 /// or a command after a marker whose round is in the window.
 fn fx_window_has_work(tile_ix: u32) -> bool {
     var scan_ix = tile_ix * PTCL_INITIAL_ALLOC + 3u;
-    if win_lo > 0u {
+    if win_lo() > 0u {
         let hm = ptcl[tile_ix * PTCL_INITIAL_ALLOC + 2u];
         if hm != 0u {
             scan_ix = hm;
@@ -1424,7 +1431,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
         }
         if t == CMD_EFFECT {
             let round = ptcl[scan_ix + 3u];
-            if win_hi != SEG_ALL && round >= win_hi {
+            if win_hi() != SEG_ALL && round >= win_hi() {
                 break;
             }
             if ptcl[scan_ix + 1u] >= EFFECT_INLINE_BASE && fx_in_window(round) {
@@ -1433,7 +1440,7 @@ fn fx_window_has_work(tile_ix: u32) -> bool {
             scan_seg = round;
             let hm = ptcl[scan_ix + 7u];
             scan_ix += 8u;
-            if scan_seg < win_lo && hm != 0u {
+            if scan_seg < win_lo() && hm != 0u {
                 scan_ix = hm;
             }
             continue;
@@ -1490,8 +1497,6 @@ fn main(
     if ptcl[0] == ~0u {
         return;
     }
-    win_lo = config.seg_lo;
-    win_hi = config.seg_target;
     var tile_xy = wg_id.xy;
 #ifdef packed
     if (config.sparse_n != 0u) {
@@ -1529,12 +1534,12 @@ fn main(
     let fx_head_group = ptcl[cmd_ix + 1u];
     let fx_head_marker = ptcl[cmd_ix + 2u];
     cmd_ix += 3u;
-    if win_lo > 0u && fx_head_group != 0u {
+    if win_lo() > 0u && fx_head_group != 0u {
         var pm = fx_head_marker;
         if ptcl[pm] == CMD_JUMP {
             pm = ptcl[pm + 1u];
         }
-        cmd_ix = select(fx_head_marker, fx_head_group, ptcl[pm + 3u] >= win_lo);
+        cmd_ix = select(fx_head_marker, fx_head_group, ptcl[pm + 3u] >= win_lo());
     }
     var seg_current = 0u;
     while true {
@@ -1547,24 +1552,24 @@ fn main(
 #ifdef packed
             fx_run_mark(cmd_ix, xy, &rgba, &area);
 #endif
-            if win_hi != SEG_ALL && round >= win_hi {
+            if win_hi() != SEG_ALL && round >= win_hi() {
                 break;
             }
             seg_current = round;
             let fx_link_group = ptcl[cmd_ix + 6u];
             let fx_link_marker = ptcl[cmd_ix + 7u];
             cmd_ix += 8u;
-            if seg_current < win_lo && fx_link_group != 0u {
+            if seg_current < win_lo() && fx_link_group != 0u {
                 var pm = fx_link_marker;
                 if ptcl[pm] == CMD_JUMP {
                     pm = ptcl[pm + 1u];
                 }
-                cmd_ix = select(fx_link_marker, fx_link_group, ptcl[pm + 3u] >= win_lo);
+                cmd_ix = select(fx_link_marker, fx_link_group, ptcl[pm + 3u] >= win_lo());
             }
             continue;
         }
-        let seg_active = seg_current >= win_lo
-            && (win_hi == SEG_ALL || seg_current < win_hi);
+        let seg_active = seg_current >= win_lo()
+            && (win_hi() == SEG_ALL || seg_current < win_hi());
         switch tag {
             case CMD_FILL: {
                 let fill = read_fill(cmd_ix);
