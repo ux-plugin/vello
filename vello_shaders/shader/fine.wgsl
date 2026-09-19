@@ -1256,7 +1256,7 @@ fn fx_scatter_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
 /// The value record resampled to this arm's resolution at its pixel `fp`: `u[0].x` input texels per
 /// output texel — a box average of them when whole, bilinear otherwise. A read past the record
 /// yields its clamped edge (`u[0].y` = 0), transparency (1), or `acc`, the output pixel as it is (2).
-fn fx_scale_value(d: FxDesc, v: Rec, fp: vec2<f32>, acc: vec4<f32>) -> vec4<f32> {
+fn fx_resample_value(d: FxDesc, v: Rec, fp: vec2<f32>, acc: vec4<f32>) -> vec4<f32> {
     let ratio = d.u[0].x;
     let transparent = d.u[0].y == 1.0;
     let n = i32(round(ratio));
@@ -1299,7 +1299,7 @@ fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32
         } else if ((d.bits & 256u) != 0u) {
             value = fx_scatter_value(d, v, fp);
         } else if ((d.bits & 8192u) != 0u) {
-            value = fx_scale_value(d, v, fp, acc);
+            value = fx_resample_value(d, v, fp, acc);
         } else {
             value = rec_ld(v, rec_ipos(v, fp), true);
         }
