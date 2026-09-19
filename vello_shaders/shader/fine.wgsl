@@ -1334,6 +1334,56 @@ fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32
     return mix(acc, eff, cov);
 }
 
+/// The tile's pixels, shared across the workgroup for a snapshot's box average.
+var<workgroup> sh_snapshot: array<vec4<f32>, TILE_WIDTH * TILE_HEIGHT>;
+
+/// A snapshot mark (bit 1024): the arm reads this spine's rows, so it runs here, in the spine's
+/// own tiles at the reader's place in z, and writes the tile's pixels — the state below the
+/// reader, nothing above it — into its output record (4), resampled by `u[0].x` input texels per
+/// output texel: a copy at 1, a box average at 2, 4 or 8. Record 0 is the spine's rows, which
+/// place this tile in the spine's texels. The tile's own pixels are left as they are.
+fn fx_snapshot(d: FxDesc, xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
+    let v = rec_of(d, 0u);
+    let o = rec_of(d, 4u);
+    let n = max(i32(round(d.u[0].x)), 1);
+    let base = xy + v.shift - vec2<f32>(0.0, f32(page_rows(v.lo.y)));
+    let out_shift = vec2<i32>(o.shift) + vec2<i32>(0, page_rows(o.lo.y));
+    if (n == 1) {
+        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+            let q = vec2<i32>(floor(base + vec2<f32>(f32(i), 0.0))) + out_shift;
+            if (all(q >= o.lo) && all(q < o.hi)) {
+                textureStore(output, stg_local(q), stg_layer(q), vec4<u32>(pack4x8unorm((*rgba)[i]), 0u, 0u, 0u));
+            }
+        }
+        return;
+    }
+    let lx = u32(xy.x) % TILE_WIDTH;
+    let ly = u32(xy.y) % TILE_HEIGHT;
+    for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+        sh_snapshot[ly * TILE_WIDTH + lx + i] = (*rgba)[i];
+    }
+    workgroupBarrier();
+    if (i32(ly) % n == 0) {
+        for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
+            let x = lx + i;
+            if (i32(x) % n != 0) {
+                continue;
+            }
+            var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+            for (var yy = 0; yy < n; yy += 1) {
+                for (var xx = 0; xx < n; xx += 1) {
+                    acc = acc + sh_snapshot[(i32(ly) + yy) * i32(TILE_WIDTH) + i32(x) + xx];
+                }
+            }
+            let q = vec2<i32>(floor((base + vec2<f32>(f32(i), 0.0)) / f32(n))) + out_shift;
+            if (all(q >= o.lo) && all(q < o.hi)) {
+                textureStore(output, stg_local(q), stg_layer(q), vec4<u32>(pack4x8unorm(acc / f32(n * n)), 0u, 0u, 0u));
+            }
+        }
+    }
+    workgroupBarrier();
+}
+
 fn fx_run_mark(
     cmd_ix: u32,
     xy: vec2<f32>,
@@ -1346,6 +1396,10 @@ fn fx_run_mark(
         return;
     }
     let d = fx_load_desc(ptcl[cmd_ix + 4u]);
+    if ((d.bits & 1024u) != 0u) {
+        fx_snapshot(d, xy, rgba);
+        return;
+    }
     for (var i = 0u; i < PIXELS_PER_THREAD; i += 1u) {
         let p = xy + vec2<f32>(f32(i), 0.0);
         (*rgba)[i] = fx_arm_value(d, fx_frame_pos(d, p), (*rgba)[i], (*area)[i]);
