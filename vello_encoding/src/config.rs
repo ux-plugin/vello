@@ -433,6 +433,11 @@ pub struct BumpSizes {
     pub blend_spill: u32,
     /// Words in the shared overflow pool past every tile's own initial allocation.
     pub ptcl: u32,
+    /// The device's storage-buffer binding limit, in bytes; zero is unbounded. Every bump pool is
+    /// clamped to it — ptcl's per-tile allocation included — so a floor raised past what the
+    /// device can bind makes that pool overflow (which the front-end reports) rather than fail
+    /// validation.
+    pub max_binding: u32,
 }
 
 /// What the tile and bin allocators need for a set of draw bounds over a `width × height`
@@ -522,6 +527,15 @@ impl BufferSizes {
         let blend_spill = BufferSize::new((1 << 20).max(floors.blend_spill));
         let n_tiles = workgroups.fine.0.saturating_mul(workgroups.fine.1);
         let ptcl = BufferSize::new(n_tiles.saturating_mul(64).saturating_add((1u32 << 23).max(floors.ptcl)));
+        let (bin_data, tiles, lines, seg_counts, segments, blend_spill, ptcl) = (
+            bound(bin_data, floors.max_binding),
+            bound(tiles, floors.max_binding),
+            bound(lines, floors.max_binding),
+            bound(seg_counts, floors.max_binding),
+            bound(segments, floors.max_binding),
+            bound(blend_spill, floors.max_binding),
+            bound(ptcl, floors.max_binding),
+        );
         Self {
             path_reduced,
             path_reduced2,
@@ -549,6 +563,12 @@ impl BufferSizes {
             ptcl,
         }
     }
+}
+
+/// `size`, no more elements than fit in `max_bytes` (zero: unbounded).
+fn bound<T: Copy>(size: BufferSize<T>, max_bytes: u32) -> BufferSize<T> {
+    let (len, most) = (size.len(), max_bytes / size_of::<T>() as u32);
+    if max_bytes == 0 || len <= most { size } else { BufferSize::new(most) }
 }
 
 const fn align_up(len: u32, alignment: u32) -> u32 {

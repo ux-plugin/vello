@@ -605,7 +605,8 @@ impl Renderer {
     /// keeping the buffer proxies live across the calls. Area AA only. The caller submits `encoder`.
     ///
     /// `floors` are the pool sizes the caller insists on (a previous frame's overflow, grown);
-    /// the tile and bin pools are also raised to what the scene's draw bounds need.
+    /// the tile and bin pools are also raised to what the scene's draw bounds need, and every pool
+    /// is held to the device's storage-binding limit.
     #[expect(clippy::too_many_arguments, reason = "one session, one setup")]
     pub fn phased_begin_into(
         &mut self,
@@ -617,6 +618,8 @@ impl Renderer {
         floors: BumpSizes,
         encoder: &mut wgpu::CommandEncoder,
     ) -> Result<render::PhasedSession> {
+        let max_binding = device.limits().max_storage_buffer_binding_size.min(u64::from(u32::MAX)) as u32;
+        let floors = BumpSizes { max_binding, ..floors };
         let (session, recording) = render::begin_phased(
             scene.encoding(),
             &mut self.resolver,

@@ -1445,9 +1445,16 @@ impl<'a> TransientBindMap<'a> {
                         Some(TransientBuf::Gpu(b)) => b,
                         _ => bind_map.get_gpu_buf(proxy.id).unwrap(),
                     };
+                    // Bind what the proxy asked for (to the 4-byte multiple a storage binding needs),
+                    // not the pooled buffer: the pool rounds sizes up to a size class, and the
+                    // rounding alone can carry a binding that fits the device's limit past it.
                     wgpu::BindGroupEntry {
                         binding: i as u32,
-                        resource: buf.as_entire_binding(),
+                        resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                            buffer: buf,
+                            offset: 0,
+                            size: core::num::NonZeroU64::new(proxy.size.next_multiple_of(4).min(buf.size())),
+                        }),
                     }
                 }
                 ResourceProxy::BufferRange {
