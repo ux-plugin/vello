@@ -75,13 +75,16 @@ struct FxDesc {
 }
 
 /// One operand record: `[source, x0, y0, x1]` then `[y1, dx, dy, decode]`. `lo..hi` is a store
-/// rect whose rows carry the page offset; `shift` displaces the read in frame space.
+/// rect whose rows carry the page offset; `shift` displaces the read in frame space; `scale` is the
+/// value's texels per texel of the arm's resolution (records 0–3 carry theirs in record 5's second
+/// half, the output is at the arm's own).
 struct Rec {
     source: f32,
     lo: vec2<i32>,
     hi: vec2<i32>,
     shift: vec2<f32>,
     decode: f32,
+    scale: f32,
 }
 
 fn rec_of(d: FxDesc, k: u32) -> Rec {
@@ -93,6 +96,7 @@ fn rec_of(d: FxDesc, k: u32) -> Rec {
     r.hi = vec2<i32>(i32(a.w), i32(b.x));
     r.shift = b.yz;
     r.decode = b.w;
+    r.scale = select(1.0, d.rec[11][min(k, 3u)], k < 4u);
     return r;
 }
 
@@ -108,9 +112,24 @@ fn fx_frame_pos(d: FxDesc, p: vec2<f32>) -> vec2<f32> {
     return p - out.shift - vec2<f32>(0.0, f32(page_rows(out.lo.y)));
 }
 
-/// Frame position `fp` on record `r`'s page, displaced by the record's shift.
+/// Position `q` in record `r`'s own texels on its page, displaced by the record's shift.
+fn rec_at(r: Rec, q: vec2<f32>) -> vec2<f32> {
+    return q - r.shift + vec2<f32>(0.0, f32(page_rows(r.lo.y)));
+}
+
+/// Frame position `fp` of the arm's resolution on record `r`'s page: scaled into the record's
+/// texels centre to centre, displaced by its shift.
 fn rec_pos(r: Rec, fp: vec2<f32>) -> vec2<f32> {
-    return fp - r.shift + vec2<f32>(0.0, f32(page_rows(r.lo.y)));
+    return rec_at(r, select((fp + vec2<f32>(0.5, 0.5)) * r.scale - vec2<f32>(0.5, 0.5), fp, r.scale == 1.0));
+}
+
+/// Record `r` at the arm's pixel `fp`: its texel when it runs at the arm's resolution, bilinear
+/// otherwise; transparent past its rect.
+fn rec_read(r: Rec, fp: vec2<f32>) -> vec4<f32> {
+    if (r.scale == 1.0) {
+        return rec_ld(r, rec_ipos(r, fp), true);
+    }
+    return rec_bilin(r, rec_pos(r, fp), true);
 }
 
 fn rec_ipos(r: Rec, fp: vec2<f32>) -> vec2<i32> {
@@ -1260,22 +1279,22 @@ fn fx_scatter_value(d: FxDesc, v: Rec, fp: vec2<f32>) -> vec4<f32> {
     return sacc / 12.0;
 }
 
-/// The value record resampled to this arm's resolution at its pixel `fp`: `u[0].x` input texels per
-/// output texel — a box average of them when whole, bilinear otherwise. A read past the record
+/// The value record resampled to this arm's resolution at its pixel `fp`: its scale in input texels
+/// per output texel — a box average of them when whole, bilinear otherwise. A read past the record
 /// yields its clamped edge (`u[0].y` = 0), transparency (1), or `acc`, the output pixel as it is (2).
 fn fx_resample_value(d: FxDesc, v: Rec, fp: vec2<f32>, acc: vec4<f32>) -> vec4<f32> {
-    let ratio = d.u[0].x;
+    let ratio = v.scale;
     let transparent = d.u[0].y == 1.0;
     let n = i32(round(ratio));
     if (d.u[0].y == 2.0) {
-        let lo = rec_ipos(v, fp * ratio);
-        let hi = rec_ipos(v, (fp + vec2<f32>(1.0, 1.0)) * ratio - vec2<f32>(1e-3, 1e-3));
+        let lo = vec2<i32>(floor(rec_at(v, fp * ratio)));
+        let hi = vec2<i32>(floor(rec_at(v, (fp + vec2<f32>(1.0, 1.0)) * ratio - vec2<f32>(1e-3, 1e-3))));
         if (any(lo < v.lo) || any(hi >= v.hi)) {
             return acc;
         }
     }
     if (ratio > 1.0 && abs(ratio - f32(n)) < 1e-4 && n <= 8) {
-        let base = rec_ipos(v, fp * ratio);
+        let base = vec2<i32>(floor(rec_at(v, fp * ratio)));
         var acc = vec4<f32>(0.0, 0.0, 0.0, 0.0);
         for (var y = 0; y < n; y = y + 1) {
             for (var x = 0; x < n; x = x + 1) {
@@ -1284,8 +1303,7 @@ fn fx_resample_value(d: FxDesc, v: Rec, fp: vec2<f32>, acc: vec4<f32>) -> vec4<f
         }
         return acc / f32(n * n);
     }
-    let q = rec_pos(v, (fp + vec2<f32>(0.5, 0.5)) * ratio - vec2<f32>(0.5, 0.5));
-    return rec_bilin(v, q, transparent);
+    return rec_bilin(v, rec_pos(v, fp), transparent);
 }
 
 /// One arm at one pixel: the value through its head, the reference and coverage as their records
@@ -1308,20 +1326,20 @@ fn fx_arm_value(d: FxDesc, fp: vec2<f32>, acc: vec4<f32>, area: f32) -> vec4<f32
         } else if ((d.bits & 8192u) != 0u) {
             value = fx_resample_value(d, v, fp, acc);
         } else {
-            value = rec_ld(v, rec_ipos(v, fp), true);
+            value = rec_read(v, fp);
         }
     }
     var orig = acc;
     if (o.source == SRC_AREA) {
         orig = vec4<f32>(0.0, 0.0, 0.0, area);
     } else if (o.source == SRC_STORE) {
-        orig = rec_ld(o, rec_ipos(o, fp), true);
+        orig = rec_read(o, fp);
     }
     var cov = 1.0;
     if (c.source == SRC_AREA) {
         cov = area;
     } else if (c.source == SRC_STORE) {
-        cov = rec_ld(c, rec_ipos(c, fp), true).a;
+        cov = rec_read(c, fp).a;
     }
     let eff = fx_applyPointwise(d.bits, (d.bits & 8u) != 0u, (d.bits & 16u) != 0u, value, orig, fld, d.u);
     if ((d.bits & 512u) != 0u) {
@@ -1346,13 +1364,13 @@ var<workgroup> sh_snapshot: array<vec4<f32>, TILE_WIDTH * TILE_HEIGHT>;
 
 /// A snapshot mark (bit 1024): the arm reads this spine's rows, so it runs here, in the spine's
 /// own tiles at the reader's place in z, and writes the tile's pixels — the state below the
-/// reader, nothing above it — into its output record (4), resampled by `u[0].x` input texels per
-/// output texel: a copy at 1, a box average at 2, 4 or 8. Record 0 is the spine's rows, which
+/// reader, nothing above it — into its output record (4), resampled by record 0's scale in input
+/// texels per output texel: a copy at 1, a box average at 2, 4 or 8. Record 0 is the spine's rows, which
 /// place this tile in the spine's texels. The tile's own pixels are left as they are.
 fn fx_snapshot(d: FxDesc, xy: vec2<f32>, rgba: ptr<function, array<vec4<f32>, PIXELS_PER_THREAD>>) {
     let v = rec_of(d, 0u);
     let o = rec_of(d, 4u);
-    let n = max(i32(round(d.u[0].x)), 1);
+    let n = max(i32(round(v.scale)), 1);
     let base = xy + v.shift - vec2<f32>(0.0, f32(page_rows(v.lo.y)));
     let out_shift = vec2<i32>(o.shift) + vec2<i32>(0, page_rows(o.lo.y));
     if (n == 1) {
